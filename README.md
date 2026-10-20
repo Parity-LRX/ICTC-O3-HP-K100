@@ -46,14 +46,17 @@ full MH-1 fine-tuning requires a training adapter.
 ## Multi-GPU results
 
 Measured on one node with 64 GiB K100 GPUs, FP32 and TF32 disabled.
-Timing includes MD integration, neighbor rebuilding, energy, forces and communication.
+Timing includes MD integration, neighbor rebuilding/sorting, energy, forces,
+communication and cache handoff. Scaling uses one MPI rank and two CPU threads
+per GPU; 3 warmup steps, then three consecutive 20-step windows. Reported scaling
+time is the median of the three window means; startup and JIT are excluded.
 
-**Scaling, remeasured with 0.1.0 on 2026-10-21:** C64, hidden/edge lmax=2,
+### C64 scaling
+
+Remeasured with 0.1.0 on 2026-10-21: C64, hidden/edge lmax=2,
 2 interactions, full-CG correlation=3, H/C/O technical weights, cutoff 4.5 Å,
 about 50 neighbors/atom. Current ML-IAP/FP32 RCCL interface, grouped species
-linears, forward/adjoint edge chunks 1,048,576/32,768. One MPI rank and two
-CPU threads per GPU; 3 warmup steps, then three consecutive 20-step windows.
-Reported time is the median of the three window means; startup and JIT are excluded.
+linears, forward/adjoint edge chunks 1,048,576/32,768.
 
 Strong scaling, fixed **262,144 atoms**:
 
@@ -73,10 +76,39 @@ Weak scaling, fixed **131,072 atoms/GPU** and local geometry:
 | 4 | 524,288 | 1,132.590 | 3.728× | 93.20% |
 | 8 | 1,048,576 | 1,172.413 | **7.203×** | **90.03%** |
 
-Strong efficiency is `T₁(N)/(p×Tₚ(N))`; weak efficiency is `T₁(n)/Tₚ(p×n)`.
-The three windows are not independent-run confidence intervals.
+### MACE-MH-1 scaling
 
-**Eight-GPU capacity:** ML-IAP with FP32 RCCL feature exchange;
+Measured with 0.1.0 on 2026-10-21: pretrained `omat_pbe` head, with all six
+original heads retained; periodic FCC Cu, lattice constant 3.615 Å, cutoff
+6 Å and 78 neighbors/atom. Projected-feature FP32 RCCL exchange; forward,
+adjoint and radial chunks 262,144/32,768/32,768. Same timing protocol as above.
+Every GPU count passed 256-atom original-MACE energy/force checks and
+per-rank ghost/adjoint transport checks.
+
+Strong scaling, fixed **65,536 atoms**:
+
+| GPUs | ms/step | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: |
+| 1 | 6,907.408 | 1.000× | 100.00% |
+| 2 | 3,505.261 | 1.971× | 98.53% |
+| 4 | 1,774.945 | 3.892× | 97.29% |
+| 8 | 913.766 | **7.559×** | **94.49%** |
+
+Weak scaling, fixed **32,768 atoms/GPU** and local geometry:
+
+| GPUs | Total atoms | ms/step | Throughput speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 32,768 | 3,437.113 | 1.000× | 100.00% |
+| 2 | 65,536 | 3,506.372 | 1.960× | 98.02% |
+| 4 | 131,072 | 3,524.422 | 3.901× | 97.52% |
+| 8 | 262,144 | 3,543.252 | **7.760×** | **97.00%** |
+
+For both models, strong efficiency is `T₁(N)/(p×Tₚ(N))`; weak efficiency is
+`T₁(n)/Tₚ(p×n)`. The three windows are not independent-run confidence intervals.
+
+### Eight-GPU capacity
+
+ML-IAP with FP32 RCCL feature exchange;
 50 timed NVE steps after warmup, 0.25 fs timestep. Atoms are global physical
 atoms, excluding ghost copies; times are per-step medians.
 
