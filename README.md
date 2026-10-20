@@ -48,19 +48,6 @@ full MH-1 fine-tuning requires a training adapter.
 Measured on one node with 64 GiB K100 GPUs, FP32 and TF32 disabled.
 Timing includes MD integration, neighbor rebuilding, energy, forces and communication.
 
-**Weak scaling:** C64, lmax=3, 2 interactions, correlation=3; H/C/O,
-cutoff 4.5 Å, 32,768 atoms/GPU, compact `mff/torch/kk` capacity path.
-Each time is the median of three 20-step run means.
-
-| GPUs | Total atoms | ms/step | Weak-scaling efficiency |
-| ---: | ---: | ---: | ---: |
-| 1 | 32,768 | 508.77 | 100.0% |
-| 2 | 65,536 | 603.42 | 84.3% |
-| 4 | 131,072 | 605.32 | 84.0% |
-| 8 | 262,144 | 609.20 | 83.5% |
-
-Efficiency is `T₁(32,768) / Tₚ(32,768 × p)`.
-
 **Eight-GPU capacity:** ML-IAP with FP32 RCCL feature exchange;
 50 timed NVE steps after warmup, 0.25 fs timestep. Atoms are global physical
 atoms, excluding ghost copies; times are per-step medians.
