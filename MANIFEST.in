@@ -1,0 +1,16 @@
+include README.md LICENSE NOTICE LICENSE_SCOPE.md COMMERCIAL_LICENSE.md pyproject.toml
+recursive-include LICENSES *.txt
+recursive-include docs *.md
+recursive-include lammps_user_mfftorch *.md *.txt *.cmake *.h *.cpp *.cu *.sh *.in in.*
+prune tests
+prune test
+prune examples
+prune benchmarks
+prune validation
+prune scripts
+prune artifacts
+prune docs/legacy
+prune mace_ictc/bench
+prune mace_ictc/test
+prune .git
+recursive-exclude * __pycache__ *.pyc *.pyo *.log *.csv *.xml *.json *.png *.pdf *.svg *.whl *.pt2 *.pth

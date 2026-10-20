@@ -1,0 +1,12 @@
+Required Notice: Copyright (c) 2026 The MACE-ICTC RuixiangLin. New MACE-ICTC-HP implementations are offered under PolyForm Noncommercial License 1.0.0; commercial permission is available only through a separate written grant by the rights holder.
+Required Notice: Preserve the MIT copyright and permission notices for the earlier MACE-ICTC implementation and the MACE/e3nn portions identified in LICENSE_SCOPE.md. This release does not withdraw rights already granted under MIT.
+
+The PolyForm Noncommercial License 1.0.0 text in LICENSE is the unmodified
+official text from https://polyformproject.org/licenses/noncommercial/1.0.0.txt.
+Its permitted-purpose and noncommercial-organization clauses are not narrowed
+by this notice or by the separate commercial-permission procedure.
+
+MACE-derived Clebsch-Gordan and symmetric-contraction files retain their
+author notices (Ilyes Batatia) and MIT terms. The e3nn copyright and MIT terms
+are retained separately. Dependencies and third-party weights have their own
+licenses; no commercial grant for them is implied by this project.

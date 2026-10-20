@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ictc-o3-hp-k100"
+version = "0.1.0"
+description = "K100 HIP optimized ICTC operators, force training, and atomistic inference"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "PolyForm-Noncommercial-1.0.0 AND MIT" }
+dependencies = ["torch>=2.7", "numpy>=1.20", "e3nn>=0.4.4,<0.6", "ase>=3.22", "opt-einsum-fx>=0.1.4"]
+
+[project.optional-dependencies]
+hp = ["ninja"]
+train = ["h5py", "pandas", "scipy"]
+conversion = ["mace-torch>=0.3.16"]
+
+[project.urls]
+Repository = "https://github.com/Parity-LRX/ICTC-O3-HP-K100"
+Documentation = "https://github.com/Parity-LRX/ICTC-O3-HP-K100/blob/main/docs/HP_API.md"
+Issues = "https://github.com/Parity-LRX/ICTC-O3-HP-K100/issues"
+
+[project.scripts]
+mff-train = "mace_ictc.cli.train:main"
+mff-export-aoti = "mace_ictc.cli.export_aoti_core:main"
+mff-export-core = "mace_ictc.cli.export_libtorch_core:main"
+mff-convert-mace = "mace_ictc.cli.convert_mace:main"
+mff-convert-foundation = "mace_ictc.cli.convert_foundation:main"
+mff-preprocess = "mace_ictc.cli.preprocess:main"
+
+[tool.setuptools]
+license-files = ["LICENSE", "LICENSES/*.txt", "NOTICE", "LICENSE_SCOPE.md", "COMMERCIAL_LICENSE.md"]
+
+[tool.setuptools.packages.find]
+include = ["mace_ictc", "mace_ictc.*"]
+exclude = ["mace_ictc.bench", "mace_ictc.bench.*", "mace_ictc.test", "mace_ictc.test.*"]
+
+[tool.setuptools.package-data]
+mace_ictc = ["models/_ictd_basis/v1/*.pt", "csrc/*.cpp", "csrc/*.cu"]
