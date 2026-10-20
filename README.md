@@ -48,6 +48,34 @@ full MH-1 fine-tuning requires a training adapter.
 Measured on one node with 64 GiB K100 GPUs, FP32 and TF32 disabled.
 Timing includes MD integration, neighbor rebuilding, energy, forces and communication.
 
+**Scaling, remeasured with 0.1.0 on 2026-10-21:** C64, hidden/edge lmax=2,
+2 interactions, full-CG correlation=3, H/C/O technical weights, cutoff 4.5 Å,
+about 50 neighbors/atom. Current ML-IAP/FP32 RCCL interface, grouped species
+linears, forward/adjoint edge chunks 1,048,576/32,768. One MPI rank and two
+CPU threads per GPU; 3 warmup steps, then three consecutive 20-step windows.
+Reported time is the median of the three window means; startup and JIT are excluded.
+
+Strong scaling, fixed **262,144 atoms**:
+
+| GPUs | ms/step | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,128.899 | 1.000× | 100.00% |
+| 2 | 1,125.568 | 1.891× | 94.57% |
+| 4 | 566.008 | 3.761× | 94.03% |
+| 8 | 301.215 | **7.068×** | **88.35%** |
+
+Weak scaling, fixed **131,072 atoms/GPU** and local geometry:
+
+| GPUs | Total atoms | ms/step | Throughput speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 131,072 | 1,055.564 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,114.135 | 1.895× | 94.74% |
+| 4 | 524,288 | 1,132.590 | 3.728× | 93.20% |
+| 8 | 1,048,576 | 1,172.413 | **7.203×** | **90.03%** |
+
+Strong efficiency is `T₁(N)/(p×Tₚ(N))`; weak efficiency is `T₁(n)/Tₚ(p×n)`.
+The three windows are not independent-run confidence intervals.
+
 **Eight-GPU capacity:** ML-IAP with FP32 RCCL feature exchange;
 50 timed NVE steps after warmup, 0.25 fs timestep. Atoms are global physical
 atoms, excluding ghost copies; times are per-step medians.
