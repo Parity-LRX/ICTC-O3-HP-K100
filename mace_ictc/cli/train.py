@@ -563,6 +563,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "all also computes loss gradients for leaf inputs such as positions.")
     ap.add_argument("--generated-layout", choices=("packed", "fused_pack"), default="packed",
                     help="Generated HP message layout; packed is the established default, fused_pack fuses boundary copies.")
+    ap.add_argument("--training-message-linear-layout", choices=("node_component", "einsum"), default="node_component",
+                    help="Generated eager training message linear layout; node_component uses contiguous "
+                         "node/angular GEMM rows, einsum restores the original layout.")
     ap.add_argument("--interaction-init", default="identity", choices=["identity", "mace-random"],
                     help="Initialize ICTC interaction linear/skip maps as identity or MACE-like random maps.")
     ap.add_argument("--mace-compatible-random-init", action="store_true",
@@ -1340,6 +1343,7 @@ def main(argv=None):
         train_makefx_compile=args.train_makefx_compile,
         operator_plan=args.operator_plan,
         generated_layout=args.generated_layout,
+        training_message_linear_layout=args.training_message_linear_layout,
         backward_targets=args.backward_targets,
         require_train_makefx_compile=bool(args.train_makefx_compile and args.product_backend == "cueq"),
         makefx_max_slots=args.makefx_max_slots,

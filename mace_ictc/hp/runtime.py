@@ -108,7 +108,7 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
                     species_schedule="grouped",
                     training_gate_schedule="materialized",mixed_channel_tile=None,
                     mixed_geometry_schedule="fused",training_gate_gemm_policy="torch",
-                    training_adjoint_channel_tile=None,training_message_linear_layout="einsum",
+                    training_adjoint_channel_tile=None,training_message_linear_layout="node_component",
                     radial_checkpoint=False,inference_message_layout="native",
                     inference_adjoint_channel_tile="auto",inference_gate_adjoint_rows=0,
                     inference_gemm_policy="torch",inference_message_adjoint_edges=0,
@@ -135,9 +135,10 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
     bounds gradient GEMM rows for the qualified K100 radial projection.
     training_adjoint_channel_tile independently bounds the first TP adjoint
     channel tile (0, 32 or 64) during materialized eager training.
-    training_message_linear_layout="node_component" packs node/angular rows
+    training_message_linear_layout defaults to "node_component", packing node/angular rows
     for a shared FP32 channel GEMM in message linears. Live weights and their
-    mixed adjoints use ordinary differentiable linear operations.
+    mixed adjoints use ordinary differentiable linear operations. "einsum"
+    restores the old training layout; inference and reference plans use it automatically.
     inference_message_layout="degree" keeps TP outputs in degree-major angular
     rows through the following linear and coordinate adjoint. It is opt-in,
     eager L<=3 inference with layout="fused_pack"; frozen gate/TP weights use
@@ -250,11 +251,6 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
             raise ValueError('training_adjoint_channel_tile must be None, 0, 32 or 64')
         if not training and policy!='reference':
             raise ValueError('The training adjoint channel tile requires training=True')
-    if training_message_linear_layout not in ('einsum','node_component'):
-        raise ValueError('training_message_linear_layout must be einsum or node_component')
-    if (training_message_linear_layout!='einsum' and policy!='reference'
-            and (not training or capture)):
-        raise ValueError('The node/component message linear layout requires eager training')
     if not training and policy!='reference' and (mixed_geometry_schedule!='fused'
             or training_gate_gemm_policy!='torch'):
         raise ValueError('Mixed geometry and gate gradient GEMM schedules require training=True')
@@ -290,6 +286,7 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
         wide_channel_policy=wide_channel_policy,
         high_l_policy=high_l_policy,
         reference_buffer_policy=reference_buffer_policy,
+        training_message_linear_layout=training_message_linear_layout,
     )
     selected=info['selected']=='generated'
     basis_enabled=False
@@ -328,8 +325,6 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
         layer.tp._inference_message_adjoint_edges=inference_message_adjoint_edges if selected and not training else 0
         if hasattr(layer,'message_linear'):
             layer.message_linear._inference_degree_layout=degree_layout
-            layer.message_linear._training_message_linear_layout=(
-                training_message_linear_layout if selected and training else 'einsum')
         schedule=gate_schedules[index] if per_layer else gate_schedules[0]
         layer.tp._training_gate_schedule=schedule if selected and training else 'materialized'
         layer.tp._radial_checkpoint=bool(selected and training and radial_checkpoint)
@@ -360,7 +355,6 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
     info['training_adjoint_channel_tile']=training_adjoint_channel_tile if selected and training else None
     info['mixed_geometry_schedule']=mixed_geometry_schedule if selected and training else 'fused'
     info['training_gate_gemm_policy']=training_gate_gemm_policy if selected and training else 'torch'
-    info['training_message_linear_layout']=training_message_linear_layout if selected and training else 'einsum'
     info['radial_checkpoint']=bool(selected and training and radial_checkpoint)
     info['inference_message_layout']=inference_message_layout if selected and not training else 'native'
     info['inference_adjoint_channel_tile']=inference_adjoint_channel_tile if selected and not training else 0

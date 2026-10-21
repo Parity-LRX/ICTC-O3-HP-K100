@@ -807,7 +807,7 @@ K100 原生 CG/TP 的能量、力及混合伴随
 
 ### 消息线性层的节点／角分量行布局
 
-`training_message_linear_layout="node_component"` 将消息线性层的
+generated eager training 默认使用 `training_message_linear_layout="node_component"`，将消息线性层的
 `[N,Cin,2l+1]` 输入整理为连续的 `[N*(2l+1),Cin]`，共享同一份
 `[Cout,Cin]` 实时权重执行 GEMM，再恢复原有输出分量顺序。这与已有通道
 adapter 的共享 GEMM 布局一致，避免 `einsum` 在大图上整理
@@ -816,17 +816,20 @@ adapter 的共享 GEMM 布局一致，避免 `einsum` 在大图上整理
 ```python
 configure_model(
     model, training=True, policy="generated", layout="fused_pack",
-    training_message_linear_layout="node_component",
 )
+# 显式恢复旧布局：
+configure_model(model, training=True, training_message_linear_layout="einsum")
 ```
 
 该开关可与上述 TP/gate 调度同时使用；它不替代这些调度。权重、输入和上游
 特征的混合伴随通过普通可微 `linear` 计算，包含力损失及坐标二阶反传。
 参数对象、trainability、state_dict keys 和对外特征顺序保持原样，FP32
-归约顺序可能改变。默认 `"einsum"` 保留原路径；仅 eager training 可显式
-启用，generated capture 或推理配置会拒绝这个训练选项。CUDA FP32 且未启用 autocast
-时使用新布局，其他 dtype/设备沿用原计算。重新配置时省略该选项，或改为
-`policy="reference"`，均清除该布局标志。
+归约顺序可能改变。该默认值同时适用于 `ForceTrainer` 和训练 CLI；CLI 可用
+`--training-message-linear-layout einsum` 恢复旧布局。CUDA FP32 且未启用 autocast
+时使用新布局，其他 dtype/设备沿用原计算。重新配置 eager generated training
+时省略该选项，会重新启用默认布局；推理、`policy="reference"` 或 `auto` 的
+reference 回退会清除该布局标志。`capture=True` 的训练在 `auto` 下沿用
+reference 路径，显式 `policy="generated"` 仍因不支持训练 capture 而报错。
 
 ## 径向重算与逐层 gate 调度
 

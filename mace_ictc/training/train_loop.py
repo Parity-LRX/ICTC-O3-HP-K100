@@ -127,6 +127,7 @@ class ForceTrainer:
         makefx_max_slots: int = 8,
         operator_plan: str = "auto",
         generated_layout: str = "packed",
+        training_message_linear_layout: str = "node_component",
         backward_targets: str = "auto",
         # plumbing
         train_sampler=None,
@@ -265,6 +266,7 @@ class ForceTrainer:
         self.operator_plan_info = configure_mace_runtime_plan(
             self.model, policy=operator_plan, training=True, capture=self.train_makefx_compile,
             generated_layout=generated_layout,
+            training_message_linear_layout=training_message_linear_layout,
         )
         if backward_targets not in ("auto", "parameters", "all"):
             raise ValueError("backward_targets must be auto, parameters or all")

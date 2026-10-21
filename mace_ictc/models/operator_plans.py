@@ -76,11 +76,14 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
                                 generated_layout: str = "packed",
                                 wide_channel_policy: str = "auto",
                                 high_l_policy: str = "auto",
-                                reference_buffer_policy: str = "auto") -> dict:
+                                reference_buffer_policy: str = "auto",
+                                training_message_linear_layout: str = "node_component") -> dict:
     """Default to qualified generated eager operators, with a reference escape.
 
     Zero gate cache is intentional for the default, including deep models.
     Callers may explicitly budget an inference cache per interaction for speed.
+    Generated eager training defaults to contiguous node/component message GEMMs;
+    reference and inference plans restore the einsum layout.
     """
     from .fp32_policy import strict_fp32
     strict_fp32()
@@ -94,13 +97,16 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
         raise ValueError("high_l_policy must be auto or off")
     if reference_buffer_policy not in ('auto','device'):
         raise ValueError('reference_buffer_policy must be auto or device')
+    if training_message_linear_layout not in ('einsum','node_component'):
+        raise ValueError('training_message_linear_layout must be einsum or node_component')
     core = mace_backbone_core(model)
     from .reference_u_residency import host_reference_unavailable,restore_model_reference_u,restore_reference_u
     if policy == "reference":
         from .pure_cartesian_ictd_fix import PureCartesianICTDFix
         counts = set_mace_backbone_plan(core) if isinstance(core, PureCartesianICTDFix) else {}
         restore_model_reference_u(core)
-        return {"requested": policy, "selected": "reference", "reasons": [], "counts": counts}
+        return {"requested": policy, "selected": "reference", "reasons": [], "counts": counts,
+                "training_message_linear_layout": "einsum"}
     reasons = generated_plan_unavailable(core, training=training, capture=capture)
     if reasons:
         if policy == "generated":
@@ -108,7 +114,8 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
         from .pure_cartesian_ictd_fix import PureCartesianICTDFix
         counts=set_mace_backbone_plan(core) if isinstance(core,PureCartesianICTDFix) else {}
         restore_model_reference_u(core)
-        return {"requested": policy, "selected": "reference", "reasons": reasons, "counts": counts}
+        return {"requested": policy, "selected": "reference", "reasons": reasons, "counts": counts,
+                "training_message_linear_layout": "einsum"}
     if training and gate_cache_bytes:
         raise ValueError("Training uses live radial gates; inference gate cache must be zero")
     wide=(wide_channel_policy=="auto" and core.channels>=96
@@ -122,6 +129,7 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
         shared_species_gemm=wide and core.num_elements<=4,
         generated_csr_forward="auto" if wide else False,
         gate_cache_bytes=gate_cache_bytes, generated_layout=generated_layout,
+        training_message_linear_layout=training_message_linear_layout if training else "einsum",
     )
     from .pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3
     high=(high_l_policy=="auto" and 4<=core.lmax<=5 and core.ictd_fix_edge_lmax<=5)
@@ -158,6 +166,7 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
                 module._partitioned_circuit=True
                 counts["high_l_partitioned_sc"]+=1
     return {"requested": policy, "selected": "generated", "reasons": [], "counts": counts,
+            "training_message_linear_layout":training_message_linear_layout if training else "einsum",
             "wide_channel_policy":wide_channel_policy,"wide_channels_active":wide,
             "high_l_policy":high_l_policy,"high_l_active":high,
             "high_l_device_capability":high_l_device_capability,
@@ -199,7 +208,8 @@ def set_mace_backbone_plan(model: torch.nn.Module, *, bond_first: bool = False,
                            shared_species_gemm: bool = False,
                            generated_csr_forward: bool | str = False,
                            generated_second: bool = False,
-                           generated_layout: str = "packed") -> dict[str, int]:
+                           generated_layout: str = "packed",
+                           training_message_linear_layout: str = "einsum") -> dict[str, int]:
     """Select neutral backbone plans without importing or configuring CHORUS.
 
     Generated Cartesian messages accelerate C64 FP32 forward/first adjoints
@@ -227,6 +237,8 @@ def set_mace_backbone_plan(model: torch.nn.Module, *, bond_first: bool = False,
         raise ValueError("CSR forward requires generated_message")
     if generated_layout not in ("packed","canonical","fused_pack"):
         raise ValueError("generated_layout must be packed, canonical or fused_pack")
+    if training_message_linear_layout not in ('einsum','node_component'):
+        raise ValueError('training_message_linear_layout must be einsum or node_component')
     if generated_layout!="packed" and not generated_message:
         raise ValueError("fused generated layout requires generated_message")
     if not isinstance(gate_cache_bytes,int) or isinstance(gate_cache_bytes,bool) or gate_cache_bytes<0:
@@ -247,7 +259,7 @@ def set_mace_backbone_plan(model: torch.nn.Module, *, bond_first: bool = False,
                     or getattr(module,"tp_cueq",None) is not None):
                 raise ValueError("Independent ICTC plans cannot mix cuEq operators; select a native ICTC backend")
     from .ictd_irreps import HarmonicPathWeightedTensorProduct, EdgeWeightedPathPreservingTensorProduct, EquivariantChannelLinearSO3, EquivariantChannelLinearSO3Rect
-    from .pure_cartesian_ictd_fix import ICTDResidualInteractionBlock, _Normalize2MomSiLU, ICTDBridgeUSymmetricContractionSO3,ElementConditionedLinearSO3
+    from .pure_cartesian_ictd_fix import ICTDResidualInteractionBlock, _Normalize2MomSiLU, ICTDBridgeUSymmetricContractionSO3,ElementConditionedLinearSO3,PathPreservingLinearSO3
     from ._mace_symmetric_contraction import _Contraction
     if hasattr(model,"angular_basis") and hasattr(model,"ictd_fix_edge_lmax"):
         model._fused_direction_harmonics=bool(fused_harmonics)
@@ -256,6 +268,8 @@ def set_mace_backbone_plan(model: torch.nn.Module, *, bond_first: bool = False,
              "factorized_contraction":0,"factorized_circuit":0,"streamed_gates":0,
              "generated_message":0,"fold_frozen_path_weights":0,"shared_channel_gemm":0,"shared_species_gemm":0,"generated_second":0,"generated_csr_forward":0}
     for module in model.modules():
+        if isinstance(module,PathPreservingLinearSO3):
+            module._training_message_linear_layout=training_message_linear_layout
         if isinstance(module,ElementConditionedLinearSO3):
             module._grouped_species_gemm=False
             module._shared_species_gemm=bool(shared_species_gemm)

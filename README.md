@@ -35,9 +35,12 @@ from mace_ictc.hp import create_model, configure_model
 model = create_model(channels=64, lmax=2, num_interactions=2, correlation=3)
 configure_model(
     model, training=True, policy="generated", layout="fused_pack",
-    training_message_linear_layout="node_component",
 )
 ```
+
+Generated eager training uses `training_message_linear_layout="node_component"`
+by default in both the HP API and `ForceTrainer`/CLI. Set it to `"einsum"` (CLI:
+`--training-message-linear-layout einsum`) to select the previous layout.
 
 See the [API guide](docs/HP_API.md) for training, inference and conversion.
 The current MH-1 foundation adapter supports frozen-weight force inference;
