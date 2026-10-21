@@ -1,10 +1,11 @@
 # ICTC-O3-HP-K100
 
-Cartesian tensor operators for K100 (`gfx926`), with HIP kernels for atomistic
-energy/force training and inference. Version **0.1.0**.
+High-performance **ICTC-O3 operators optimized for Hygon K100 GPUs**, together
+with the **MACE-ICTC framework** for atomistic modeling, training and inference.
 
-Distribution: `ictc-o3-hp-k100`. Python packages: `ictc_o3` for standalone
-operators and `mace_ictc` for models, training and conversion.
+Version **0.1.0**. Distribution: `ictc-o3-hp-k100`.
+Python packages: `ictc_o3` for standalone operators and `mace_ictc` for the
+MACE-ICTC framework.
 
 ## Python API
 

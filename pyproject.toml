@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ictc-o3-hp-k100"
 version = "0.1.0"
-description = "K100 HIP optimized ICTC operators, force training, and atomistic inference"
+description = "High-performance ICTC-O3 operators and the MACE-ICTC framework, optimized for Hygon K100 GPUs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "PolyForm-Noncommercial-1.0.0 AND MIT" }
