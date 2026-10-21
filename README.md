@@ -193,16 +193,21 @@ and material configurations shown above.
 
 HP and FastEq are compared on one Hygon K100 (64 GiB), using complete MACE
 models in eager FP32, with TF32 and `torch.compile` disabled. The paired
-benchmark snapshot dated 21 October 2026 covers 44 configurations:
+throughput snapshot dated 21 October 2026 covers 44 configurations:
 C64/C128/C256, `lmax=1/2/3`, and 1,024–65,536 atoms, with the tested sizes
 varying by architecture. Each pair starts from equivalent randomly
 initialized MACE models and uses the same fixed neighbor graph. These
 results use two interactions, full CG `correlation=3`, periodic H/C/O,
 cutoff 4.5 Å and approximately 50 directed neighbors/atom.
 
-### Training
+![Single-K100 C64/lmax2 training and energy-and-force inference: throughput and peak allocated GPU memory, with observed OOM brackets.](docs/assets/training-inference.svg)
 
-![HP and FastEq full energy-and-force training throughput on one K100, across 44 model and atom-count configurations. A cross denotes a measured out-of-memory result.](docs/assets/training-throughput.svg)
+The main panels show C64, `lmax=2`, matching the architecture in the C64
+multi-GPU results. The summary ratios below cover the full architecture
+scan. Expand the sections for all nine architectures; memory curves extend
+through observed OOM, with additional C64/lmax2 samples near the boundary.
+
+### Training
 
 Across 43 paired measurements, the median HP/FastEq training throughput
 ratio is 1.65×, with ratios ranging from 1.03× to 2.46×. HP is faster at all
@@ -214,9 +219,20 @@ Each training step includes energy evaluation, forces with
 second derivatives, and an AdamW update. HP uses the default
 `training_message_linear_layout="node_component"`.
 
-### Inference
+<details>
+<summary>Full training scan: throughput and memory</summary>
 
-![HP performance mode, HP capacity mode and FastEq energy-and-force inference throughput on one K100, across all 44 configurations.](docs/assets/inference-throughput.svg)
+![HP and FastEq full energy-and-force training throughput on one K100, across 44 model and atom-count configurations. A cross denotes a measured out-of-memory result.](docs/assets/training-throughput.svg)
+
+![HP and FastEq training peak allocated memory versus atom count. Crosses above each panel mark the smallest tested GPU OOM size.](docs/assets/training-memory.svg)
+
+The curves include the original successful training points and extensions
+at doubled atom counts, through an observed GPU out-of-memory (OOM) result
+for each implementation and architecture.
+
+</details>
+
+### Inference
 
 For energy-and-force inference, the median HP/FastEq throughput ratio is
 1.40× in performance mode and 1.27× in capacity mode. HP is faster at 44/44
@@ -229,7 +245,16 @@ to reduce memory use. Both use frozen model parameters and the same FP32
 accuracy criteria.
 
 <details>
-<summary>Energy-only inference</summary>
+<summary>Full energy-and-force inference scan: throughput and memory</summary>
+
+![HP performance mode, HP capacity mode and FastEq energy-and-force inference throughput on one K100, across all 44 configurations.](docs/assets/inference-throughput.svg)
+
+![HP performance mode, HP capacity mode and FastEq energy-and-force peak allocated memory versus atom count. Crosses above the panels mark observed GPU OOM sizes.](docs/assets/inference-memory.svg)
+
+</details>
+
+<details>
+<summary>Energy-only inference: throughput and memory</summary>
 
 ![HP performance mode, HP capacity mode and FastEq energy-only inference throughput on one K100.](docs/assets/energy-only-throughput.svg)
 
@@ -237,22 +262,33 @@ For energy-only evaluation, the median HP/FastEq throughput ratios are
 1.26× in performance mode and 1.25× in capacity mode. HP is faster at 38/44
 and 34/44 measured points, respectively; some configurations favor FastEq.
 
+![HP performance mode, HP capacity mode and FastEq energy-only peak allocated memory versus atom count, extended until GPU OOM.](docs/assets/energy-only-memory.svg)
+
+Within the original 44-point scan, capacity mode reduces peak allocation
+at all 44 points, with a median reduction of 62.7%. Performance mode has a
+median increase of 2.9% relative to FastEq.
+
 </details>
 
-### GPU memory
+### GPU memory versus atom count
 
-![Paired peak allocated GPU memory: FastEq on the horizontal axis and HP on the vertical axis, for training, energy-and-force inference and energy-only inference. Points below the dashed equality line use less memory with HP.](docs/assets/memory-comparison.svg)
+Memory curves first extend each preset by doubling the atom count until
+GPU OOM. The C64/lmax2 training and energy-and-force curves add three
+interior sizes and three bisections of each success/OOM bracket. Curves
+stop at the last successful size; crosses above the panels mark only the
+atom count of the smallest tested OOM. Upper bars in the main panels show
+the refined brackets. These are sampled boundaries, not exact capacity
+limits. OOM during initial evaluation or kernel tuning also terminates
+a preset. Successful points show peak allocations after warmup.
 
-Across paired configurations, the median reduction in peak allocated
+Within the original matched scan, the median reduction in peak allocated
 memory is 12.3% for training, 19.3% for energy-and-force inference in
 performance mode, and 60.7% in capacity mode. HP uses less memory at 32/43,
 37/44 and 44/44 points, respectively. At the C64, `lmax=2`, 65,536-atom
 training point where FastEq runs out of memory, HP uses 53.4 GiB.
 
-For energy-only inference, capacity mode reduces peak allocation at all
-44 points, with a median reduction of 62.7%. Performance mode has a median
-increase of 2.9% relative to FastEq. These values measure PyTorch peak
-allocated GPU memory; driver allocations and external runtime buffers
+Memory values are PyTorch peak allocated GPU memory in GiB, including
+resident graph tensors. Driver allocations and external runtime buffers
 are excluded.
 
 <details>
@@ -271,6 +307,15 @@ The reported time is the median of the round medians. Model loading,
 conversion, compilation, data transfers, neighbor-list construction,
 MD integration and multi-GPU communication are excluded. This timing scope
 differs from the complete MD steps in the multi-GPU figures above.
+
+The memory extensions retain the same model and preset configurations.
+Each new size runs in a fresh process, with two warmup calls followed by
+three complete evaluations or optimizer steps; the largest of the three
+peak allocations is plotted. Periodic graphs retain the same lattice,
+jitter seed and cutoff. Their local stencil construction at larger sizes
+matches the complete ASE periodic edge lists at 64, 80, 1,024, 1,280,
+4,096 and 5,120 atoms, including non-power-of-two sizes.
+The throughput figures use the original 44-configuration timing scan.
 
 The HP inference presets use 81,920/32,768 forward/backward edges per chunk
 and a gate-cache budget of 5 GiB per interaction in performance mode;
