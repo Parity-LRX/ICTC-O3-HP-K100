@@ -48,6 +48,9 @@ class MFFTorchEngine {
 
   void load_core(const std::string& core_pt_path, const std::string& device_str);
   void prepare_for_shape(int64_t nlocal, int64_t ntotal, int64_t nedges);
+  void set_domain_owners(const torch::Tensor& owners,int rank,int size) {
+    domain_owners_=owners;domain_rank_=rank;domain_size_=size;
+  }
 
   // Warmup: run one dummy forward+backward to trigger JIT compilation and CUDA caching.
   void warmup(int64_t N = 32, int64_t E = 256);
@@ -153,6 +156,9 @@ class MFFTorchEngine {
                       const torch::Tensor& dispersion_edge_shifts);
   void ensure_core_for_shape(int64_t nlocal, int64_t ntotal, int64_t nedges, bool warmup_on_switch);
 
+  torch::Tensor domain_owners_;
+  int domain_rank_=0;
+  int domain_size_=1;
   torch::jit::script::Module core_;
 #if MFF_HAS_AOTI
   std::unique_ptr<torch::inductor::AOTIModelPackageLoader> aoti_loader_;

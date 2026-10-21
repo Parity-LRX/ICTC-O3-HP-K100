@@ -43,7 +43,7 @@ class PairMFFTorchKokkos : public PairMFFTorch {
   torch::Tensor type2Z_cuda_;
 
   // Cached CUDA tensor buffers to avoid per-step allocation.
-  int64_t cached_Etotal_ = 0;
+  int64_t cached_Etotal_ = -1;
   int64_t cached_ntotal_ = 0;
   torch::Tensor buf_edge_src_;
   torch::Tensor buf_edge_dst_;

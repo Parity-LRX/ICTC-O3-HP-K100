@@ -18,6 +18,33 @@ from .monomial_operator import triton
 from .rematerialized_message import _edge_slice, _tiles, _native
 
 
+def _folded_weights(tp,last,sample,*,cache=True):
+    """Fold frozen path scales once, with ordinary tensor-version invalidation."""
+    operands=(tp.weight,last.weight) if last.bias is None else (tp.weight,last.weight,last.bias)
+    signature=None
+    try:
+        if cache and not any(w.requires_grad for w in operands):
+            signature=(sample.device,sample.dtype,
+                       tuple((w._version,w.data_ptr(),w.shape,w.device,w.dtype) for w in operands))
+    except RuntimeError:
+        pass
+    cached=getattr(tp,'_frozen_gate_weights',None)
+    if (signature is not None and cached is not None and cached[1]==signature
+            and len(cached[0])==len(operands) and all(a is b for a,b in zip(cached[0],operands))):
+        return cached[2]
+    def fold():
+        weight=tp.weight.to(sample).contiguous()
+        gate_weight=last.weight*weight.reshape(-1,1)
+        bias=sample.new_empty(0) if last.bias is None else last.bias*weight.reshape(-1)
+        return torch.ones_like(weight),gate_weight,bias
+    if signature is not None:
+        with torch.inference_mode(False),torch.no_grad():result=fold()
+        tp._frozen_gate_weights=(operands,signature,result)
+        return result
+    tp._frozen_gate_weights=None
+    return fold()
+
+
 def _gate_projection(h,a,bias,p):
     if p.get('gate_gemm_policy','torch')=='dtk2604' and not bias.numel():
         from .hip_gate_gemm import gemm
@@ -59,7 +86,7 @@ class _StreamedGate(torch.autograd.Function):
     def forward(ctx,x,sh,w,h,a,bias,src,dst,mask,p,projection):
         from .fused_message import _group_message_raw,_normal_message_output,_channel_node
         ctx.plan=p;ctx.projection=projection
-        cached={};remaining=p.get("gate_cache_bytes",0)
+        cached={};remaining=p.get("gate_cache_bytes",0) if any(ctx.needs_input_grad[:6]) else 0
         canonical=p.get("generated_layout","packed")=="canonical" and p.get("generated_forward",False)
         native_packed=bool(p.get('native_packed',False))
         nout=p.get('output_nodes',x.shape[0])
@@ -284,9 +311,10 @@ def streamed_gate_message(tp,x1,edge_attrs,edge_feats,fc,src,dst,mask,*,output_n
         if mask.numel():mask=mask[permutation]
     weight=tp.weight.to(sample).contiguous();gate_weight=last.weight
     if getattr(tp,"_fold_path_weights",False) and not train_gate:
-        gate_weight=gate_weight*weight.reshape(-1,1)
-        if bias.numel():bias=bias*weight.reshape(-1)
-        weight=torch.ones_like(weight);plan["unit_weights"]=True
+        from .hip_fused_basis import small_force_workload
+        small=small_force_workload(sample,c,requires_grad=any(v.requires_grad for v in (x,sh,hidden)))
+        weight,gate_weight,bias=_folded_weights(tp,last,sample,cache=not small)
+        plan["unit_weights"]=True
     if getattr(tp,'_generated_compact_cartesian',False):
         raise ValueError('Legacy STF-coordinate flag is retired; reconfigure the model with message_schedule=native or roles')
     operation=_StreamedGate

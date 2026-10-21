@@ -197,6 +197,7 @@ PairMFFTorch::PairMFFTorch(LAMMPS *lmp) : Pair(lmp) {
   one_coeff = 1;
   manybody_flag = 1;
   comm_reverse = 3;
+  comm_forward = 2;
   // rRESPA: this pair splits the cheap short-range core (inner level, every step) from the expensive
   // many-body-dispersion solve (outer level, every K steps). compute_inner/compute_middle/compute_outer
   // below implement the multiple-time-stepping; the split is by PHYSICS (SR vs MBD), not by distance,
@@ -209,6 +210,41 @@ PairMFFTorch::~PairMFFTorch() {
     memory->destroy(setflag);
     memory->destroy(cutsq);
   }
+}
+
+int PairMFFTorch::pack_forward_comm(int n,int *list,double *buf,int,int *) {
+  int offset=0;
+  for(int j=0;j<n;++j)for(int k=0;k<2;++k)
+    buf[offset++]=owner_map_buffer_[static_cast<size_t>(list[j])*2+k];
+  return offset;
+}
+
+void PairMFFTorch::unpack_forward_comm(int n,int first,double *buf) {
+  int offset=0;
+  for(int i=first;i<first+n;++i)for(int k=0;k<2;++k)
+    owner_map_buffer_[static_cast<size_t>(i)*2+k]=buf[offset++];
+}
+
+void PairMFFTorch::refresh_domain_owners() {
+  if(!layerwise_exchange_ || comm->nprocs==1)return;
+  // Empty domains cannot skip RCCL collectives while peers evaluate layers.
+  // Check collectively before any per-rank early return or model call.
+  int minimum=0;
+  MPI_Allreduce(&atom->nlocal,&minimum,1,MPI_INT,MPI_MIN,world);
+  if(minimum==0)error->all(FLERR,"Native MFF requires at least one owned atom on every MPI rank");
+  const int total=atom->nlocal+atom->nghost;
+  owner_map_buffer_.assign(static_cast<size_t>(total)*2,-1.0);
+  for(int i=0;i<atom->nlocal;++i) {
+    owner_map_buffer_[static_cast<size_t>(i)*2]=comm->me;
+    owner_map_buffer_[static_cast<size_t>(i)*2+1]=i;
+  }
+  // Double owner codes exactly represent every LAMMPS local int index. The
+  // native current communication plan handles migration and repeated images.
+  comm->forward_comm(this);
+  auto owners=torch::empty({total,2},torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  auto *dst=owners.data_ptr<int64_t>();
+  for(size_t i=0;i<owner_map_buffer_.size();++i)dst[i]=static_cast<int64_t>(owner_map_buffer_[i]);
+  engine_->set_domain_owners(owners,comm->me,comm->nprocs);
 }
 
 int PairMFFTorch::pack_reverse_comm(int n,int first,double *buf) {
@@ -259,10 +295,15 @@ void PairMFFTorch::allocate() {
 
 void PairMFFTorch::configure_message_depth() {
   int exported_depth=0;
+  layerwise_exchange_=false;
   std::ifstream metadata(core_pt_path_+".meta");
   std::string key;
   while(metadata>>key) {
     if(key=="message_passing_depth")metadata>>exported_depth;
+    else if(key=="feature_exchange") {
+      std::string transport;metadata>>transport;
+      layerwise_exchange_=(transport=="rccl");
+    }
     else {std::string rest;std::getline(metadata,rest);}
   }
   if(exported_depth>0) {
@@ -472,8 +513,9 @@ void PairMFFTorch::init_style() {
                         "to local atoms; add 'atom_modify map yes' (or array/hash) to your input.");
     neighbor->add_request(this, NeighConst::REQ_FULL);  // 1x halo: default ghost cutoff is enough
   } else {
-    neighbor->add_request(this, NeighConst::REQ_FULL | NeighConst::REQ_GHOST);
-    const double halo = std::max(static_cast<double>(mp_depth_) * cut_global_, request_cut_global_);
+    neighbor->add_request(this, layerwise_exchange_ ? NeighConst::REQ_FULL :
+                          NeighConst::REQ_FULL | NeighConst::REQ_GHOST);
+    const double halo = std::max(static_cast<double>(layerwise_exchange_ ? 1 : mp_depth_) * cut_global_, request_cut_global_);
     if (comm->cutghostuser < halo) comm->cutghostuser = halo;
   }
 
@@ -782,6 +824,7 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   const int nlocal = atom->nlocal;
   const int nghost = atom->nghost;
   const int ntotal = nlocal + nghost;
+  refresh_domain_owners();
   // Number of NODES the model sees: fold_mode_ collapses every ghost onto its local owner, so the
   // graph is just the nlocal local atoms; refined-A keeps the ghosts as nodes (ntotal).
   const int n_model = fold_mode_ ? nlocal : ntotal;
@@ -947,7 +990,7 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   std::vector<int> frontier;
   frontier.reserve(static_cast<size_t>(inum));
   for (int ii = 0; ii < inum; ii++) { is_center[ilist[ii]] = 1; frontier.push_back(ilist[ii]); }
-  for (int hop = 1; hop < mp_depth_; hop++) {
+  for (int hop = 1; hop < (layerwise_exchange_ ? 1 : mp_depth_); hop++) {
     std::vector<int> next;
     for (int ci : frontier) {
       const int jn = numneigh[ci];
@@ -1042,7 +1085,7 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   const int64_t Edisp = use_dispersion_edges ? static_cast<int64_t>(buf_disp_edge_src_cpu_.size()) : 0;
   // Do not skip one-edge graphs: canonical MBD/SLQ-MBD represents a two-atom
   // oscillator coupling with exactly one undirected dispersion edge.
-  if (E == 0 && (!use_dispersion_edges || Edisp == 0)) return;
+  if (!layerwise_exchange_ && E == 0 && (!use_dispersion_edges || Edisp == 0)) return;
   const auto profile_graph = profile_pair ? ProfileClock::now() : ProfileClock::time_point{};
   sort_edge_vectors(buf_edge_src_cpu_, buf_edge_dst_cpu_, buf_edge_shifts_cpu_);
   if (use_dispersion_edges) {
@@ -1145,7 +1188,9 @@ void PairMFFTorch::compute(int eflag, int vflag) {
                            external_tensor_t, fidelity_ids_t,
                            need_energy, want_atom_virial);
   } catch (const std::exception &e) {
-    error->all(FLERR, (std::string("mff/torch engine compute failed: ") + e.what()).c_str());
+    if(layerwise_exchange_ && comm->nprocs>1)
+      error->one(FLERR, (std::string("mff/torch engine compute failed: ") + e.what()).c_str());
+    else error->all(FLERR, (std::string("mff/torch engine compute failed: ") + e.what()).c_str());
   }
   const auto profile_engine = profile_pair ? ProfileClock::now() : ProfileClock::time_point{};
   cache_physical_outputs(out, nlocal);

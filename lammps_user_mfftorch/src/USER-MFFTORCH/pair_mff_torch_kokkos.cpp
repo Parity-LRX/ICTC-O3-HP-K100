@@ -233,8 +233,9 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
                         "to local atoms; add 'atom_modify map yes' (or array/hash) to your input.");
     neighbor->add_request(this, NeighConst::REQ_FULL);
   } else {
-    neighbor->add_request(this, NeighConst::REQ_FULL | NeighConst::REQ_GHOST);
-    const double halo = std::max(static_cast<double>(mp_depth_) * cut_global_, request_cut_global_);
+    neighbor->add_request(this, layerwise_exchange_ ? NeighConst::REQ_FULL :
+                          NeighConst::REQ_FULL | NeighConst::REQ_GHOST);
+    const double halo = std::max(static_cast<double>(layerwise_exchange_ ? 1 : mp_depth_) * cut_global_, request_cut_global_);
     if (comm->cutghostuser < halo) comm->cutghostuser = halo;
   }
 
@@ -377,6 +378,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   nall = atom->nlocal + atom->nghost;
   const int nlocal_owned = nlocal;
   const int ntotal = nall;
+  refresh_domain_owners();
   const int nmodel = fold ? nlocal_owned : ntotal;
 
   NeighListKokkos<DeviceType> *k_list = static_cast<NeighListKokkos<DeviceType> *>(list);
@@ -527,7 +529,9 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 	                             current_external_tensor(torch::kCPU), current_fidelity_tensor(torch::kCPU),
 	                             static_cast<bool>(eflag_global || eflag_atom), static_cast<bool>(vflag_atom));
 	    } catch (const std::exception &e) {
-	      error->all(FLERR, (std::string("mff/torch/kk host-staged engine compute failed: ") + e.what()).c_str());
+	      if(layerwise_exchange_ && comm->nprocs>1)
+      error->one(FLERR, (std::string("mff/torch/kk host-staged engine compute failed: ") + e.what()).c_str());
+    else error->all(FLERR, (std::string("mff/torch/kk host-staged engine compute failed: ") + e.what()).c_str());
 	    }
 	    mfftorch::ReciprocalOutputs reciprocal_out;
 	    const bool exports_runtime_source =
@@ -682,7 +686,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 
   // A K-layer local-energy graph needs incoming edges only for centers
   // reachable in fewer than K hops. Outer K-hop nodes are source-only.
-  const int depth=mp_depth_;
+  const int depth=layerwise_exchange_ ? 1 : mp_depth_;
   Kokkos::View<int *,DeviceType> center_level("mfftorch::center_level",ntotal);
   Kokkos::parallel_for("mfftorch::init_center_level",ntotal,KOKKOS_LAMBDA(const int i) {
     center_level(i)=i<nlocal_owned ? 0 : depth;
@@ -713,7 +717,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
       },
       Etotal);
   finish_segment(edge_count_ms);
-  if (Etotal == 0) return;
+  if (Etotal == 0 && !layerwise_exchange_) return;
 
   // Exclusive-scan offsets on device; reuse cached view when inum unchanged.
   if (cached_inum_ != inum) {
@@ -902,7 +906,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
     Edispfiltered = disp_valid_mask.sum().item<int64_t>();
   }
   // Keep one-edge graphs alive for canonical MBD/SLQ-MBD.
-  if (Efiltered == 0 && (!use_dispersion_edges || Edispfiltered == 0)) return;
+  if (!layerwise_exchange_ && Efiltered == 0 && (!use_dispersion_edges || Edispfiltered == 0)) return;
   if (Efiltered != Etotal) {
     auto valid_idx = torch::nonzero(valid_mask).view({-1});
     buf_edge_src_ = buf_edge_src_.index_select(0, valid_idx);
@@ -1102,7 +1106,9 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
     }
     finish_segment(compute_ms);
   } catch (const std::exception &e) {
-    error->all(FLERR, (std::string("mff/torch/kk engine compute failed: ") + e.what()).c_str());
+    if(layerwise_exchange_ && comm->nprocs>1)
+      error->one(FLERR, (std::string("mff/torch/kk engine compute failed: ") + e.what()).c_str());
+    else error->all(FLERR, (std::string("mff/torch/kk engine compute failed: ") + e.what()).c_str());
   }
   cache_physical_outputs(out, nlocal);
 

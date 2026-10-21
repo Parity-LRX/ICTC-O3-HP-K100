@@ -1,26 +1,13 @@
 #!/usr/bin/env python3
-"""
-Export TorchScript core model loadable by LibTorch (C++) via torch.jit.save.
+"""Export a K100 MFF deployment artifact.
 
-Difference from torch.save(obj):
-- torch.save() saves Python pickle objects (including custom classes), not directly loadable from C++.
-- Pure C++ pipeline requires TorchScript files exported via torch.jit.save(ScriptModule, path).
+The default native backend writes a scripted dispatch envelope, the original
+checkpoint and metadata. Installed Python HP kernels run eagerly through the
+C++ engine, including differentiable RCCL feature transport under MPI.
 
-This script exports core.pt with:
-- forward signature:
-    (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec,
-     dispersion_edge_src, dispersion_edge_dst, dispersion_edge_shifts, dispersion_edge_vec,
-     external_tensor) -> atom_energies
-- **LAMMPS 接口仅需能量和力**：TorchScript trace 时 model 不输出物理张量（dipole/polarizability 等），
-  只输出 per-atom energy；力由 C++ 侧 dE/dpos 计算。
-- **Optional embedded E0** (option B): embed per-element constant energy (E0) from preprocessing/fitting
-  into TorchScript; exported core.pt outputs per-atom energy as "network energy + E0(Z)".
-  Note: E0 does not affect forces (constant gradient w.r.t. coordinates is zero).
-
-Recommended usage:
-- Usually pass only `--checkpoint`, `--elements`, and export/runtime options.
-- Model-structure hyperparameters default to checkpoint metadata.
-- If explicit CLI values conflict with checkpoint metadata, the CLI wins.
+``--backend reference`` exports the original whole-network TorchScript core.
+Its model structure can be overridden with the legacy export options. Raw
+Python checkpoints and AOTInductor .pt2 packages are different formats.
 """
 
 from __future__ import annotations
@@ -49,6 +36,50 @@ def _pick_device(req: str) -> str:
         torch.cuda.set_device(0)
         return "cuda:0"
     return req
+
+
+def _make_cuda_device_constants_relative(core: torch.jit.ScriptModule) -> int:
+    """Keep GPU traces loadable on any rank's GPU.
+
+    Tracing ``tensor.to(device=other.device)`` records a literal ``cuda:0``.
+    ``jit.load(map_location=...)`` relocates tensors, but not those IR constants.
+    Derive CUDA allocation devices from each method's first tensor argument;
+    explicit CPU devices retain their original meaning.
+    """
+    rewritten = 0
+
+    def nodes_in(block):
+        for node in block.nodes():
+            yield node
+            for child in node.blocks():
+                yield from nodes_in(child)
+
+    for module in core.modules():
+        for name in module._c._method_names():
+            graph = module._c._get_method(name).graph
+            tensor_input = next(
+                (value for value in graph.inputs() if value.type().kind() == "TensorType"),
+                None,
+            )
+            if tensor_input is None:
+                continue
+            constants = [
+                node for node in nodes_in(graph)
+                if node.kind() == "prim::Constant"
+                and node.output().type().kind() == "DeviceObjType"
+                and node.output().toIValue().type == "cuda"
+            ]
+            if not constants:
+                continue
+            device_node = graph.create("prim::device", [tensor_input], 1)
+            device_node.output().setType(constants[0].output().type())
+            device_node.insertBefore(next(graph.nodes()))
+            for node in constants:
+                node.output().replaceAllUsesWith(device_node.output())
+                node.destroy()
+                rewritten += 1
+            graph.lint()
+    return rewritten
 
 
 def _parse_dtype(s: Optional[str]) -> Optional[torch.dtype]:
@@ -784,6 +815,7 @@ def _export_single_core(
         trace_num_edges=int(trace_num_edges),
         jit_mode=jit_mode,
     )
+    relative_cuda_devices = _make_cuda_device_constants_relative(core)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_pt)), exist_ok=True)
     core.eval()
@@ -838,6 +870,7 @@ def _export_single_core(
         "elements": elements,
         "tensor_product_mode": mode,
         "device_exported_from": device,
+        "input_relative_cuda_device_constants": relative_cuda_devices,
         "max_radius": float(effective_radius),
         "num_interaction": int(num_interaction) if num_interaction is not None else None,
         "dtype": str(actual_dtype).replace("torch.", ""),
@@ -988,6 +1021,7 @@ def _export_single_core(
     meta_path = out_pt + ".json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+    Path(out_pt + ".meta").write_text(f"message_passing_depth {int(num_interaction)}\n")
     print(f"Wrote metadata: {meta_path}")
     return meta
 
@@ -1013,7 +1047,26 @@ def export_core(
     trace_buckets: str | None = None,
     jit_mode: str | None = None,
     avg_num_neighbors: Optional[float] = None,
+    backend: str = "native",
+    inference_mode: str = "performance",
+    head: str | None = None,
 ) -> None:
+    if backend == "native":
+        if device == "cpu" or force_dtype not in (None, torch.float32):
+            raise ValueError("Native K100 MFF requires --device cuda and FP32")
+        if (bundle_out or trace_buckets or native_ops or export_reciprocal_source
+                or export_fidelity_id is not None or tensor_product_mode is not None
+                or max_radius is not None or num_interaction is not None):
+            raise ValueError("Native MFF restores model structure from the checkpoint; use --backend reference for export overrides")
+        from mace_ictc.interfaces.lammps_hp import export_native
+        export_native(checkpoint=checkpoint, elements=elements, out_pt=out_pt,
+            inference_mode=inference_mode, head=head, embed_e0=embed_e0,
+            e0_csv=e0_csv, avg_num_neighbors=avg_num_neighbors)
+        return
+    if backend != "reference":
+        raise ValueError("backend must be native or reference")
+    if head is not None:
+        raise ValueError("--head requires the native FoundationHP backend")
     ckpt_peek = torch.load(checkpoint, map_location="cpu", weights_only=False)
     mode = tensor_product_mode if tensor_product_mode is not None else ckpt_peek.get("tensor_product_mode", None)
     del ckpt_peek
@@ -1111,9 +1164,14 @@ def export_core(
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Export LibTorch-loadable TorchScript core model. "
-                    "Model-structure hyperparameters default to checkpoint metadata; explicit CLI values override."
+        description="Export K100 MFF inference. Native HP performance mode is the default; "
+                    "--backend reference selects whole-network TorchScript."
     )
+    p.add_argument("--backend", choices=["native", "reference"], default="native",
+                   help="Default: native K100 HP kernels and layerwise RCCL. reference exports the portable whole-network TorchScript route.")
+    p.add_argument("--inference-mode", choices=["performance", "capacity"], default="performance",
+                   help="Native HP memory schedule; performance is the default.")
+    p.add_argument("--head", default=None, help="Select one retained FoundationHP readout head")
     p.add_argument("--checkpoint", type=str, required=True,
                    help="Checkpoint (.pth). Structure hyperparameters are resolved with priority: "
                         "explicit CLI > checkpoint metadata > defaults.")
@@ -1174,6 +1232,7 @@ def main() -> None:
     embed_e0 = not bool(args.no_embed_e0)
     export_core(
         checkpoint=args.checkpoint,
+        backend=args.backend, inference_mode=args.inference_mode, head=args.head,
         elements=list(args.elements),
         device=device,
         max_radius=(float(args.max_radius) if args.max_radius is not None else None),

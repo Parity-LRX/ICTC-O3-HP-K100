@@ -439,6 +439,41 @@ static void ensure_python_custom_op_registrations() {
   }
 }
 
+// Register and reconstruct the installed native HP runtime before loading its
+// scripted dispatch envelope. Python API symbols are resolved dynamically so
+// portable reference cores retain their existing LibTorch-only load path.
+static void ensure_native_hp_runtime(const std::string& path,const torch::Device& device) {
+  std::ifstream mf(path+".meta");
+  std::string key,value;
+  bool native=false;
+  while(mf>>key) {
+    if(key=="backend") {mf>>value;native=(value=="ictc-hp");}
+    else {std::string rest;std::getline(mf,rest);}
+  }
+  if(!native)return;
+  ensure_libpython();
+  auto initialized=reinterpret_cast<int (*)()>(dlsym(RTLD_DEFAULT,"Py_IsInitialized"));
+  auto initialize=reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT,"Py_InitializeEx"));
+  auto ensure=reinterpret_cast<int (*)()>(dlsym(RTLD_DEFAULT,"PyGILState_Ensure"));
+  auto release=reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT,"PyGILState_Release"));
+  auto run=reinterpret_cast<int (*)(const char*)>(dlsym(RTLD_DEFAULT,"PyRun_SimpleString"));
+  if(!initialized || !initialize || !ensure || !release || !run)
+    throw std::runtime_error("Native MFF requires the installed Python runtime; use mff-lammps");
+  if(!initialized())initialize(0);
+  auto literal=[](const std::string& text) {
+    static const char hex[]="0123456789abcdef";
+    std::string result="bytes.fromhex('";
+    for(unsigned char c:text) {result+=hex[c>>4];result+=hex[c&15];}
+    return result+"').decode('utf-8')";
+  };
+  const std::string code="from mace_ictc.interfaces.lammps_hp import register_core\nregister_core("+
+      literal(path)+","+literal(device.str())+")\n";
+  const int state=ensure();
+  const int rc=run(code.c_str());
+  release(state);
+  if(rc)throw std::runtime_error("Native HP reconstruction failed; see Python traceback above");
+}
+
 struct OptionalGilRelease {
   using Py_IsInitialized_Fn = int (*)();
   using PyGILState_Check_Fn = int (*)();
@@ -494,6 +529,7 @@ static void load_custom_op_libs() {
 void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
   load_custom_op_libs();
   ensure_python_custom_op_registrations();
+  ensure_native_hp_runtime(core_pt_path,device_);
 
   // AOTInductor .pt2: an Inductor-compiled inference package with the force traced INTO
   // the graph. Load via AOTIModelPackageLoader and take the simpler AOTI compute path
@@ -663,6 +699,8 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
   try {
     std::vector<std::string> preserved_methods;
     if (core_.find_method("forward_owned")) preserved_methods.emplace_back("forward_owned");
+    if (core_.find_method("forward_distributed")) preserved_methods.emplace_back("forward_distributed");
+    if (core_.find_method("after_force")) preserved_methods.emplace_back("after_force");
     if (core_.find_method("warmup_on_real_graph")) preserved_methods.emplace_back("warmup_on_real_graph");
     core_ = torch::jit::freeze(core_, preserved_methods);
   } catch (...) {
@@ -1736,7 +1774,16 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
 
   torch::jit::IValue core_out;
   auto owned_forward = core_.find_method("forward_owned");
-  if (nlocal < ntotal && inputs.size() == 8 && owned_forward) {
+  auto distributed_forward = core_.find_method("forward_distributed");
+  if(domain_size_>1 && distributed_forward) {
+    if(!domain_owners_.defined() || domain_owners_.size(0)!=ntotal)
+      throw std::runtime_error("Native MFF requires a fresh LAMMPS ghost owner map");
+    inputs.emplace_back(nlocal);
+    inputs.emplace_back(domain_owners_);
+    inputs.emplace_back(domain_rank_);
+    inputs.emplace_back(domain_size_);
+    core_out=(*distributed_forward)(inputs);
+  } else if (nlocal < ntotal && inputs.size() == 8 && owned_forward) {
     // Optional short-range ABI: ordinary eight inputs plus the owned prefix.
     // The core must retain derivatives for every local/ghost coordinate and
     // return [ntotal] energies; only [0:nlocal] contributes to E_local below.
@@ -1838,6 +1885,7 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
   if (need_energy) {
     out.energy = E_local.detach().to(torch::kCPU).item<double>();
   }
+  if(auto after_force=core_.find_method("after_force"))(*after_force)({atom_e.detach()});
   if (debug_timings) {
     const auto prep_ms =
         std::chrono::duration<double, std::milli>(t_after_prep - t_start).count();

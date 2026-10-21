@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from numbers import Integral
 from typing import Dict, List
 
 import opt_einsum_fx
@@ -37,6 +38,16 @@ from mace_ictc.models.dispersion import build_long_range_dispersion, normalize_d
 
 _CONTRACTION_BATCH_EXAMPLE = 10
 _CONTRACTION_ALPHABET = ["w", "x", "v", "n", "z", "r", "t", "y", "u", "o", "p", "s"]
+
+
+def _radial_mlp_widths(value) -> tuple[int, ...]:
+    if value is None:
+        return (64, 64, 64)
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("radial_mlp_hidden must be a list or tuple of positive integers")
+    if any(isinstance(width, bool) or not isinstance(width, Integral) or width < 1 for width in value):
+        raise ValueError("radial_mlp_hidden must contain positive integers")
+    return tuple(int(width) for width in value)
 
 
 def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) -> torch.dtype:
@@ -2422,6 +2433,7 @@ class ICTDResidualInteractionBlock(nn.Module):
         interaction_init: str = "identity",
         use_rms_norm: bool = False,
         interaction_attn_heads: int = 0,
+        radial_mlp_hidden: list[int] | tuple[int, ...] | None = None,
     ):
         super().__init__()
         self.channels = int(channels)
@@ -2494,17 +2506,17 @@ class ICTDResidualInteractionBlock(nn.Module):
             if self.ictd_tp_backend == "cueq"
             else None
         )
-        self.fc = nn.Sequential(
-            nn.Linear(self.number_of_basis, 64, bias=False),
-            _Normalize2MomSiLU(),
-            nn.Linear(64, 64, bias=False),
-            _Normalize2MomSiLU(),
-            nn.Linear(64, 64, bias=False),
-            _Normalize2MomSiLU(),
-            nn.Linear(64, self.tp.num_paths * self.channels, bias=False),
-        )
-        for idx in (0, 2, 4, 6):
-            _init_mace_style_linear_(self.fc[idx])
+        self.radial_mlp_hidden = _radial_mlp_widths(radial_mlp_hidden)
+        radial_sizes = (self.number_of_basis, *self.radial_mlp_hidden, self.tp.num_paths * self.channels)
+        radial_layers = []
+        for index, (size_in, size_out) in enumerate(zip(radial_sizes, radial_sizes[1:])):
+            radial_layers.append(nn.Linear(size_in, size_out, bias=False))
+            if index < len(radial_sizes) - 2:
+                radial_layers.append(_Normalize2MomSiLU())
+        self.fc = nn.Sequential(*radial_layers)
+        for module in self.fc:
+            if isinstance(module, nn.Linear):
+                _init_mace_style_linear_(module)
         self.message_linear = PathPreservingLinearSO3(
             {
                 l: self.channels * int(self.tp.path_counts_by_l.get(l, 0))
@@ -3187,12 +3199,14 @@ class PureCartesianICTDFix(nn.Module):
         energy_output_scale_enabled: bool = False,
         energy_output_shift: float = 0.0,
         energy_output_shift_enabled: bool = False,
+        radial_mlp_hidden: list[int] | tuple[int, ...] | None = None,
     ):
         super().__init__()
         if embed_size is None:
             embed_size = [128, 128, 128]
         if main_hidden_sizes3 is None:
             main_hidden_sizes3 = [64]
+        self.radial_mlp_hidden = _radial_mlp_widths(radial_mlp_hidden)
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -3428,6 +3442,7 @@ class PureCartesianICTDFix(nn.Module):
                     interaction_init=self.ictd_fix_interaction_init,
                     use_rms_norm=self.ictd_fix_interaction_rms_norm,
                     interaction_attn_heads=self.ictd_fix_interaction_attn_heads,
+                    radial_mlp_hidden=self.radial_mlp_hidden,
                 )
             )
             if effective_product_backend == "native-mace":

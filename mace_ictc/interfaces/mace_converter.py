@@ -1,7 +1,7 @@
 """Load a real e3nn MACE (``mace-torch``) model into a MACE-ICTC model.
 
 ``convert_mace_to_ictd(mace_model, ictd_model)`` copies every learnable weight from a
-``ScaleShiftMACE`` (built with the matching small config) into a
+``ScaleShiftMACE`` with a matching supported architecture into a
 :class:`mace_ictc.models.pure_cartesian_ictd_fix.PureCartesianICTDFix`. The exact
 default/recommended target is ``ictd_fix_product_backend="ictd-bridge-u"``, which uses
 the MACE U tensors folded into the ICTC basis. ``native-mace`` is also supported as a
@@ -330,21 +330,23 @@ def convert_mace_to_ictd(mace_model, ictd_model) -> Dict[str, object]:
 
         # radial MLP: MACE conv_tp_weights (e3nn FullyConnectedNet, no bias) -> ICTC fc.
         #
-        # e3nn `_Layer`(var_in=var_out=1): with act -> out = K * silu(x @ (W_mace / sqrt(h_in)));
-        # without act (last) -> out = x @ W_mace. Here W_mace is stored as (h_in, h_out) and
-        # the activation is normalize2mom(silu) = K * silu(.) with the CONSTANT K below.
-        # ICTC fc is [Linear, SiLU, Linear, SiLU, Linear, SiLU, Linear] (plain SiLU, bias).
-        #
-        # To make the two networks identical we (1) transpose W_mace to nn.Linear (out,in)
-        # layout and divide by sqrt(h_in) so the SiLU arguments match, which leaves each
-        # activated ICTC layer's output a factor 1/K below e3nn; (2) fold that 1/K into the
-        # NEXT layer by multiplying its weight by K. The last (un-activated) layer therefore
-        # carries one extra K (to undo the previous activated layer's 1/K). All biases -> 0.
+        # e3nn `_Layer`(var_in=var_out=1) applies W_mace / sqrt(h_in), stored
+        # as (h_in, h_out), followed by normalize2mom(SiLU) on hidden layers.
+        # ICTC uses the same normalize2mom(SiLU) activation after each hidden linear.
+        # Copy every source layer with its own input normalization and preserve arbitrary
+        # hidden widths/depth. Only the final output rows need TP path reordering/scaling.
         mace_layers = [layer for layer in m_inter.conv_tp_weights]  # e3nn _Layer modules
-        ictd_fc_linears = [ictd_inter.fc[k] for k in (0, 2, 4, 6)]
-        assert len(mace_layers) == len(ictd_fc_linears) == 4
+        ictd_fc_linears = [module for module in ictd_inter.fc if isinstance(module, torch.nn.Linear)]
+        if len(mace_layers) != len(ictd_fc_linears) or not mace_layers:
+            raise ValueError(f"radial MLP depth mismatch at interaction {i}: "
+                             f"MACE has {len(mace_layers)} linears, ICTC has {len(ictd_fc_linears)}")
+        for index, (source_layer, target_layer) in enumerate(zip(mace_layers, ictd_fc_linears)):
+            if tuple(source_layer.weight.T.shape) != tuple(target_layer.weight.shape):
+                raise ValueError(f"radial MLP shape mismatch at interaction {i}, layer {index}: "
+                                 f"MACE {tuple(source_layer.weight.T.shape)}, "
+                                 f"ICTC {tuple(target_layer.weight.shape)}")
         with torch.no_grad():
-            for k in range(3):  # activated layers 0,1,2
+            for k in range(len(mace_layers) - 1):
                 h_in = float(mace_layers[k].h_in)
                 w = mace_layers[k].weight.to(dtype=ictd_fc_linears[k].weight.dtype)  # (h_in, h_out)
                 scale = 1.0 / (h_in ** 0.5)
@@ -352,26 +354,25 @@ def convert_mace_to_ictd(mace_model, ictd_model) -> Dict[str, object]:
                 if ictd_fc_linears[k].bias is not None:
                     ictd_fc_linears[k].bias.zero_()
             # last layer (no act): e3nn computes out = x @ (W_mace / sqrt(h_in * var_in/var_out))
-            # = x @ (W_mace / sqrt(h_in)) with var_in=var_out=1. ICTC now uses the same
-            # normalize2mom(silu) activations, so no activation scale is folded into this layer.
-            h_in_last = float(mace_layers[3].h_in)
+            # = x @ (W_mace / sqrt(h_in)) with var_in=var_out=1.
+            h_in_last = float(mace_layers[-1].h_in)
             last_w = (
-                mace_layers[3].weight * (1.0 / (h_in_last ** 0.5))
-            ).to(dtype=ictd_fc_linears[3].weight.dtype).T.contiguous()  # (P*C, 64) MACE path order
+                mace_layers[-1].weight * (1.0 / (h_in_last ** 0.5))
+            ).to(dtype=ictd_fc_linears[-1].weight.dtype).T.contiguous()
             mace_paths = _mace_conv_tp_paths(m_inter.conv_tp)
             ictd_paths = [tuple(p) for p in ictd_inter.tp.paths]
-            new_last = torch.zeros_like(ictd_fc_linears[3].weight)  # (P*C, 64) ICTC path order
+            new_last = torch.zeros_like(ictd_fc_linears[-1].weight)
             for mace_pos, path in enumerate(mace_paths):
                 ictd_pos = ictd_paths.index(path)
                 c = float(c_by_path[path])
                 new_last[ictd_pos * C : (ictd_pos + 1) * C, :] = (
                     c * last_w[mace_pos * C : (mace_pos + 1) * C, :]
             )
-            ictd_fc_linears[3].weight.copy_(new_last)
-            if ictd_fc_linears[3].bias is not None:
-                ictd_fc_linears[3].bias.zero_()
+            ictd_fc_linears[-1].weight.copy_(new_last)
+            if ictd_fc_linears[-1].bias is not None:
+                ictd_fc_linears[-1].bias.zero_()
         report["blocks"][f"interaction[{i}].fc"] = (
-            "e3nn FC -> ICTC fc: W.T/sqrt(h_in), normalize2mom(silu) K folded into next layer; "
+            "e3nn FC -> ICTC fc: W.T/sqrt(h_in), matching normalize2mom(silu), original hidden widths/depth; "
             "last layer reordered to ICTC path order, scaled by c_p; biases zeroed"
         )
 

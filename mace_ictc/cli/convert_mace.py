@@ -16,7 +16,7 @@ import torch
 from e3nn import o3
 
 from mace_ictc.interfaces.mace_converter import convert_mace_to_ictd
-from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
+from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix, _radial_mlp_widths
 
 
 log = logging.getLogger(__name__)
@@ -109,8 +109,7 @@ def _validate_supported_config(cfg: dict[str, Any], *, channels: int, lmax: int)
         )
     if str(cfg["radial_type"]) != "bessel":
         raise ValueError(f"only MACE radial_type='bessel' is supported exactly, got {cfg['radial_type']!r}")
-    if list(cfg["radial_MLP"]) != [64, 64, 64]:
-        raise ValueError(f"only radial_MLP=[64, 64, 64] is supported, got {cfg['radial_MLP']!r}")
+    _radial_mlp_widths(cfg["radial_MLP"])
     if bool(cfg.get("pair_repulsion", False)):
         raise ValueError("pair_repulsion=True is not supported by the MACE-ICTC converter")
     distance_transform = cfg.get("distance_transform", None)
@@ -196,6 +195,7 @@ def build_ictd_from_mace_config(
         avg_num_neighbors=_as_float(cfg["avg_num_neighbors"]),
         angular_basis="ictd",
         internal_compute_dtype=dtype,
+        radial_mlp_hidden=_radial_mlp_widths(cfg["radial_MLP"]),
         device=device,
     ).to(device=device, dtype=dtype)
     return model
@@ -223,6 +223,7 @@ def _checkpoint_hparams_from_model(model: PureCartesianICTDFix, cfg: dict[str, A
         "num_layers": 1,
         "main_hidden_sizes3": [64],
         "emb_number_main_2": [64, 64, 64],
+        "radial_mlp_hidden": list(model.radial_mlp_hidden),
         "num_interaction": int(model.num_interaction),
         "invariant_channels": int(model.channels),
         "ictd_fix_route": "baseline",

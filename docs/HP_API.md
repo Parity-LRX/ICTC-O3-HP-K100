@@ -1,5 +1,11 @@
 # ICTC-O3-HP-K100 API
 
+This guide targets Hygon K100 (`gfx926`) with the vendor HIP/DTK stack.
+The supported performance workflow is eager FP32 with native HIP kernels.
+AOTInductor `.pt2`, `torch.compile` and graph replay are outside the supported
+K100 deployment workflow. HIP kernel JIT compilation is still required for
+native operators; it is separate from whole-model compilation.
+
 `ictc_o3` provides standalone operator APIs, and `mace_ictc.hp` provides
 whole-model APIs. These sibling Python packages are installed together with
 `ictc-o3-hp-k100`. See the [O3 operator overview](O3_API.md) for a quick reference.
@@ -25,7 +31,7 @@ in `models/`.
 | CSR, GEMM | Compressed sparse row grouping of edges by destination node; general matrix–matrix multiplication. Neither changes the model's mathematical definition. |
 | E0 | Per-element atomic-energy offsets from the checkpoint or training fit. These offsets must be included consistently when comparing total energies. |
 | FP32, FP64, TF32 | 32-bit and 64-bit floating-point arithmetic; TensorFloat-32, an optional reduced-mantissa matrix-multiply mode. HP kernels use FP32 and disable TF32. Triton's `tf32x3` mode is also excluded. |
-| AOTI | AOTInductor: the ahead-of-time deployment backend of TorchInductor, used here to package an exported energy/force graph as `.pt2`. It is distinct from the legacy TorchScript `.pt` route. |
+| AOTI | AOTInductor, an ahead-of-time deployment backend retained in compatibility code. Its `.pt2` route is unsupported on the current K100 stack. |
 | Reference route | The original differentiable implementation selected by `policy="reference"`. This selection does not imply FP64 arithmetic. |
 
 Irrep degree/parity follows the [e3nn irreps convention](https://docs.e3nn.org/en/stable/api/o3/o3_irreps.html).
@@ -36,9 +42,9 @@ The component coordinates can differ between angular bases even when this
 normalization agrees.
 
 Throughout this guide, `device="cuda"` and `torch.cuda` denote PyTorch's GPU
-device API. HIP-enabled PyTorch uses these same names on K100; they do not
-identify K100 as NVIDIA hardware. See [PyTorch HIP semantics](https://docs.pytorch.org/docs/2.7/notes/hip.html).
-Backend-specific export support is described separately below.
+device API on the K100 HIP build. See
+[PyTorch HIP semantics](https://docs.pytorch.org/docs/2.7/notes/hip.html).
+All execution recipes below target K100. See section 6 for the supported deployment formats.
 
 ## API overview
 
@@ -57,7 +63,7 @@ Backend-specific export support is described separately below.
 | `check_model(model, ...)` | Check whole-model coverage without mutation | Returns `supported` and `reasons`; does not compile or modify the model |
 | `configure_model(model, ...)` | Select a whole-model eager execution plan | Returns the selection, reasons, operator counts and layouts |
 | `energy_and_forces(model, ...)` | Evaluate model energy and forces on an existing graph | Returns `energy[B]`, `forces[N,3]` and `atomic_energy[N]`; does not add E0 |
-| `prepare_for_export(model, ...)` | Prepare whole-model FX/AOTI export | Registers or prepares independent Triton operators for export lowering; does not write an export file |
+| `prepare_for_export(model, ...)` | Retained compatibility preparation API | Does not write a file or establish K100 `.pt2` support; use the K100 deployment routes in section 6 |
 
 Importing the API does not trigger GPU compilation. The first actual call may
 build constant plans and JIT-compile kernels; cold-start time must be reported
@@ -164,9 +170,9 @@ checkpoint keys.
 
 Standalone edge operators write outputs directly, without node aggregation.
 First-order backward, mixed second derivatives and existing higher-order autograd
-routes remain available. This GPU JIT wrapper cannot be placed directly inside
-`make_fx`, `torch.compile`, functorch transforms or autocast. Whole-model AOTI uses the prepared route
-in section 6.
+routes remain available. This eager HIP wrapper cannot be placed directly inside
+`make_fx`, `torch.compile`, functorch transforms or autocast. K100 deployment
+formats are described in section 6.
 
 Use `torch.autograd.grad` for VJPs:
 
@@ -198,7 +204,7 @@ message = GraphMessage(
 # node_blocks[l]: [N,C,2l+1], C=tp.channels
 # edge_blocks[l]: [E,1,2l+1]
 # radial_gates: [E,tp.num_paths*C], current radial MLP output
-# src/dst: [E] int64 CUDA, valid indices into the same N-node buffer
+# src/dst: [E] int64 on the K100 GPU, valid indices into the same N-node buffer
 node_paths = message(node_blocks, edge_blocks, radial_gates, src, dst, mask=None)
 ```
 
@@ -292,8 +298,8 @@ load/store masks for channel tails that are not multiples of 32.
 `correlation` supports 2 and 3, with compatibility for 1. The factory uses the
 existing full CG baseline bridge-U. `use_reduced_cg=True` raises an explicit error
 rather than enabling cuEquivariance (cuEq) basis generation. The process default dtype is
-preserved. For dynamic AOTI, the factory builds e3nn submodules through FX and
-restores the previous e3nn optimization defaults afterwards.
+preserved. The factory builds e3nn submodules through FX and restores the
+previous e3nn optimization defaults afterwards.
 
 Interaction depth and angular degree are not fixed to two layers/L<=3.
 Structural support remains subject to native model basis construction and
@@ -335,16 +341,22 @@ Existing checkpoints:
 from mace_ictc.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
 
 potential = LAMMPS_MLIAP_MFF.from_checkpoint(
-    "trained_model.pth", element_types=["H","C","O"], device="cuda",
+    "trained_model.pth", element_types=["H", "C", "O"], device="cuda",
     avg_num_neighbors=training_average_neighbors,
-    operator_plan="generated", generated_layout="packed",
+    operator_plan="checkpoint", torchscript=False,
 )
 model = potential.wrapper.model
+info = configure_model(model, training=False, policy="generated", layout="fused_pack")
 ```
 
 Species, training average neighbor count, cutoff, dtype and E0 must come from
-the actual checkpoint/training record. The API does not force FP64 checkpoints
-to FP32 or silently freeze trainable TP coefficients.
+the actual checkpoint/training record. The loader retains checkpoint precision.
+Its inference wrapper freezes model parameters; `configure_model` itself does
+not freeze or cast them. On K100, use `operator_plan="checkpoint"` in this
+loader and then select native eager HP with `configure_model`. The loader's
+`auto`/`generated` choices prepare deployment Triton operators and are not the
+native K100 recipe. This snippet uses the class's checkpoint-loading
+functionality to obtain a Python model; section 6 covers C++ MFF-Torch deployment.
 
 ## 5. Training
 
@@ -393,7 +405,8 @@ from mace_ictc.training import ForceTrainer
 trainer = ForceTrainer(
     model, train_loader, config=training_config, device="cuda", dtype=torch.float32,
     operator_plan="generated", generated_layout="fused_pack",
-    backward_targets="parameters",  # other established trainer arguments unchanged
+    train_makefx_compile=False,
+    backward_targets="parameters",  # Select other trainer arguments for the task.
 )
 ```
 
@@ -410,66 +423,85 @@ mff-train --data-dir /task/data --dtype float32 \
 
 `--freeze-conv-tp-weight` is an explicit architecture choice for a new model.
 It changes an existing checkpoint whose TP coefficients are trainable.
-`--operator-plan auto` does not change dtype or freeze weights. Explicit make_fx
-training capture uses the reference route under `auto`; its behavior and
-performance must be reported separately from generated eager training.
+`--operator-plan auto` does not change dtype or freeze weights. Keep
+`train_makefx_compile=False` in `ForceTrainer` and omit `--train-makefx-compile`
+on the CLI for the supported K100 eager training path.
 
-## 6. AOTI / LAMMPS
+## 6. Checkpoint conversion and LAMMPS on K100
 
-Python preparation entry point:
-
-```python
-from mace_ictc.hp import prepare_for_export
-
-model.eval().requires_grad_(False)
-info = prepare_for_export(model, policy="generated", layout="fused_pack")
-# Continue with the existing force make_fx -> torch.export -> AOTInductor pipeline.
-# Optional preparation-only control: retain canonical U on its original device.
-# info = prepare_for_export(model, policy="generated", reference_buffer_policy="device")
-```
-
-`layout=None` retains an explicitly selected layout; a new model defaults to
-packed. `dynamic=True` is the default. Existing TorchScript e3nn submodules
-would bake the example N into a symbolic trace, so the API reports their names
-before export. Set `e3nn.set_optimization_defaults(jit_script_fx=False)` before
-rebuilding/loading the model. Pass `dynamic=False` only when deliberately
-preparing a fixed-N package. The export CLI sets this option before model loading.
-
-The function prepares the model. Use the existing export CLI to create the
-package, validate it and write LAMMPS metadata:
+### Convert a supported MACE model
 
 ```bash
-mff-export-aoti --checkpoint trained_model.pth --elements H,C,O \
-  --device cuda --operator-plan generated --generated-layout packed \
-  --avg-num-neighbors TRAINING_VALUE --embed-e0 --out /task/model.pt2
+mff-convert-mace --mace-model original.model --out converted.pth \
+  --product-backend ictd-bridge-u --dtype float32 --device cpu
 ```
 
-The CLI uses the checkpoint weights, actual architecture and precision.
-`--generated-layout fused_pack` compiles fused copies into the new package.
-Changing Python configuration does not update an existing `.pt2` file.
-Export preserves the owned-energy interface, dynamic N/E and message-passing
-depth. The CLI-generated `.meta` also records the requested layout. For complete
-build and usage instructions for `pair_style mff/torch` / `mff/torch/kk`, see the
-[interface documentation](../lammps_user_mfftorch/README.md).
+Run conversion through a batch allocation on the designated compute resources.
+The standard converter targets `ScaleShiftMACE` with natural-parity, contiguous
+hidden degrees of equal channel multiplicity, at least two interactions,
+Bessel radial features, SiLU readout and a uniform correlation across layers.
+It accepts the supported ordinary/residual interaction blocks. Pair repulsion
+and additional distance transforms require the separate foundation-model
+adapter below or another matching implementation.
 
-High-L inference preparation uses bounded export implementations. L4/5, correlation=3
-SC uses a shared quadratic prefix, sparse final coupling and analytic first
-backward kernels. Correlation=2 with channel tails and nonscalar targets also uses sparse export.
-High-L TP is partitioned by input degree and at most two paths; C>=32 adds
-32-channel tiling, retaining graph aggregation and geometry derivatives.
+Radial MLP hidden widths and depth are read from the model. Positive integer
+widths are accepted; an empty list describes a single linear projection.
+The target preserves the original normalized activations, layer weights and
+TP path normalization. `radial_mlp_hidden` is saved in checkpoint architecture
+metadata and restored by the public checkpoint loader. Legacy checkpoints
+without this field retain the `[64, 64, 64]` architecture.
 
-The default `reference_buffer_policy="auto"` leaves original U on the CPU
-after factorization for validated single-device correlation=3 models. `"device"`
-changes preparation-time residency of the original buffers without changing
-exported operators. The CLI option is `--reference-buffer-policy auto|device`.
-These constants are not transferred at every step.
+K100 checks cover `[64,64,64]`, `[32,32,32]`, `[17,31]`, `[96]`,
+`[16,32,48,24]` and `[]`. They include FP64 energy/force agreement with MACE,
+FP32 performance/capacity inference, force-loss parameter and coordinate
+derivatives, legacy checkpoint reload and TorchScript export. This is
+numerical conversion coverage, not a performance guarantee for every width.
 
-Dense U remains registered with its original checkpoint keys. Only the
-factorization tables, projections and frozen weights actually referenced by
-the force graph enter the export package. Parameter or U changes after
-preparation require preparation/export again; old frozen banks are no longer
-valid. A standalone edge wrapper that writes outputs directly cannot replace
-graph messages in the export graph, which require node reduction.
+### Native MFF deployment (default)
+
+`mff-export-core` defaults to native HP performance inference on K100. It
+writes a small TorchScript dispatch archive plus checkpoint and metadata
+sidecars. The C++ engine reconstructs the installed Python HP model and
+registers its operators automatically. It computes forces through autograd;
+there is no whole-network trace or `.pt2` package in this route.
+
+```bash
+mff-export-core --checkpoint converted.pth --elements H C O --out core.pt
+mpirun --bind-to none -np 8 mff-lammps -in in.mfftorch
+```
+
+Use the trained cutoff and species mapping in `pair_style mff/torch/kk` and
+`pair_coeff`. The launcher selects Kokkos, full neighbors, Newton off and host
+owner-map communication. One-cutoff coordinate halos and FP32 RCCL feature
+and adjoint exchange are the native multi-GPU default. The current scope is
+one node, one rank per GPU and a nonempty owned domain on every rank.
+
+`--inference-mode capacity` selects smaller forward chunks with the same
+FP32 model and backward schedule. The performance schedule derives its
+message-memory bound from actual TP widths and device memory. Model channel
+counts, angular degrees, radial-network dimensions, interaction count and
+species are restored from the checkpoint.
+
+Keep `core.pt`, `core.pt.checkpoint.pth`, `core.pt.json` and `core.pt.meta`
+together. A raw Python checkpoint with a `.pt` suffix cannot replace the
+TorchScript dispatch archive. See the [LAMMPS guide](../lammps_user_mfftorch/README.md)
+for builds, inputs, ownership and numerical verification.
+
+### Portable reference export and compatibility APIs
+
+For the original whole-network TorchScript route, pass `--backend reference`
+explicitly. This route uses reference operators and a complete message-depth
+coordinate halo under MPI. Its memory and performance differ from native HP.
+The reference exporter makes GPU device constants relative to the input
+rather than retaining the tracing rank's device index.
+
+`configure_model` configures an eager Python model. It does not change an
+already exported archive; re-export to change an artifact's inference mode.
+
+`prepare_for_export` and `mff-export-aoti` remain in the source for compatibility.
+They are not supported K100 deployment entry points. The presence of an AOTI
+loader header, `MFF_USE_HIP=ON`, or a successful preparation call does not add
+`.pt2` export/runtime support to the current K100 stack.
 
 ## 7. Coverage, defaults and fallbacks
 
@@ -497,6 +529,26 @@ requires coverage and raises an explicit error when its conditions are not met;
 `auto` may select the reference route and return the reasons. Neither freezes
 weights. For inference, explicitly freeze parameters, pass `training=False`
 and use the complete force evaluation in section 4.
+
+On K100, `inference_basis_fusion=True` fuses the fixed input/output basis
+transforms and layout conversions into the native HIP SC circuit and its first
+feature adjoint. Frozen projected SC coefficients and folded TP path scales are
+reused until their parameters change. Normal in-place updates,
+`load_state_dict`, parameter replacement, dtype/device changes and unfreezing
+invalidate the corresponding caches. Direct `.data` mutations bypass PyTorch
+version tracking and are outside the cache contract. Coordinates, features, species
+indices and graph topology remain live inputs. Trainable coefficient banks and
+higher derivatives use the differentiable route.
+
+Small force workloads retain packed HIP basis transforms and fresh weight
+projections, selected by the node/channel work count relative to the GPU's compute-unit count. This dispatch
+accepts arbitrary channel counts and species; it does not specialize a model's
+hyperparameters. Energy-only calls use the direct fused circuit.
+
+Energy-only calls do not retain radial gate pages when no backward pass is
+needed. Force inference retains the configured `gate_cache_bytes` budget;
+capacity mode can keep that budget at zero. These changes preserve FP32
+arithmetic and the original checkpoint parameterization.
 
 | Component | Rules used by the unified policy |
 | --- | --- |
@@ -565,9 +617,9 @@ channels to bound compilation complexity.
 High-L TP with C>=64 generates geometry by input/output angular component.
 L4 training uses 32-channel tiles, while inference retains the original tiling.
 L5 correlation=2 training retains the original tiling and inference uses 32-channel tiles.
-L5 correlation=3 training uses 32-channel tiles; inference uses the original tiling on
-NVIDIA GPUs with compute capability 8.9 and 32-channel tiles elsewhere. This
-device-dependent schedule does not guarantee a speedup for every graph.
+L5 correlation=3 uses 32-channel tiles on the K100 route. High-degree policies
+remain conditional on model coverage and device resources. The low-degree
+K100 measurements do not establish high-degree throughput or capacity.
 
 Cor3 sparse execution sizes work blocks by coefficient count per row, bounding
 per-thread intermediates when a row has many coefficients. Original SC learned weights enter
@@ -621,16 +673,11 @@ select `device`. Frequent alternation between discrete-species HP calls and
 differentiable-attribute reference calls transfers constants; such workloads
 can keep `device` residency.
 
-High-L generated export defaults to CPU U; use
-`prepare_for_export(..., reference_buffer_policy="device")` for device residency.
-Measure peak memory separately for prepared Python, standalone `.pt2` runners
-and actual LAMMPS processes. Eager constant-byte savings cannot directly predict
-the peak-memory difference in the other execution modes.
-
-The GPU CSR schedule applies to eager training/inference. AOTI retains
-prepared Triton message kernels, with separate bounded high-L SC/TP
-implementations from section 6. Measure complete forces with the actual
-AOTI/LAMMPS package; eager speedups do not transfer automatically.
+Measure peak memory separately for eager Python and actual LAMMPS processes.
+Driver, Kokkos and communication allocations are outside PyTorch's peak-allocated
+counter. Eager constant-byte savings do not directly predict complete-process
+memory savings. GPU CSR schedules apply to eager training/inference; portable
+TorchScript deployment uses a separate execution route.
 Explicit `generated` retains reconstruction-accuracy checks against the actual
 U tensors. Exceeding the reconstruction budget raises an error rather than
 reporting an original-SC fallback as HP support. Initial planning/JIT is
@@ -718,7 +765,7 @@ This restriction does not affect standalone TP `execution="legacy"` layout
 compatibility.
 
 Explicit role-based message scheduling covers hidden/edge L<=3. Higher degrees
-retain the `native` route, `high_l_policy` and AOTI. In particular, `canonical`
+retain the `native` route and the applicable `high_l_policy`. In particular, `canonical`
 memory access and experimental multi-warp/grouped schedules are not default
 recommended configurations. Channels, interaction depth and correlation remain
 caller-selected architecture parameters. Performance validation depends on
@@ -733,7 +780,7 @@ op = PackedGraphMessage.create(channels=64, input_lmax=3, edge_lmax=3,
                                cartesian_schedule="native", reduction="csr")
 # x: [N, C*(L_in+1)**2], angular component before channel within each degree
 # sh: [E, (L_edge+1)**2]; g: [E, op.gate_width]
-# src/dst: [E], int64 CUDA, valid node indices; repeated/unsorted entries allowed
+# src/dst: [E], int64 on the K100 GPU, valid node indices; repeated/unsorted entries allowed
 # Output: [N, op.output_width], separate paths, same layout as EdgeTensorProduct.ir_mul
 out = op(x, sh, g, src, dst)
 grad_x, grad_g = torch.autograd.grad(out, (x, g), output_cotangent)
@@ -757,13 +804,13 @@ depends on C, L, graph topology and GPU.
 ```python
 configure_model(model, training=False, policy="generated", layout="fused_pack",
                 message_schedule="roles", graph_reduction="csr",
-                topology_backend="device", csr_accumulator_limit=24)
+                topology_backend="native", csr_accumulator_limit=24)
 configure_model(model, training=True, policy="generated", layout="fused_pack",
                 message_schedule="roles", graph_reduction="csr",
-                topology_backend="device", csr_accumulator_limit=24)
+                topology_backend="native", csr_accumulator_limit=24)
 
 op = PackedGraphMessage.create(channels=64, input_lmax=3, edge_lmax=3,
-     cartesian_schedule="native", reduction="csr", topology_backend="device",
+     cartesian_schedule="native", reduction="csr", topology_backend="native",
      csr_accumulator_limit=24)
 out = op(x, sh, g, src, dst)
 ```
@@ -781,8 +828,8 @@ integer controls the CSR accumulator budget. Reference mode does not use this
 device fast path.
 
 These options preserve architecture, dtype and parameter trainability.
-Validated coverage remains eager GPU FP32; the CSR schedule does not expand
-AOTI performance validation. Experiments with source-fused backward,
+Validated coverage remains eager K100 FP32; CSR settings do not establish
+exported-model support. Experiments with source-fused backward,
 cross-degree fusion and persistent warp scheduling did not show consistent
 benefits and are not defaults.
 
@@ -830,9 +877,8 @@ discrete indices.
 
 This setting preserves radial paging and gate-cache budgets. Select capacity
 and throughput configurations for the workload and check actual energy, forces,
-parameter gradients, warm throughput and peak memory. Fixed-shape CUDA Graphs
-require a separate caller-managed preparation and validation protocol; enabling
-this option does not capture or cache whole-model calls.
+parameter gradients, warm throughput and peak memory. This option does not
+capture whole-model calls; graph replay is outside the supported K100 workflow.
 
 ## Native geometry schedules and edge chunks
 
@@ -851,7 +897,7 @@ Standalone graph operators that already hold all gates can use larger chunks:
 ```python
 op = PackedGraphMessage.create(
     channels=64, input_lmax=3, edge_lmax=3,
-    reduction="csr", topology_backend="device", csr_accumulator_limit=24,
+    reduction="csr", topology_backend="native", csr_accumulator_limit=24,
     csr_slice_search=True, geometry_schedule="streamed",
     edge_chunk_size=1_048_576,
 )
@@ -863,7 +909,7 @@ Whole-model training can explicitly use the same geometry and chunk settings:
 ```python
 configure_model(
     model, training=True, policy="generated", layout="packed",
-    message_schedule="roles", graph_reduction="csr", topology_backend="device",
+    message_schedule="roles", graph_reduction="csr", topology_backend="native",
     csr_accumulator_limit=24, csr_slice_search=True,
     geometry_schedule="streamed", message_chunk_edges=1_048_576,
 )
@@ -875,7 +921,7 @@ Capacity-oriented force inference retains smaller radial-gate chunks:
 model.eval().requires_grad_(False)  # Caller explicitly freezes inference parameters.
 configure_model(
     model, training=False, policy="generated", layout="packed",
-    message_schedule="roles", graph_reduction="csr", topology_backend="device",
+    message_schedule="roles", graph_reduction="csr", topology_backend="native",
     csr_accumulator_limit=24, csr_slice_search=True,
     geometry_schedule="streamed", message_chunk_edges=65_536,
     gate_cache_bytes=0,
@@ -887,8 +933,8 @@ overrides every layer. When training or standalone graph calls already hold
 full gates, larger chunks reduce launch overhead. In streamed radial inference,
 larger chunks enlarge temporary gate buffers, so measure peak memory too.
 Capacity-oriented inference does not automatically enlarge edge chunks.
-These eager-schedule performance observations have not been extended to AOTI
-or existing deployment packages.
+These performance observations apply to eager HP and do not characterize
+the portable TorchScript pair styles.
 
 ### Forward/backward chunks for large C64/L2 systems on K100
 
@@ -958,7 +1004,7 @@ or weights across calls.
 info = configure_model(
     model, training=True, policy="generated", layout="fused_pack",
     message_schedule="roles", species_schedule="indexed",
-    graph_reduction="csr", topology_backend="device",
+    graph_reduction="csr", topology_backend="native",
     csr_accumulator_limit=24, csr_slice_search=True,
     geometry_schedule="streamed", message_chunk_edges=65_536,
     training_gate_schedule="cached",  # Lower memory, with additional training time.
@@ -971,8 +1017,8 @@ trainability, checkpoint keys and the CG/SC polynomials are preserved.
 Fast mixed backward targets parameter-gradient requests such as
 `autograd.grad(loss, trainable_parameters)`. Backward involving coordinate
 Hessians and higher derivatives retains differentiable reference expressions,
-without promising the same memory savings. These schedules are not used for
-AOTI or inference acceleration.
+without promising the same memory savings. These are eager training
+schedules, separate from inference presets.
 
 Reconfiguring without `training_gate_schedule`, or switching to
 `policy="reference"`, restores `"materialized"`. Returned information includes
@@ -1086,7 +1132,7 @@ tradeoff configuration for two-interaction C128/L3 is:
 configure_model(
     model, training=True, policy="generated", layout="fused_pack",
     message_schedule="roles", species_schedule="indexed",
-    graph_reduction="csr", topology_backend="device",
+    graph_reduction="csr", topology_backend="native",
     csr_accumulator_limit=24, csr_slice_search=True,
     geometry_schedule="streamed", message_chunk_edges=1_048_576,
     mixed_channel_tile=64,
@@ -1126,7 +1172,7 @@ model.eval().requires_grad_(False)
 configure_model(
     model, training=False, policy="generated", layout="fused_pack",
     message_schedule="roles", species_schedule="indexed",
-    graph_reduction="csr", topology_backend="device",
+    graph_reduction="csr", topology_backend="native",
     csr_accumulator_limit=24, csr_slice_search=True,
     geometry_schedule="streamed", message_chunk_edges=81_920,
     gate_cache_bytes=5 * 1024**3,
@@ -1152,45 +1198,27 @@ Reconfiguring without this option, switching to `policy="reference"`, or
 selecting training clears the new message layout. Parameter objects,
 trainability and state_dict keys are preserved.
 
-### Channel tiling for force backward kernels
+### Compatibility control for first-backward channel tiling
 
-The configuration above defaults to
-`inference_adjoint_channel_tile="auto"`; `64` can also be selected explicitly.
-This option reuses existing GPU tiled kernels for first-order backward when
-radial-network parameters are frozen and input-feature gradients are needed.
-Forward and the first layer's geometry/gate-only backward kernels keep their schedules.
-No extra intermediate tensor is added; tiled harmonic-gradient reductions
-reuse the existing output buffer. Floating reduction order changes, so
-bitwise equality is not guaranteed.
-
-Allowed values are `"auto"` (default), `0` (original schedule), `32` and `64`.
-Auto disables tiling during training; explicit 32/64 is invalid with
-`training=True`. The option does not freeze parameters or alter differentiable
-higher-order fallbacks. Reconfiguring without it restores auto; setting `0`
-or selecting reference clears tiling. Both capacity-oriented operation with
-`gate_cache_bytes=0` and speed-oriented operation with the original cache
-budget can use this option. Validate other devices/configurations separately.
-
-Auto uses bounded structural rules rather than applying a fixed 64-channel
-schedule to every model. Current automatic coverage is A100 and RTX 4090 D,
-degree layout, streamed geometry and role-specific backward kernels, with at least 4096 edges,
-C between 128 and 256, and maximum angular input/output widths both equal to
-7 (L3 paths). It selects 64 when the source-level live-value estimate
-`ceil(C/32) * max(2*input_width + output_width + 3)` is at least 144; otherwise
-it retains the original schedule. This estimate is not a hardware register count.
-
-Both devices use the same structural rule. Standard RTX 4090 and other Ada
-cards are not automatically enabled by this policy.
-
-The policy reads only shape/device metadata; it performs no online tuning,
-GPU allocation or synchronization. Different atom counts reuse the same
-kernels rather than compiling separately for each N. Unknown devices, small
-workloads and unvalidated angular widths fall back automatically. Capacity
-and speed modes share the same scheduler and differ in gate-cache budget.
-This remains an empirical policy with a defined validation range, without
-guaranteeing optimal speed for every graph distribution or channel count.
+`inference_adjoint_channel_tile` accepts `"auto"`, `0`, `32` or `64`.
+The automatic specialized dispatch is inactive on K100, so `"auto"` retains
+the existing K100 schedule. The documented K100 performance/capacity presets
+use `inference_gate_adjoint_rows`, `inference_message_adjoint_edges` and the
+qualified `dtk2604` GEMM policy instead. Explicit 32/64 tiling requires its own
+K100 validation and is invalid with `training=True`. This control does not
+freeze parameters or change higher-derivative fallback semantics.
 
 ## Nonlinear MACE foundation checkpoints
+
+Export a converted foundation object through the native MFF default:
+
+```bash
+mff-export-core --checkpoint mace-mh-1-ictc-hp.pt --elements Cu \
+  --head omat_pbe --out mh1-core.pt
+```
+
+The runtime evaluates the selected head and retains all original heads in the
+checkpoint. Use the appropriate head and species for the intended system.
 
 `mace_ictc.interfaces.foundation_hp.FoundationHP` supports the
 `RealAgnosticResidualNonLinearInteractionBlock` architecture used by MH-1.
