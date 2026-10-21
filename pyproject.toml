@@ -33,7 +33,7 @@ mff-preprocess = "mace_ictc.cli.preprocess:main"
 license-files = ["LICENSE", "LICENSES/*.txt", "NOTICE", "LICENSE_SCOPE.md", "COMMERCIAL_LICENSE.md"]
 
 [tool.setuptools.packages.find]
-include = ["mace_ictc", "mace_ictc.*"]
+include = ["ictc_o3", "ictc_o3.*", "mace_ictc", "mace_ictc.*"]
 exclude = ["mace_ictc.bench", "mace_ictc.bench.*", "mace_ictc.test", "mace_ictc.test.*"]
 
 [tool.setuptools.package-data]

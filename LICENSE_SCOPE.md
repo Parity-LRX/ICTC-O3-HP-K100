@@ -12,7 +12,8 @@ The PolyForm offer covers the following new HP components and their newly
 added integration changes, to the extent their copyright is controlled by
 the project rights holders:
 
-- `mace_ictc/hp/`: documented standalone operators and whole-model APIs.
+- `ictc_o3/`: documented standalone operator APIs and their HP implementations.
+- `mace_ictc/hp/`: whole-model APIs and compatibility imports for the operators.
 - `mace_ictc/models/generated_cartesian_message.py`,
   `generated_message_second.py`, `generated_direction_harmonics.py`:
   independent CUDA/Triton source generation and adjoints.

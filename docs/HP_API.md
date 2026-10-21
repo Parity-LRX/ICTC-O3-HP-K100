@@ -1,6 +1,8 @@
 # ICTC-O3-HP-K100 API
 
-`mace_ictc.hp` 提供受支持的算子与整网 API；
+`ictc_o3` 提供独立算子 API，`mace_ictc.hp` 提供整网 API；二者是并列的
+顶层 Python 包，随 `ictc-o3-hp-k100` 一起安装。算子速查见 [O3 API](O3_API.md)。
+旧的 `mace_ictc.hp` 算子导入路径继续兼容；
 `models/` 里的 `_source`、`_plan`、原始 CUDA launch 等内部函数无需由用户调用。
 性能对照、测试与验证资料由维护者本地保存，不包含在交付源码和安装包中。
 
@@ -37,7 +39,7 @@ matmul/cuDNN 的 `allow_tf32=False` 固定到进程中，不自动恢复此前�
 
 ```python
 import torch
-from mace_ictc.hp import EdgeTensorProduct, direction_harmonics
+from ictc_o3 import EdgeTensorProduct, direction_harmonics
 
 op = EdgeTensorProduct.create(
     channels=96, input_lmax=3, edge_lmax=3, output_lmax=3,
@@ -132,7 +134,7 @@ dx, dr, dg = torch.autograd.grad(
 需要真实图聚合时调用 `GraphMessage`，而不是把独立边 TP 当作节点消息：
 
 ```python
-from mace_ictc.hp import GraphMessage
+from ictc_o3 import GraphMessage
 
 message = GraphMessage(
     tp, input_lmax=3, edge_lmax=3,
@@ -164,7 +166,7 @@ gather/scatter、初始化和图 reduction。默认保持 `packed`。
 ## 3. 其他高性能算子
 
 ```python
-from mace_ictc.hp import (
+from ictc_o3 import (
     direction_harmonics, create_symmetric_contraction, configure_symmetric_contraction,
     channel_linear, normalized_silu,
 )
@@ -560,7 +562,7 @@ configure_model(model, training=True, policy="generated", message_schedule="nati
 原生 packed 图接口供已经持有二维缓冲的调用方使用：
 
 ```python
-from mace_ictc.hp import PackedGraphMessage
+from ictc_o3 import PackedGraphMessage
 
 op = PackedGraphMessage.create(channels=64, input_lmax=3, edge_lmax=3,
                                cartesian_schedule="native", reduction="csr")

@@ -1,8 +1,8 @@
 """
 ICTC-O3-HP-K100 - HIP optimized operators and MACE-compatible models.
 
-Standalone high-performance library. Stable HP operator and
-whole-network entrypoints are exposed in ``mace_ictc.hp``. The package name
+Standalone high-performance library. Operator entrypoints are exposed in
+``ictc_o3`` and whole-network entrypoints in ``mace_ictc.hp``. The package name
 is retained for checkpoint compatibility; no O2U1 package is required.
 """
 

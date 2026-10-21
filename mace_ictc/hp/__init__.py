@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""Supported high-performance API; see docs/HP_API.md for full usage.
+"""Whole-model HP API and compatibility imports for ``ictc_o3`` operators.
 
 Importing this namespace never builds CUDA extensions or selects a model plan.
+See docs/HP_API.md for model usage and docs/O3_API.md for standalone operators.
 """
 from .operators import (
     EdgeTensorProduct, GraphMessage, PackedGraphMessage, channel_linear,

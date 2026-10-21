@@ -3,8 +3,31 @@
 K100 (`gfx926`) HIP optimized Cartesian tensor operators, atomistic force
 training and inference. Version **0.1.0**.
 
-Distribution: `ictc-o3-hp-k100`. Python namespace: `mace_ictc`, retained for
-model and checkpoint compatibility.
+Distribution: `ictc-o3-hp-k100`. Python packages: `ictc_o3` for standalone
+operators and `mace_ictc` for models, training and conversion.
+
+## Python API
+
+The two packages live side by side and are installed together:
+
+```text
+ictc_o3/          # Public Cartesian tensor operators
+mace_ictc/        # MACE-compatible models, training and interfaces
+```
+
+```python
+from ictc_o3 import (
+    EdgeTensorProduct, GraphMessage, PackedGraphMessage,
+    direction_harmonics, create_symmetric_contraction,
+    configure_symmetric_contraction, channel_linear, normalized_silu,
+)
+from mace_ictc.hp import create_model, configure_model, energy_and_forces
+from mace_ictc.training import ForceTrainer
+```
+
+See the [operator API](docs/O3_API.md) for shapes, gradients and standalone usage,
+and the [model API](docs/HP_API.md) for training, inference and conversion.
+Existing operator imports from `mace_ictc.hp` remain compatible.
 
 ## Installation
 
