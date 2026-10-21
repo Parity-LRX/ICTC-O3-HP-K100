@@ -1,5 +1,7 @@
 # ICTC O3 算子 API
 
+[English](O3_API.en.md) | 简体中文
+
 `ictc_o3/` 与 `mace_ictc/` 位于仓库同一层。前者提供独立算子，后者提供
 MACE 兼容模型、训练器和转换接口。两个包随 `ictc-o3-hp-k100` 一起安装，
 共用现有 HP 内核。使用独立算子无需创建 MACE 模型。
