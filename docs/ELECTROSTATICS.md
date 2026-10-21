@@ -36,6 +36,47 @@ Fixed-sigma models retain their reciprocal energy inside exported graphs.
 The separate C++ reciprocal solver currently uses legacy box-dependent
 screening, so fixed-sigma models do not delegate sources to that solver.
 
+## Whole-model overhead with fixed screening
+
+![Whole-model energy-and-force inference and training throughput, with peak allocated memory, for the short-range HP backbone and learned monopole, dipole and quadrupole extensions.](assets/electrostatics-whole-model-k100.svg)
+
+These are matched, randomly initialized MACE-ICTC models on one K100, using
+C64, lmax=2, two interactions, correlation=3, about 50 neighbors per atom,
+eager FP32, PCS, sigma=1 and one learned source channel. The same backbone
+weights and graph are used with nonzero source gates. Timings include the
+backbone, source prediction and reciprocal module. Training includes the
+energy-plus-force loss, mixed second derivatives and AdamW, using the
+framework default `loss.backward(inputs=trainable_parameters)`.
+Neighbor construction and communication are excluded. Peaks are PyTorch
+allocated memory, excluding driver and external runtime buffers.
+
+For a 64,000-atom cubic box with side 80 and a 160³ mesh:
+
+- Monopoles: energy-and-force inference 489 → 502 ms; training 1488 → 1538 ms.
+- Adding dipoles: inference 489 → 626 ms; training 1488 → 1784 ms.
+- Adding quadrupoles: inference 489 → 893 ms; training 1488 → 2342 ms.
+  Peak allocation changes from 17.20 to 17.92 GiB for inference, and
+  from 51.61 to 52.61 GiB for training.
+
+The small monopole differences should be read with timing variation in mind.
+Three synchronized timing rounds follow compilation and warmup; figures
+show medians and the range of round medians, rather than confidence intervals.
+The scan also includes a C128/lmax=3 model at 16,384 atoms on a 128³ mesh:
+quadrupoles change inference from 435 to 646 ms and training from 1646 to
+2081 ms. Relative overhead depends on backbone cost, source width, rank,
+physical smoothing length, box shape and mesh resolution.
+
+![Box-shape dependence of the whole-model time increase for monopoles, dipoles and quadrupoles.](assets/electrostatics-box-shape-k100.svg)
+
+A 65,536-atom rectangular box with sides 64, 64 and 128 uses a 256³ cubic
+mesh to bound grid spacing by 0.5. Its quadrupole inference takes
+507 → 2326 ms. Dipole and quadrupole training encounter OOM with the default
+PyTorch allocator. This records an allocation failure, not a proven hardware
+capacity limit. A rectangular 128×128×256 mesh would use one quarter as many
+grid points at the same spacing; that mesh shape is not yet supported by
+this API. The cubic-mesh restriction is therefore a substantial cost for
+elongated boxes. Tested endpoints do not establish a maximum system size.
+
 ## Assignment implementation benchmark
 
 ![Single-K100 reciprocal energy-and-force throughput and peak allocated memory, comparing original ICTC Torch operations with native HIP assignment and real FFTs. Error bars show the range of three timing-round medians.](assets/electrostatics-k100.svg)
