@@ -61,8 +61,10 @@ def _plan(owner, x):
     from .reference_u_residency import constant_key
     key=constant_key(owner,x.device,x.dtype)
     cached=getattr(owner,"_factorized_u_cache",None)
-    if cached is not None and cached[0]==key:return cached[1]
-    with torch.no_grad():
+    if (cached is not None and cached[0]==key and (cached[1] is None
+            or all(name in cached[1] for name in ('basis_input','basis_output')))):
+        return cached[1]
+    with torch.inference_mode(False),torch.no_grad():
         qblocks=[value.detach().to(device="cpu",dtype=torch.float64) for value in qs]
         q=torch.block_diag(*qblocks[:owner.lmax+1]);size=q.shape[0]
         targets=[o3.Irrep(module.output_lmax,(-1)**module.output_lmax) for module in modules]
@@ -147,8 +149,46 @@ def _plan(owner, x):
               "reconstruction_relative":reconstruction}
         plan["final"]["weight_node_reduction"]=True
         plan["input_size"]=size
+        # Preserve every coefficient, rounded exactly as the resident basis.
+        # Only fixed basis constants are embedded in the native HIP program.
+        plan['basis_input']=tuple(tuple(row) for row in q.to(dtype=x.dtype).tolist())
+        plan['basis_output']=tuple(tuple(tuple(row) for row in value.to(dtype=x.dtype).tolist())
+                                   for value in qblocks[:owner.target_lmax+1])
         owner._factorized_u_cache=(key,plan)
         return plan
+
+
+def _projected_bank(owner,plan,x):
+    """Reuse frozen projections until the parameters or constant plan change."""
+    weights=tuple(([module.weights_max,*module.weights][module.correlation-order])
+                  for module,order,_ in plan['projections'])
+    cacheable=getattr(owner,'_hip_fused_basis',False) and not any(w.requires_grad for w in weights)
+    if cacheable:
+        from .hip_fused_basis import small_force_workload
+        cacheable=not small_force_workload(x,x.shape[1])
+    signature=None
+    if cacheable:
+        try:
+            signature=tuple((w._version,w.data_ptr(),w.shape,w.device,w.dtype) for w in weights)
+        except RuntimeError:
+            # Inference tensors have no version counter; do not cache them.
+            cacheable=False
+    cached=getattr(owner,'_frozen_projected_bank',None)
+    if (cacheable and cached is not None and cached[0] is plan and cached[2]==signature
+            and len(cached[1])==len(weights) and all(a is b for a,b in zip(cached[1],weights))):
+        return cached[3]
+    owner._frozen_projected_bank=None
+    def project():
+        return torch.cat([torch.einsum('rp,zpc->zcr',projection,weight.to(x))
+                          for (_,_,projection),weight in zip(plan['projections'],weights)],-1)
+    if cacheable:
+        # An energy-only inference_mode call can be followed by force inference.
+        # Autograd must be able to save this tensor in that later call.
+        with torch.inference_mode(False),torch.no_grad():
+            bank=project()
+        owner._frozen_projected_bank=(plan,weights,signature,bank)
+        return bank
+    return project()
 
 
 def factorized_contractions(owner, x, idx):
@@ -171,11 +211,7 @@ def factorized_contractions(owner, x, idx):
         and not getattr(owner,'_staged_circuit',False) and not getattr(owner,'_compact_circuit_adjoints',False)
         and getattr(torch.cuda.get_device_properties(x.device),'gcnArchName','').split(':')[0]=='gfx926')
     native=None if fuse_basis else x@plan['q']
-    banks=[]
-    for module,order,projection in plan["projections"]:
-        weights=[module.weights_max,*module.weights]
-        banks.append(torch.einsum("rp,zpc->zcr",projection,weights[module.correlation-order].to(x)))
-    bank=torch.cat(banks,-1)
+    bank=_projected_bank(owner,plan,x)
     if fuse_basis:
         from .hip_fused_basis import fused
         result=fused(x,bank,idx,plan)
@@ -190,7 +226,7 @@ def factorized_contractions(owner, x, idx):
             active_plan=compact_plan(plan)
         output=species_circuit(native,bank,idx,active_plan)
         parts=output.split(plan["sizes"],-1)
-        return torch.cat([(part@q.T).reshape(n,-1) for part,q in zip(parts,plan["qout"])],-1)
+        return torch.cat([(part@q.T).reshape(n,c*part.shape[-1]) for part,q in zip(parts,plan["qout"])],-1)
     output=x.new_zeros(n,c,sum(plan["sizes"]))
     for species in range(bank.shape[0]):
         rows=torch.nonzero(idx==species,as_tuple=True)[0]
@@ -225,4 +261,4 @@ def factorized_contractions(owner, x, idx):
         value=sparse_weighted_product(left,right,bank[species],plan["final"])
         output=output.index_add(0,rows,value)
     parts=output.split(plan["sizes"],-1)
-    return torch.cat([(part@q.T).reshape(n,-1) for part,q in zip(parts,plan["qout"])],-1)
+    return torch.cat([(part@q.T).reshape(n,c*part.shape[-1]) for part,q in zip(parts,plan["qout"])],-1)

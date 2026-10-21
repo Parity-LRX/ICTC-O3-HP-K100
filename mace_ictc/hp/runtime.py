@@ -157,9 +157,12 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
     chunk independently of forward/cache chunks. Cached gates are sliced as
     views; missing gates are recomputed for each smaller chunk. Zero preserves
     the forward chunk size. This does not change the cache budget automatically.
-    inference_basis_fusion opts into K100 basis/packing fusion around frozen
-    indexed low-L species circuits. It retains an extra feature tensor for the
-    differentiable fallback, so callers should measure their memory budget.
+    inference_basis_fusion fuses fixed basis transforms into native K100 frozen
+    indexed low-L SC circuit loads/stores and first feature adjoints. Frozen
+    weight projections are reused with tensor-version invalidation. Trainable
+    banks and higher derivatives retain the differentiable polynomial route.
+    Small force workloads retain packed HIP basis transforms and fresh weight
+    projections, dispatched by node/channel work relative to compute-unit count.
     species_linear_schedule="grouped" groups integer-indexed element-conditioned
     linear maps (including self connections) by species and uses one GEMM per
     occupied species, avoiding [N,C_out,C_in] weights. It supports arbitrary
@@ -308,6 +311,8 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
             module._hip_fused_basis=bool(basis_enabled and module._species_circuit
                 and not getattr(module,'_staged_circuit',False)
                 and not getattr(module,'_compact_circuit_adjoints',False))
+            if training or not module._hip_fused_basis:
+                module._frozen_projected_bank=None
             indexed_count+=int(module._species_circuit)
     info['species_schedule']=species_schedule if selected else 'reference'
     info['species_linear_schedule']=species_linear_schedule if selected else 'reference'
@@ -317,6 +322,8 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
     info['counts']['hip_basis_fusion']=sum(bool(getattr(module,'_hip_fused_basis',False)) for module in core.modules())
     info['inference_basis_fusion']=bool(info['counts']['hip_basis_fusion'])
     for index,layer in enumerate(interactions):
+        if training or not selected:
+            layer.tp._frozen_gate_weights=None
         degree_layout=selected and not training and inference_message_layout=='degree'
         layer.tp._inference_degree_layout=degree_layout
         layer.tp._inference_adjoint_channel_tile=inference_adjoint_channel_tile if selected and not training else 0

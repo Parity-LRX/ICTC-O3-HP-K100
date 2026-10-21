@@ -19,7 +19,13 @@ def _sum(values):
     return '+'.join(f'({v})' for v in values) if values else '0.0f'
 
 
-def _source(plan,banked):
+def _basis_sum(coefficients,values):
+    # Eliminate only exact zeros. Small nonzero basis entries are retained.
+    return _sum(value if coefficient==1. else f'{_literal(coefficient)}*{value}'
+                for coefficient,value in zip(coefficients,values) if coefficient!=0.)
+
+
+def _source(plan,banked,basis_fused=False):
     pair,final=plan['pair'],plan['final']
     size=plan['input_size'];width=pair['sizes'][3] if pair is not None else 0
     paths=final['sizes'][2];outsize=final['sizes'][3]
@@ -34,7 +40,14 @@ def _source(plan,banked):
            'const int64_t row=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;',
            'if(row>=N*C)return;const int64_t n=row/C,c=row%C;',
            f'const int64_t base=({("IDX[n]*C+c" if banked else "c")})*{paths};']
-    for i in range(size):lines.append(f'const float x{i}=X[(n*{size}+{i})*C+c];')
+    if basis_fused:
+        for i in range(size):lines.append(f'const float u{i}=X[(n*C+c)*{size}+{i}];')
+        q=plan['basis_input']
+        for i in range(size):
+            expr=_basis_sum((row[i] for row in q),(f'u{j}' for j in range(size)))
+            lines.append(f'const float x{i}={expr};')
+    else:
+        for i in range(size):lines.append(f'const float x{i}=X[(n*{size}+{i})*C+c];')
     lines.append(f'const float x{size}=1.0f;')
     for path in range(paths):lines.append(f'const float w{path}=A[base+{path}];')
     lines.append('if constexpr(!BACK) {')
@@ -48,10 +61,29 @@ def _source(plan,banked):
             rhs=_sum(f'{_literal(value)}*w{path}*x{right}' for right,path,value in rows)
             lines.append(f'y{out}+=v*({rhs});')
         lines.append('}')
-    for out in range(outsize):lines.append(f'Y[(n*{outsize}+{out})*C+c]=y{out};')
+    if basis_fused:
+        offset=0
+        for matrix in plan['basis_output']:
+            width_out=len(matrix)
+            for out,row in enumerate(matrix):
+                expr=_basis_sum(row,(f'y{offset+j}' for j in range(width_out)))
+                lines.append(f'Y[n*C*{outsize}+{offset}*C+c*{width_out}+{out}]={expr};')
+            offset+=width_out
+    else:
+        for out in range(outsize):lines.append(f'Y[(n*{outsize}+{out})*C+c]=y{out};')
     lines.append('} else {')
     for i in range(size):lines.append(f'float d{i}=0.0f;')
-    for out in range(outsize):lines.append(f'const float g{out}=G[(n*{outsize}+{out})*C+c];')
+    if basis_fused:
+        offset=0
+        for matrix in plan['basis_output']:
+            width_out=len(matrix)
+            for out in range(width_out):
+                expr=_basis_sum((row[out] for row in matrix),
+                    (f'G[n*C*{outsize}+{offset}*C+c*{width_out}+{j}]' for j in range(width_out)))
+                lines.append(f'const float g{offset+out}={expr};')
+            offset+=width_out
+    else:
+        for out in range(outsize):lines.append(f'const float g{out}=G[(n*{outsize}+{out})*C+c];')
     for left,entries in groups.items():
         identity=left>=width
         terms=prefixes.get(left,[])
@@ -73,7 +105,12 @@ def _source(plan,banked):
             rhs=_sum(f'{_literal(value)}*w{path}*g{out}' for path,out,value in rows)
             lines.append(f'd{right}+=v*({rhs});')
         lines.append('}')
-    for i in range(size):lines.append(f'Y[(n*{size}+{i})*C+c]=d{i};')
+    if basis_fused:
+        for i,row in enumerate(plan['basis_input']):
+            expr=_basis_sum(row,(f'd{j}' for j in range(size)))
+            lines.append(f'Y[(n*C+c)*{size}+{i}]={expr};')
+    else:
+        for i in range(size):lines.append(f'Y[(n*{size}+{i})*C+c]=d{i};')
     lines.extend(['}','}',r'''
 void run(torch::Tensor x,torch::Tensor a,torch::Tensor g,torch::Tensor idx,torch::Tensor out,bool backward) {
  const c10::cuda::CUDAGuard guard(x.device());
@@ -87,7 +124,9 @@ void run(torch::Tensor x,torch::Tensor a,torch::Tensor g,torch::Tensor idx,torch
  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 '''])
-    return '\n'.join(lines)
+    source='\n'.join(lines)
+    if basis_fused:source=source.replace('C=x.size(2)','C=x.size(1)')
+    return source
 
 
 def _training_source(plan,banked,mode,hasx,hasa):
@@ -247,6 +286,27 @@ def _training_raw(x,a,plan,mode,g,hx,ha,idx,packed_input):
             return partial.sum(1).transpose(1,2).contiguous()
         return out.sum(1).T.contiguous()
     return out if packed_input else out.transpose(1,2).contiguous()
+
+
+def raw_basis(x,a,index,plan,mode=0,grad=None):
+    """Frozen inference circuit in the original feature and output layouts."""
+    if mode not in (0,1):raise ValueError('Unknown fused basis circuit mode')
+    n,c,_=x.shape;m=plan['final']['sizes'][3]
+    out=torch.empty_like(x) if mode==1 else x.new_empty(n,c*m)
+    if not out.numel():return out
+    signature=('basis',True)
+    cache=plan.setdefault('hip_circuit_extensions',{})
+    if signature not in cache:
+        source=_source(plan,True,basis_fused=True)
+        key=hashlib.sha256(source.encode()).hexdigest()[:16]
+        if key not in _EXTENSIONS:
+            from .native_jit import load_inline
+            _EXTENSIONS[key]=load_inline(name='ictc_hip_circuit_'+key,
+                cpp_sources='#include <torch/extension.h>\nvoid run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,bool);',
+                cuda_sources=source,functions=['run'],extra_cflags=['-O3'],extra_cuda_cflags=['-O3'])
+        cache[signature]=_EXTENSIONS[key]
+    cache[signature].run(x,a,x if grad is None else grad,index,out,mode==1)
+    return out
 
 
 def raw(x,a,plan,mode,g=None,idx=None,*,hx=None,ha=None,packed_input=False):

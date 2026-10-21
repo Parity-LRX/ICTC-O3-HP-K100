@@ -1,10 +1,15 @@
-# ICTC O3 Operator API
+# ICTC-O3 operator API for K100
 
 `ictc_o3/` and `mace_ictc/` are sibling packages in the repository. The former
 provides standalone operators; the latter provides MACE-compatible models,
 training and conversion interfaces. Both are installed with `ictc-o3-hp-k100`
 and share the existing HP kernels. Standalone operators can be used without
 constructing a MACE model.
+
+This package targets Hygon K100 (`gfx926`) with the matching HIP/DTK PyTorch
+stack. The documented fast path is eager FP32 with native HIP kernels.
+Whole-model `.pt2` deployment and `torch.compile` are outside the supported
+K100 workflow; native kernel JIT compilation is a separate requirement.
 
 ```python
 from ictc_o3 import (
@@ -29,8 +34,7 @@ TP means tensor product; SC means symmetric contraction; CG means
 Clebsch–Gordan. See the [terminology reference](HP_API.md#terminology-and-notation)
 for basis, parity, normalization and derivative conventions.
 
-`device="cuda"` is the PyTorch device name on both CUDA and HIP builds,
-including K100. See [PyTorch HIP semantics](https://docs.pytorch.org/docs/2.7/notes/hip.html).
+`device="cuda"` is the PyTorch GPU device name used by the K100 HIP build. See [PyTorch HIP semantics](https://docs.pytorch.org/docs/2.7/notes/hip.html).
 
 | API | Constructor or factory | Inputs and outputs |
 | --- | --- | --- |
@@ -94,7 +98,7 @@ message = PackedGraphMessage.create(
     reduction="csr", edge_chunk_size=65536, device="cuda",
 )
 # features: [N, 32*9], ir_mul; harmonics: [E,9]
-# gates: [E, message.gate_width]; src/dst: [E], int64 CUDA
+# gates: [E, message.gate_width]; src/dst: [E], int64 on the K100 GPU
 node_paths = message(features, harmonics, gates, src, dst)
 ```
 
@@ -134,7 +138,12 @@ For the dictionary interface, use
   JIT compilation are cold-start costs.
 
 Full parameter descriptions, SC input conventions, layouts, higher-degree
-coverage and export paths are documented in the
+coverage and K100 deployment formats are documented in the
 [detailed API guide](HP_API.md).
 Import model construction and energy/force helpers from `mace_ictc.hp`, and
 the trainer from `mace_ictc.training`.
+
+For model deployment in LAMMPS, the public `mff-export-core` default uses
+native K100 HP kernels and layerwise RCCL feature/adjoint exchange.
+`mff-lammps` selects the Kokkos graph path and loads the exported runtime
+automatically. See the [MFF guide](../lammps_user_mfftorch/README.md).

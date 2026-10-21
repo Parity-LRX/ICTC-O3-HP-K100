@@ -38,12 +38,34 @@ and Triton stack, then install:
 ```bash
 git clone https://github.com/Parity-LRX/ICTC-O3-HP-K100.git
 cd ICTC-O3-HP-K100
-python -m pip install -e '.[hp,train,conversion]'
+python -m pip install -e '.[hp,train,conversion,lammps]'
 ```
 
 The `hp` extra supplies Ninja and preserves the installed vendor Triton.
 GPU execution and just-in-time (JIT) compilation need the matching HIP compiler and runtime.
 On Slurm clusters, run computation through `sbatch` on an allocated GPU.
+
+## K100 execution and deployment
+
+The performance path is eager FP32 with native HIP operators for training
+and inference. Whole-model `torch.compile`, AOTInductor `.pt2` deployment
+and graph replay are outside the supported current K100 workflow.
+Native HIP kernel JIT compilation is a separate requirement.
+
+For LAMMPS deployment, `mff-export-core` defaults to native HP performance
+inference, and `mff-lammps` enables Kokkos/HIP graph preparation. Multi-GPU
+execution exchanges intermediate features and reverse gradients through FP32
+RCCL, using a fresh LAMMPS ghost owner map on every force evaluation.
+
+```bash
+mff-export-core --checkpoint converted.pth --elements H C O --out core.pt
+mpirun --bind-to none -np 8 mff-lammps -in in.mfftorch
+```
+
+Run these commands inside a K100 allocation. `--inference-mode capacity`
+selects smaller forward chunks; `--backend reference` selects portable
+whole-network TorchScript. Build instructions, model packaging and input
+examples are in the [K100 MFF-Torch guide](lammps_user_mfftorch/README.md).
 
 ## Features
 
@@ -51,6 +73,7 @@ On Slurm clusters, run computation through `sbatch` on an allocated GPU.
 - HIP kernels for first-order backward and mixed second derivatives in energy/force training.
 - Streamed inference gates, chunked backward kernels and grouped element-conditioned linear maps.
 - Nonlinear MACE-MH-1 conversion with all original readout heads retained.
+- Standard MACE conversion preserves radial MLP hidden widths and depth.
 - LAMMPS interfaces and model export utilities.
 
 ```python
@@ -80,8 +103,16 @@ atom-steps/s; ghost copies are excluded from the atom count. `k` means thousand.
 
 These measurements use the eager LAMMPS
 [ML-IAP](https://docs.lammps.org/pair_mliap.html) interface with FP32 RCCL feature
-exchange. Standalone `.pt2` deployment has its own backend requirements in the
+exchange through dedicated adapters, separate from the generic Python callback.
+The public MFF native default packages the same native HP execution and
+layerwise transport strategy. The existing figures retain their original
+ML-IAP measurement provenance. `.pt2` deployment is unsupported on K100. See the
 [LAMMPS guide](lammps_user_mfftorch/docs/BUILD_AND_RUN.md).
+
+The packaged MFF native default is also verified on 1/2/4/8 GPUs. Its 8-GPU
+strong/weak efficiencies are 89.21%/90.50% for C64 and
+97.96%/98.00% for MH-1. Weak-scaling throughput reaches 882k and 75.3k
+atom-steps/s, respectively. See the [MFF measurements and protocol](lammps_user_mfftorch/docs/BUILD_AND_RUN.md#packaged-mff-default-complete-md-steps).
 
 ### C64 scaling
 

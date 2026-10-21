@@ -13,6 +13,7 @@ dependencies = ["torch>=2.7", "numpy>=1.20", "e3nn>=0.4.4,<0.6", "ase>=3.22", "o
 
 [project.optional-dependencies]
 hp = ["ninja"]
+lammps = ["mpi4py>=3.1"]
 train = ["h5py", "pandas", "scipy"]
 conversion = ["mace-torch>=0.3.16"]
 
@@ -25,11 +26,13 @@ Issues = "https://github.com/Parity-LRX/ICTC-O3-HP-K100/issues"
 mff-train = "mace_ictc.cli.train:main"
 mff-export-aoti = "mace_ictc.cli.export_aoti_core:main"
 mff-export-core = "mace_ictc.cli.export_libtorch_core:main"
+mff-lammps = "mff_lammps:main"
 mff-convert-mace = "mace_ictc.cli.convert_mace:main"
 mff-convert-foundation = "mace_ictc.cli.convert_foundation:main"
 mff-preprocess = "mace_ictc.cli.preprocess:main"
 
 [tool.setuptools]
+py-modules = ["mff_lammps"]
 license-files = ["LICENSE", "LICENSES/*.txt", "NOTICE", "LICENSE_SCOPE.md"]
 
 [tool.setuptools.packages.find]
