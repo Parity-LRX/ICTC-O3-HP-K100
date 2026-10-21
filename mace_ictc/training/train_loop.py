@@ -1920,6 +1920,7 @@ class ForceTrainer:
                 "long_range_green_mode", "long_range_assignment",
                 "long_range_mesh_fft_full_ewald", "long_range_max_multipole_l",
                 "long_range_mesh_fft_reciprocal_only",
+                "long_range_smearing_sigma",
                 "long_range_multipole_gate_init",
                 "long_range_dispersion_mode", "long_range_dispersion", "dispersion_cutoff",
                 "dispersion_min_cutoff", "dispersion_switch_width",

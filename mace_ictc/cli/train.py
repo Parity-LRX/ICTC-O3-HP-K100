@@ -413,6 +413,7 @@ def build_baseline_model(
     long_range_slab_padding_factor: int = 2,
     long_range_mesh_fft_full_ewald: bool = False,
     long_range_mesh_fft_reciprocal_only: bool = False,
+    long_range_smearing_sigma: float | None = None,
     long_range_max_multipole_l: int = 0,
     long_range_multipole_gate_init: float = 0.1,
     long_range_dispersion_mode: str = "none",
@@ -495,6 +496,7 @@ def build_baseline_model(
         long_range_slab_padding_factor=long_range_slab_padding_factor,
         long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
         long_range_mesh_fft_reciprocal_only=long_range_mesh_fft_reciprocal_only,
+        long_range_smearing_sigma=long_range_smearing_sigma,
         long_range_max_multipole_l=long_range_max_multipole_l,
         long_range_multipole_gate_init=long_range_multipole_gate_init,
         long_range_dispersion_mode=long_range_dispersion_mode,
@@ -627,6 +629,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Use full-Ewald-style mesh FFT correction terms for mesh_fft.")
     ap.add_argument("--long-range-mesh-fft-reciprocal-only", action="store_true",
                     help="Retain only the screened reciprocal functional; omit real/self/background terms.")
+    ap.add_argument("--long-range-smearing-sigma", type=float, default=None,
+                    help="Fixed Gaussian length in coordinate units: exp(-sigma^2*k^2/2). "
+                         "Requires mesh_fft and --long-range-mesh-fft-full-ewald. "
+                         "Omission preserves legacy box-dependent screening.")
     ap.add_argument("--electrostatics-backend", default="auto", choices=["auto", "hip", "reference"],
                     help="Mesh execution backend; hip requires eager K100 FP32/FP64.")
     ap.add_argument("--long-range-max-multipole-l", type=int, default=0,
@@ -1159,6 +1165,7 @@ def main(argv=None):
         long_range_slab_padding_factor=args.long_range_slab_padding_factor,
         long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
         long_range_mesh_fft_reciprocal_only=args.long_range_mesh_fft_reciprocal_only,
+        long_range_smearing_sigma=args.long_range_smearing_sigma,
         long_range_max_multipole_l=args.long_range_max_multipole_l,
         long_range_multipole_gate_init=args.long_range_multipole_gate_init,
         long_range_dispersion_mode=args.long_range_dispersion_mode,
@@ -1299,6 +1306,7 @@ def main(argv=None):
         long_range_assignment=args.long_range_assignment,
         long_range_mesh_fft_full_ewald=bool(args.long_range_mesh_fft_full_ewald),
         long_range_mesh_fft_reciprocal_only=bool(args.long_range_mesh_fft_reciprocal_only),
+        long_range_smearing_sigma=args.long_range_smearing_sigma,
         long_range_max_multipole_l=int(args.long_range_max_multipole_l),
         long_range_multipole_gate_init=float(args.long_range_multipole_gate_init),
         long_range_dispersion_mode=args.long_range_dispersion_mode,

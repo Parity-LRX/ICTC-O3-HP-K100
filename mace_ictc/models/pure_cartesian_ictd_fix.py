@@ -3098,6 +3098,7 @@ class PureCartesianICTDFix(nn.Module):
         long_range_assignment: str = "pcs",
         long_range_mesh_fft_full_ewald: bool = False,
         long_range_mesh_fft_reciprocal_only: bool = False,
+        long_range_smearing_sigma: float | None = None,
         long_range_max_multipole_l: int = 0,
         long_range_multipole_gate_init: float = 0.1,
         long_range_dispersion: bool = False,
@@ -3558,6 +3559,7 @@ class PureCartesianICTDFix(nn.Module):
         self.long_range_neutralize = bool(long_range_neutralize)
         self.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
         self.long_range_mesh_fft_reciprocal_only = bool(long_range_mesh_fft_reciprocal_only)
+        self.long_range_smearing_sigma = long_range_smearing_sigma
         self.long_range_mesh_size = int(long_range_mesh_size)
         self.long_range_slab_padding_factor = int(long_range_slab_padding_factor)
         self.long_range_module = build_long_range_module(
@@ -3579,6 +3581,7 @@ class PureCartesianICTDFix(nn.Module):
             assignment=long_range_assignment,
             mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
             mesh_fft_reciprocal_only=long_range_mesh_fft_reciprocal_only,
+            smearing_sigma=long_range_smearing_sigma,
             max_multipole_l=long_range_max_multipole_l,
             multipole_feature_channels=self.channels,
             theta=long_range_theta,
@@ -3646,7 +3649,8 @@ class PureCartesianICTDFix(nn.Module):
                     self.long_range_module.energy_scale.fill_(1.0)
             # at export the multipole route emits a packed [q|mu|Q] reciprocal_source for the
             # C++ solver (instead of computing the reciprocal energy in-model).
-            self.long_range_exports_reciprocal_source = str(long_range_green_mode) == "poisson"
+            self.long_range_exports_reciprocal_source = (
+                str(long_range_green_mode) == "poisson" and long_range_smearing_sigma is None)
             # Deploy metadata read by export_libtorch_core -> .json -> the C++ engine/solver.
             # The packed per-atom source is [q | dipole_xyz | quad_3x3] per channel (channel-major);
             # the C++ reciprocal solver rebuilds q/mu/Q from source_channels + max_multipole_l, and

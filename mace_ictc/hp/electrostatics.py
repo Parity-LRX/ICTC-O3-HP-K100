@@ -39,11 +39,17 @@ class MeshElectrostatics(nn.Module):
     background Ewald terms. The slab option retains the original padded-cell
     approximation. Native derivatives are implemented through second order;
     select reference for derivatives of higher order.
+
+    smearing_sigma is a fixed length in coordinate units, with spectral factor
+    exp(-sigma^2*k^2/2). The default is 1.0. None restores legacy box-dependent
+    screening. Gaussian screening requires full_ewald=True; a bare kernel uses
+    full_ewald=False together with smearing_sigma=None.
     """
     def __init__(self, *, mesh_size=32, assignment='pcs', boundary='periodic',
                  slab_padding_factor=2, neutralize=True, full_ewald=True,
                  green_mode='poisson', filter_hidden_dim=64,
-                 energy_partition='potential', backend='auto', fuse_multipole_fft=True):
+                 energy_partition='potential', backend='auto', fuse_multipole_fft=True,
+                 smearing_sigma=1.0):
         super().__init__()
         from mace_ictc.models.long_range import MeshLongRangeKernel3D
         if not isinstance(mesh_size, int) or isinstance(mesh_size, bool) or mesh_size < 1:
@@ -54,7 +60,8 @@ class MeshElectrostatics(nn.Module):
             slab_padding_factor=slab_padding_factor, full_ewald=full_ewald,
             reciprocal_only=True, green_mode=green_mode,
             filter_hidden_dim=filter_hidden_dim, energy_partition=energy_partition,
-            mesh_backend=backend, fuse_multipole_fft=fuse_multipole_fft)
+            mesh_backend=backend, fuse_multipole_fft=fuse_multipole_fft,
+            smearing_sigma=smearing_sigma)
 
     def forward(self, pos, batch, cell, monopole, dipole=None, quadrupole=None):
         n = pos.shape[0]

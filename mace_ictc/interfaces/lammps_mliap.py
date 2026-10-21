@@ -1272,6 +1272,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         long_range_assignment = str(arch_meta.get("long_range_assignment", "pcs"))
         long_range_mesh_fft_full_ewald = bool(arch_meta.get("long_range_mesh_fft_full_ewald", False))
         long_range_mesh_fft_reciprocal_only = bool(arch_meta.get("long_range_mesh_fft_reciprocal_only", False))
+        long_range_smearing_sigma = arch_meta.get("long_range_smearing_sigma", None)
         long_range_max_multipole_l = int(arch_meta.get("long_range_max_multipole_l", 0))
         long_range_multipole_gate_init = float(arch_meta.get("long_range_multipole_gate_init", 0.1))
         long_range_dispersion_mode = str(
@@ -1657,6 +1658,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 long_range_assignment=long_range_assignment,
                 long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
                 long_range_mesh_fft_reciprocal_only=long_range_mesh_fft_reciprocal_only,
+                long_range_smearing_sigma=long_range_smearing_sigma,
                 long_range_max_multipole_l=long_range_max_multipole_l,
                 long_range_multipole_gate_init=long_range_multipole_gate_init,
                 long_range_dispersion_mode=long_range_dispersion_mode,

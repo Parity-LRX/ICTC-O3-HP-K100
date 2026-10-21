@@ -1084,6 +1084,7 @@ class MeshLongRangeKernel3D(nn.Module):
         k_norm_floor: float = 1.0e-6,
         mesh_backend: str = "auto",
         fuse_multipole_fft: bool = True,
+        smearing_sigma: float | None = None,
     ):
         super().__init__()
         if boundary not in {"periodic", "slab"}:
@@ -1106,9 +1107,16 @@ class MeshLongRangeKernel3D(nn.Module):
         self.green_mode = str(green_mode)
         self.assignment = str(assignment)
         self.full_ewald = bool(full_ewald)
-        # Latent-Ewald / LES-style: keep the (screened) reciprocal but SKIP the real-space erfc +
-        # self + background -- the network absorbs the real-space part. Much cheaper (no O(N^2) erfc
-        # loop), and a learnable long-range feature rather than an exact Coulomb sum.
+        if smearing_sigma is not None:
+            smearing_sigma = float(smearing_sigma)
+            if not math.isfinite(smearing_sigma) or smearing_sigma <= 0.0:
+                raise ValueError("smearing_sigma must be finite and positive, or None for legacy box-dependent screening")
+            if not self.full_ewald:
+                raise ValueError("smearing_sigma requires full_ewald=True to enable Gaussian screening")
+        self.smearing_sigma = smearing_sigma
+        # A learned reciprocal correction lets the local model fit complementary
+        # terms. An exact Coulomb sum also needs real-space, self and background
+        # terms; the reciprocal correction alone does not reproduce that sum.
         self.reciprocal_only = bool(reciprocal_only)
         self.k_norm_floor = float(k_norm_floor)
         self.ewald_alpha_prefactor = 5.0
@@ -1144,6 +1152,12 @@ class MeshLongRangeKernel3D(nn.Module):
         return 0.5 * periodic_lengths.min(dim=-1).values.clamp_min(self.k_norm_floor)
 
     def _estimate_ewald_alpha(self, real_cutoff: torch.Tensor) -> torch.Tensor:
+        # exp(-k^2/(4 alpha^2)) = exp(-sigma^2 k^2/2). A fixed
+        # physical sigma makes replication leave the reciprocal functional
+        # unchanged. None preserves existing checkpoint behavior.
+        sigma = getattr(self, "smearing_sigma", None)
+        if sigma is not None:
+            return torch.full_like(real_cutoff, 1.0 / (math.sqrt(2.0) * sigma))
         return real_cutoff.new_tensor(self.ewald_alpha_prefactor) / real_cutoff.clamp_min(self.k_norm_floor)
 
     def _init_real_space_shifts(self) -> torch.Tensor:
@@ -1449,6 +1463,7 @@ class LatentReciprocalLongRange(nn.Module):
         assignment: str = "pcs",
         mesh_fft_full_ewald: bool = False,
         mesh_fft_reciprocal_only: bool = False,
+        smearing_sigma: float | None = None,
     ):
         super().__init__()
         if reciprocal_backend not in {"direct_kspace", "mesh_fft"}:
@@ -1470,6 +1485,9 @@ class LatentReciprocalLongRange(nn.Module):
         self.assignment = str(assignment)
         self.mesh_fft_full_ewald = bool(mesh_fft_full_ewald)
         self.mesh_fft_reciprocal_only = bool(mesh_fft_reciprocal_only)
+        self.smearing_sigma = smearing_sigma
+        if smearing_sigma is not None and reciprocal_backend != "mesh_fft":
+            raise ValueError("Fixed smearing_sigma currently requires reciprocal_backend='mesh_fft'")
         self.source_kind = "latent_charge"
         self.source_layout = "channels_last"
         self.runtime_backend = "mesh_fft" if reciprocal_backend == "mesh_fft" else "none"
@@ -1486,10 +1504,13 @@ class LatentReciprocalLongRange(nn.Module):
                 assignment=self.assignment,
                 full_ewald=self.mesh_fft_full_ewald,
                 reciprocal_only=self.mesh_fft_reciprocal_only,
+                smearing_sigma=smearing_sigma,
             )
             # The external reciprocal-only solver cannot reproduce a learned
             # Green filter or optional real/self/background Ewald corrections.
-            self.exports_reciprocal_source = self.green_mode == "poisson" and (
+            # Fixed-sigma models keep their energy inline until the external
+            # C++ solver supports the same physical screening length.
+            self.exports_reciprocal_source = self.green_mode == "poisson" and smearing_sigma is None and (
                 not self.mesh_fft_full_ewald or self.mesh_fft_reciprocal_only)
             self.runtime_backend = "mesh_fft" if self.exports_reciprocal_source else "none"
             self.energy_scale = nn.Parameter(torch.tensor(0.0))
@@ -1626,6 +1647,7 @@ def build_long_range_module(
     assignment: str = "pcs",
     mesh_fft_full_ewald: bool = False,
     mesh_fft_reciprocal_only: bool = False,
+    smearing_sigma: float | None = None,
     theta: float = 0.5,
     leaf_size: int = 32,
     multipole_order: int = 0,
@@ -1662,6 +1684,7 @@ def build_long_range_module(
             assignment=assignment,
             mesh_fft_full_ewald=mesh_fft_full_ewald,
             mesh_fft_reciprocal_only=mesh_fft_reciprocal_only,
+            smearing_sigma=smearing_sigma,
         )
     raise ValueError(f"Unsupported long_range_mode: {mode!r}")
 
@@ -1688,6 +1711,7 @@ def configure_long_range_modules(
     long_range_assignment: str = "pcs",
     long_range_mesh_fft_full_ewald: bool = False,
     long_range_mesh_fft_reciprocal_only: bool = False,
+    long_range_smearing_sigma: float | None = None,
     long_range_theta: float = 0.5,
     long_range_leaf_size: int = 32,
     long_range_multipole_order: int = 0,
@@ -1728,6 +1752,7 @@ def configure_long_range_modules(
     owner.long_range_assignment = str(long_range_assignment)
     owner.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
     owner.long_range_mesh_fft_reciprocal_only = bool(long_range_mesh_fft_reciprocal_only)
+    owner.long_range_smearing_sigma = long_range_smearing_sigma
     owner.long_range_theta = float(long_range_theta)
     owner.long_range_leaf_size = int(long_range_leaf_size)
     owner.long_range_multipole_order = int(long_range_multipole_order)
@@ -1772,6 +1797,7 @@ def configure_long_range_modules(
         assignment=owner.long_range_assignment,
         mesh_fft_full_ewald=owner.long_range_mesh_fft_full_ewald,
         mesh_fft_reciprocal_only=owner.long_range_mesh_fft_reciprocal_only,
+        smearing_sigma=owner.long_range_smearing_sigma,
         theta=owner.long_range_theta,
         leaf_size=owner.long_range_leaf_size,
         multipole_order=owner.long_range_multipole_order,

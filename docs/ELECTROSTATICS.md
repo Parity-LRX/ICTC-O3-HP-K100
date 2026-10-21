@@ -7,7 +7,36 @@ assignment, periodic or padded-slab boundaries, batched triclinic cells,
 and FP32/FP64 on Hygon K100 (`gfx926`). Mesh size is a positive integer;
 the current ICTC interface uses a cubic mesh.
 
-## Measured performance
+## Fixed physical screening
+
+New `MeshElectrostatics` instances and the `create_model(electrostatics=...)`
+factory use `smearing_sigma=1.0`, measured in the same length unit as positions
+and cells. Gaussian screening multiplies the reciprocal kernel by
+`exp(-sigma**2 * k**2 / 2)`, equivalently `alpha = 1/(sqrt(2)*sigma)`.
+The length stays fixed when the box is replicated or strained. It is a model
+hyperparameter; changing it after training changes the potential.
+
+Set `smearing_sigma=None` only to reproduce legacy box-dependent screening
+(`alpha = 10/L_min`). Existing checkpoint metadata without the new field
+retains that legacy rule. Lower-level model constructors and the training
+CLI also preserve their old default; pass `long_range_smearing_sigma=1.0`
+or `--long-range-smearing-sigma 1.0` to opt in. Fixed screening requires
+`mesh_fft` and Gaussian screening enabled (`mesh_fft_full_ewald=True`).
+For a bare kernel, use `full_ewald=False, smearing_sigma=None`.
+
+When replicating a periodic cell, increase mesh dimensions by the same factor
+to retain physical grid spacing. A fixed mesh size is not a fixed spatial
+resolution. The cubic-mesh API uses the largest cell dimension to bound
+spacing; an elongated box can therefore need a larger mesh. Converge mesh
+resolution for the chosen source ranks and smoothing length. In particular,
+high multipole derivatives can amplify mesh aliasing even when energy errors
+look small.
+
+Fixed-sigma models retain their reciprocal energy inside exported graphs.
+The separate C++ reciprocal solver currently uses legacy box-dependent
+screening, so fixed-sigma models do not delegate sources to that solver.
+
+## Assignment implementation benchmark
 
 ![Single-K100 reciprocal energy-and-force throughput and peak allocated memory, comparing original ICTC Torch operations with native HIP assignment and real FFTs. Error bars show the range of three timing-round medians.](assets/electrostatics-k100.svg)
 
@@ -21,11 +50,33 @@ monopole energy-plus-force loss backward and AdamW source update takes
 These measurements isolate the reciprocal module with one prescribed
 source channel, eager FP32 and TF32 disabled. Source prediction, the MACE
 backbone, neighbor construction and multi-GPU communication are excluded.
+This compatibility benchmark uses legacy box-dependent screening
+(`smearing_sigma=None`), rather than the new fixed-length factory default.
 The curves connect measured sizes; endpoints do not establish capacity
 limits. Error bars show timing variation, rather than confidence intervals.
 Smaller workloads show more host-timing variation.
 
 ## Validation
+
+Fixed-length screening is checked separately from implementation parity:
+
+- Two physical lengths and all three source ranks agree with the full-FFT
+  reference through mixed second derivatives. Mesh refinement is compared
+  with an independent continuous structure-factor calculation.
+- Eightfold periodic replication preserves energy per cell and per-atom
+  forces at identical physical grid spacing. Three FP32 whole models with
+  two source channels also preserve the cell virial, with relative errors
+  below `1.1e-6`; force differences are below `3.4e-6`.
+- Nine strain components pass independent FP64 finite differences, including
+  cubic cells with equal lattice-vector lengths.
+- Far-field forces for q–q, q–mu, q–Q, mu–mu, mu–Q and Q–Q recover their
+  expected distance powers and signs. At sigma=1, a 96-unit periodic box
+  and a 192³ PCS mesh, the largest discrepancy from the isolated asymptote
+  over separations 6, 9 and 12 is below 0.86%. This includes periodic-image
+  effects and is not a universal error guarantee.
+- Fixed-length and legacy checkpoints reload their respective screening
+  rules. Whole-model energy/force/virial-loss parameter gradients match the
+  Torch reference for monopole, dipole and quadrupole heads.
 
 K100 validation covers 12 assignment cases, 14 electrostatics configurations,
 24 full-spectrum FFT comparisons, three whole-model energy/force/stress-loss
@@ -52,7 +103,7 @@ from ictc_o3 import MeshElectrostatics
 
 solver = MeshElectrostatics(
     mesh_size=64, assignment="pcs", boundary="periodic",
-    neutralize=True, full_ewald=True, backend="hip",
+    neutralize=True, full_ewald=True, smearing_sigma=1.0, backend="hip",
 ).cuda()
 
 # positions: [N,3]; batch: int64 [N]; cell: [B,3,3], lattice vectors in rows.
@@ -106,7 +157,7 @@ model = create_model(
     electrostatics={
         "mesh_size": 64, "source_channels": 2,
         "max_multipole_l": 2,  # 0: monopoles; 1: add dipoles; 2: add quadrupoles
-        "assignment": "pcs",
+        "assignment": "pcs", "smearing_sigma": 1.0,
     },
 )
 configure_model(
@@ -117,7 +168,7 @@ configure_model(
 
 `electrostatics=None` preserves the short-range factory behavior. A mapping
 enables `reciprocal-spectral-v1` with a periodic mesh, Gaussian screening
-and reciprocal-only energy by default. It accepts the original long-range
+at a fixed length of 1.0 and reciprocal-only energy by default. It accepts the original long-range
 factory options without the `long_range_` prefix. `max_multipole_l` must not
 exceed the backbone `lmax` or 2. Equivariant readouts and channel mixers
 remain trainable. The scalar energy gate starts at zero; the multipole
@@ -144,6 +195,7 @@ Together with `--long-range-mesh-fft-full-ewald`, it selects the screened
 reciprocal functional. This flag is saved and restored in checkpoint
 metadata. A missing flag retains the existing K100 checkpoint default;
 runtime backend choices add no state-dict parameters.
+`long_range_smearing_sigma` is saved and restored alongside these options.
 `ForceTrainer(..., config=cfg, electrostatics_backend="hip")` and CLI
 `--electrostatics-backend hip` explicitly require the eager K100 backend.
 Pass the matching `ModelConfig` to the trainer when writing checkpoints.
@@ -164,6 +216,12 @@ partitioning follow the original ICTC implementation. No additional
 Coulomb unit-conversion constant is inserted; sources and prefactors use
 the caller's unit system.
 
+The forward Fourier transform uses `exp(-i*k.r)`, and the API preserves the
+original `+i*k.mu` source convention. If standalone sources represent a
+physical point-dipole density `-p.grad(delta)`, pass `dipole=-p`. The quadrupole
+term uses the Cartesian second-moment convention shown above, with its factor
+of one half. Learned source heads fit these conventions during training.
+
 HIP kernels calculate weights and derivatives while loading atoms,
 avoiding `[N,stencil,C]` source/gradient temporaries. Their adjoints include
 coordinate Hessian-vector products and source/mesh cross terms. The
@@ -180,9 +238,10 @@ existing scalar exact-Ewald option retains its reference real-space path;
 this change does not accelerate that dense pairwise calculation. Padded
 slab boundaries retain the original approximation, rather than an exact
 two-dimensional Ewald sum. Mesh resolution and padding need physical
-convergence checks. The original adaptive screening estimate uses the
-shortest periodic lattice vector; finite differences at tied shortest
-lengths encounter a nondifferentiable minimum.
+convergence checks. Only the legacy `smearing_sigma=None` estimate uses the
+shortest periodic lattice vector and has a nondifferentiable minimum at tied
+shortest lengths. Fixed-sigma screening removes that minimum from the
+reciprocal energy.
 
 Each graph must supply its physical atoms once. This backend uses one
 device per graph and does not implement distributed FFTs or halo-charge

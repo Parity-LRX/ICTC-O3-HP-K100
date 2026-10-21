@@ -13,7 +13,8 @@ def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
     are trainable. This factory creates initialized weights, not a trained
     potential. Existing checkpoints should be loaded through from_checkpoint.
     electrostatics optionally configures the original learned long-range head;
-    its new-factory default is screened reciprocal-only mesh electrostatics.
+    its new-factory default is reciprocal-only mesh electrostatics with a
+    fixed Gaussian length smearing_sigma=1.0 in coordinate units.
     """
     if not isinstance(num_interactions, int) or isinstance(num_interactions, bool) or num_interactions < 1:
         raise ValueError("num_interactions must be a positive integer")
@@ -40,7 +41,7 @@ def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
                    'source_channels', 'hidden_dim', 'filter_hidden_dim', 'neutralize',
                    'include_k0', 'energy_partition', 'green_mode', 'assignment',
                    'slab_padding_factor', 'mesh_fft_full_ewald', 'mesh_fft_reciprocal_only',
-                   'max_multipole_l', 'multipole_gate_init'}
+                   'max_multipole_l', 'multipole_gate_init', 'smearing_sigma'}
         unknown = set(electrostatics) - allowed
         if unknown:
             raise ValueError(f"Unknown electrostatics options: {sorted(unknown)}")
@@ -48,6 +49,9 @@ def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
                        reciprocal_backend='mesh_fft', mesh_size=32, assignment='pcs',
                        mesh_fft_full_ewald=True, mesh_fft_reciprocal_only=True)
         options.update(electrostatics)
+        if 'smearing_sigma' not in options:
+            options['smearing_sigma'] = (1.0 if options['reciprocal_backend'] == 'mesh_fft'
+                                        and options['mesh_fft_full_ewald'] else None)
         long_range_options = {'long_range_' + key: value for key, value in options.items()}
     from mace_ictc.cli.train import build_baseline_model
     from mace_ictc.utils.config import ModelConfig
