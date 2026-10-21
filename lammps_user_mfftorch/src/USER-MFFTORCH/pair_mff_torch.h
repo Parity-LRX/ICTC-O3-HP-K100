@@ -43,6 +43,8 @@ class PairMFFTorch : public Pair {
   void coeff(int narg, char **arg) override;
   double init_one(int i, int j) override;
   void init_style() override;
+  int pack_forward_comm(int n,int *list,double *buf,int pbc_flag,int *pbc) override;
+  void unpack_forward_comm(int n,int first,double *buf) override;
   int pack_reverse_comm(int n,int first,double *buf) override;
   void unpack_reverse_comm(int n,int *list,double *buf) override;
   void set_physical_cache_requested(bool requested) { physical_cache_requested_ = requested; }
@@ -61,6 +63,9 @@ class PairMFFTorch : public Pair {
   torch::Tensor current_fidelity_tensor(const torch::Device& device);
   void reverse_ghost_contributions(const torch::Tensor& forces,int ntotal,bool add_to_host=true);
   std::vector<double> reverse_force_buffer_;
+  std::vector<double> owner_map_buffer_;
+  bool layerwise_exchange_ = false;
+  void refresh_domain_owners();
 
   double cut_global_ = 0.0;
   double cutsq_global_ = 0.0;
@@ -124,7 +129,7 @@ class PairMFFTorch : public Pair {
 
   // Persistent torch tensors (avoid from_blob().clone() every step).
   int64_t cached_compute_ntotal_ = 0;
-  int64_t cached_compute_nedges_ = 0;
+  int64_t cached_compute_nedges_ = -1;
   int64_t cached_compute_disp_nedges_ = 0;
   torch::Tensor cached_pos_t_;
   torch::Tensor cached_A_t_;

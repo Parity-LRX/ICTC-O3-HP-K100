@@ -1,309 +1,165 @@
-# LAMMPS USER-MFFTORCH
+# LAMMPS USER-MFFTORCH on K100
 
-`USER-MFFTORCH` is a LAMMPS package for running exported MACE-ICTC models through
-LibTorch/AOTInductor from C++. It is intended for molecular dynamics (MD) after a model has
-already been trained or converted in Python and exported as a deployment core.
+`USER-MFFTORCH` runs MACE-ICTC potentials in LAMMPS on Hygon K100 (`gfx926`).
+The default is native HP inference with Kokkos/HIP graph preparation and
+layerwise FP32 RCCL feature exchange. `mff-export-core` packages the model;
+`mff-lammps` loads it and selects the runtime automatically.
 
-## What It Provides
+AOTInductor `.pt2`, whole-model `torch.compile` and graph replay are unsupported
+on the current K100 stack. Native HIP kernel JIT compilation is required and
+is separate from those whole-model compilation mechanisms.
 
-Pair styles:
+## Build and install
 
-- `pair_style mff/torch`: C++ + LibTorch/AOTI inference path. Use this first for
-  build validation and numerical smoke tests.
-- `pair_style mff/torch/kk`: Kokkos/CUDA or HIP data-preparation path plus LibTorch/AOTI
-  inference. Use this for GPU MD when the Kokkos build is available.
+Follow the [build guide](docs/BUILD_AND_RUN.md) to build shared LAMMPS with
+`PKG_USER-MFFTORCH=ON`, `MFF_USE_HIP=ON`, `PKG_KOKKOS=ON` and
+`BUILD_MPI=ON`. Install this repository and the matching LAMMPS Python bindings
+in the same HIP-enabled Python environment, including `.[hp,conversion,lammps]`
+for the MPI Python dependency. Keep MPI, DTK, PyTorch/LibTorch
+and the C++ ABI consistent.
 
-For supported export/runtime stacks, the recommended model artifact is an
-AOTInductor (AOTI) `.pt2` core exported by
-`mff-export-aoti` or `python -m mace_ictc.cli.export_aoti_core`. Legacy
-TorchScript `core.pt` support is still kept for older LibTorch deployments, but
-validation of that deployment route uses `.pt2`. K100 has additional backend
-limitations described under [Build](#build).
+On a Slurm cluster, submit compilation, conversion, export and MD with
+`sbatch`. Run the following commands inside the allocated K100 job.
 
-Notation: N is the number of input nodes, including ghosts when present; E is
-the directed edge count; L is the maximum irrep degree. TP means tensor
-product, CG means Clebsch–Gordan, and U denotes fixed higher-order coupling
-tensors. See the [API terminology](../docs/HP_API.md#terminology-and-notation).
+## Export once
 
-## Generated inference mode
-
-Export defaults to `--operator-plan auto`.
-Supported frozen FP32 MACE-ICTC models with positive channels, L<=5,
-correlation=1/2/3 and full CG
-bridge-U products automatically use generated operators. Unsupported models
-keep their existing route and print a fallback reason. Export using:
+For a converted standard MACE checkpoint:
 
 ```bash
-python -m mace_ictc.cli.export_aoti_core --checkpoint model.pth --elements H,C,O \
-  --angular-basis ictd --embed-e0 \
-  --atoms 128 --degree 50 --device cuda --out core_generated.pt2
+mff-export-core --checkpoint converted.pth --elements H C O --out core.pt
 ```
 
-Use `--operator-plan generated` to require generated coverage, or
-`--operator-plan checkpoint` to retain the legacy export route. The package
-sidecar records the selected plan. This policy does not limit interaction depth
-to two layers. Validate the model and deployment backend used for a trajectory.
+The defaults are `--backend native --inference-mode performance`, FP32 and
+E0 included. Channel count, angular degrees, interaction count, radial MLP,
+cutoff and species come from the checkpoint. Forward message chunks are
+bounded using the actual tensor-product width and device memory; backward
+chunks are bounded separately. No model dimensions are fixed to the C64 test.
 
-Use the trained species, dtype and neighbor normalization. `generated` requires
-an FP32 checkpoint, no interaction attention and no cuEquivariance (cuEq) modules. TP and angular
-harmonics retain the Cartesian ICTC basis; symmetric contraction retains its
-existing internal basis bridge. The standalone C++ LibTorch/AOTI runtime was
-validated with PyTorch 2.7.1 built for CUDA 12.8; for that route, Python and
-Triton are needed during export only. This does not establish K100 AOTI support.
-
-Generated export enables the owned-energy input automatically and writes the
-interaction depth into `core_generated.pt2.meta`. Keep the sidecar with the
-package. Dynamic N/E export is the default, avoiding a maximum-node padding
-allocation when the ghost count varies.
-
-High-L generated export uses bounded sparse correlation=3 contractions and input-degree
-TP partitions with channel tiles. Canonical high-L/correlation=3 reference U remains on
-CPU after preparation; the package captures only its required factorized GPU
-constants. `--reference-buffer-policy device` retains the original U on GPU
-during preparation for tooling or memory controls. Checkpoint keys and weights
-are retained. Keep the newly exported `.pt2` together with its `.pt2.meta`;
-updating Python does not update an existing deployment binary. This selection
-does not establish performance or trajectory accuracy for every architecture.
-
-Python checkpoint inference also defaults to auto selection through
-`LAMMPS_MLIAP_MFF.from_checkpoint`; pass `operator_plan="checkpoint"` to opt out.
-TorchScript keeps the original path. Training auto selection preserves all
-original trainable weights and only chooses the full generated training route
-when TP base coefficients are already fixed; it never freezes them to obtain
-a speedup.
-
-Run the CUDA/Kokkos executable with `-k on g 1 -sf kk -pk kokkos neigh full
-newton off comm no`. In the input, use `atom_modify map array` before reading the
-data, `pair_style mff/torch/kk <trained-cutoff> cuda`, and the usual element
-mapping in `pair_coeff * * core_generated.pt2 ...`. On Slurm clusters, builds,
-export, numerical validation and MD must run inside a job submitted with `sbatch`.
-
-Single-rank periodic graphs fold ghosts into their local owners. MPI uses the
-exported depth for its halo, selects only the required graph centers, computes
-forces from local energies and reverses ghost derivatives even with Newton off.
-Older AOTI packages without an ownership input are rejected on an unfolded MPI
-graph; re-export them with `--owned-energy-mask` or `--operator-plan generated`.
-For older artifacts without depth metadata, set `depth <layers>` in pair_style.
-
-LibTorch follows the actual Kokkos GPU device. Bind GPUs per rank with the scheduler/MPI launcher;
-an inherited `SLURM_LOCALID=0` in every Intel-Hydra child is not a valid two-GPU
-binding. Energy/force, virial/pressure and trained-potential trajectory accuracy
-require their own validation for the user's model and deployment.
-
-Current supported deployment output is energy and force. Physical tensor outputs
-are not a supported public LAMMPS interface in the current `.pt2` deployment
-path; do not rely on `compute mff/torch/phys` for production runs.
-
-## Install Into LAMMPS
-
-Copy the current package files into the LAMMPS source tree:
-
-- `lammps_user_mfftorch/src/USER-MFFTORCH/` to `LAMMPS/src/USER-MFFTORCH/`
-- `lammps_user_mfftorch/cmake/Modules/Packages/USER-MFFTORCH.cmake` to
-  `LAMMPS/cmake/Modules/Packages/USER-MFFTORCH.cmake`
-
-Some LAMMPS versions also require adding `USER-MFFTORCH` to package lists in
-`LAMMPS/cmake/CMakeLists.txt`. The [build and run guide](docs/BUILD_AND_RUN.md)
-covers these edits, backend options and terminology.
-
-## Build
-
-Example CUDA/Kokkos build for A100/A30:
+For a converted MACE-MH-1 `FoundationHP` object:
 
 ```bash
-cd /path/to/lammps
-export LIBTORCH_PREFIX="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
-
-cmake -S cmake -B build-mfftorch-kk \
-  -D CMAKE_PREFIX_PATH="$LIBTORCH_PREFIX" \
-  -D PKG_USER-MFFTORCH=ON \
-  -D PKG_KOKKOS=ON \
-  -D Kokkos_ENABLE_CUDA=ON \
-  -D Kokkos_ARCH_AMPERE80=ON
-
-cmake --build build-mfftorch-kk -j
+mff-export-core --checkpoint mace-mh-1-ictc-hp.pt --elements Cu \
+  --head omat_pbe --out mh1-core.pt
 ```
 
-For a non-Kokkos validation build, drop the Kokkos options and use a separate
-build directory, for example `build-mfftorch`.
+The selected head is used for evaluation; all original heads remain in the
+checkpoint. Use species present in the checkpoint and the head appropriate
+for the intended calculation.
 
-The K100 branch also provides `-D MFF_USE_HIP=ON` against HIP-enabled LibTorch.
-For `mff/torch/kk`, additionally enable `PKG_KOKKOS` and `Kokkos_ENABLE_HIP`.
-The vendor Kokkos/compiler stack must support gfx926;
-graph construction, edge sorting and force writes stay on device. HIP graph
-replay is not enabled by this option. Compiling the engine does not make a CUDA `.pt2` package
-portable: export/runtime support must be checked on the target stack.
-On the tested K100/DTK 26.04 stack, portable TorchScript uses the reference
-operators; the optimized eager HP path currently requires an experimental
-in-process Python dispatcher bridge. It is not a standalone exported model.
-The MPI path disables GPU-aware MPI and uses host communication for ghost
-forces. Its single-rank graph folds periodic images; multiple ranks use
-depth-dependent halos and local-energy derivatives followed by reverse force
-communication. Constant-pressure MD (NPT), virial accuracy and execution across
-multiple nodes require separate validation.
+Keep these four files together when moving an exported model:
 
-For short-range MPI inference, an eager TorchScript bridge can optionally export
-`forward_owned(pos, A, batch, src, dst, shifts, cell, edge_vec, nlocal: int)`.
+- `core.pt`: small TorchScript dispatch archive.
+- `core.pt.checkpoint.pth`: weights and architecture.
+- `core.pt.json`: runtime configuration, species and head.
+- `core.pt.meta`: C++ backend and message-passing metadata.
 
-The engine preserves `forward_owned` during freezing and selects it when local and
-halo atoms coexist. It must return one energy slot per input atom, with correct
-energies for the owned prefix and coordinate derivatives for every required
-local/ghost atom. Ghost energy values are unspecified. Ordinary cores continue
-to use `forward`.
+The native backend calls the installed Python HP runtime from LibTorch.
+It reconstructs the model and registers dispatch operators automatically;
+users do not need a private adapter or manual operator registration.
+A Python checkpoint renamed to `.pt` is not a deployment archive.
 
-`PureCartesianICTDFix.forward(..., local_atom_count=nlocal)` provides a matching
-short-range inference path: it traces the owned energies' layer dependencies
-on the GPU, prunes unnecessary receiver edges and product rows, and retains
-all required coordinate gradients. `compact_local_states=True` also compacts
-intermediate features and remaps receiver/source indices between layers.
-`compact_local_messages=True` additionally writes generated TP messages directly
-into the required receiver rows, reducing message allocation and subsequent
-projection/self-connection matrix multiplications. It retains gradients with
-respect to all required source coordinates.
-Both options default to false. This short-range path uses eager execution
-through the Python bridge and requires no attention, long-range/dispersion
-modules or feature callbacks. It does not reduce the communication halo depth
-or create a standalone exported model.
+Use `--inference-mode capacity` for smaller forward message chunks. This
+changes memory scheduling while retaining FP32 arithmetic and model weights.
+A separate `--backend reference` option exports the original portable
+whole-network TorchScript route. It uses reference operators and a complete
+message-depth coordinate halo under MPI; its speed and capacity differ.
 
-An eager shape-tuned core may also export `warmup_on_real_graph() -> bool`.
-The engine preserves this method when freezing. Returning true skips only the
-synthetic warmup graph; the first real compute still runs normal energy/force
-evaluation. Callers must exclude real-graph initialization/autotuning from
-steady-state timing. Existing cores without this method retain their warmup.
+## Run directly
 
-At runtime, make sure the PyTorch shared libraries are visible:
-
-```bash
-export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):${LD_LIBRARY_PATH:-}"
-```
-
-## Export a Model
-
-Basic `.pt2` export from a MACE-ICTC checkpoint:
-
-```bash
-mff-export-aoti \
-  --checkpoint model.pth \
-  --elements H,C,N,O \
-  --out model.pt2 \
-  --dynamic \
-  --dtype float32 \
-  --device cuda \
-  --embed-e0
-```
-
-For deliberate fixed-N deployment, an example with dynamic edge count is:
-
-```bash
-mff-export-aoti \
-  --checkpoint model.pth \
-  --elements H,C,N,O \
-  --atoms 256 \
-  --degree 32 \
-  --static-n \
-  --dynamic \
-  --dtype float32 \
-  --device cuda \
-  --embed-e0 \
-  --out model_static256.pt2
-```
-
-Rules that matter:
-
-- `--elements` selects checkpoint species. Each `pair_coeff` symbol maps one
-  LAMMPS atom type to an exported element.
-- `--embed-e0` makes LAMMPS `pe` include the checkpoint's per-element
-  atomic-energy offsets (E0).
-- `--degree` is the synthetic export graph's average directed degree, not a
-  maximum physical coordination number. The example has `E=atoms*degree`.
-- `--static-n` fixes N; without `--dynamic`, E is fixed too. Capacity applies
-  to each rank's model input, including ghosts. Keep the exported shape
-  constraints and `.meta` sidecar consistent with the deployment.
-- A loaded checkpoint retains its actual dtype; `--dtype float32` does not
-  convert an FP64 checkpoint to FP32.
-- Always check the exporter's eager-vs-compiled energy/force comparison before
-  running LAMMPS.
-
-## LAMMPS Input
-
-Minimal example:
+Example input for an H/C/O potential trained with cutoff 4.5 Å and `metal` units:
 
 ```lammps
 units metal
 atom_style atomic
 atom_modify map array
 boundary p p p
-
 read_data system.data
-neighbor 1.0 bin
 
-pair_style mff/torch/kk 5.0 cuda
-pair_coeff * * /path/to/model.pt2 H C N O
+neighbor 0.5 bin
+pair_style mff/torch/kk 4.5 cuda
+pair_coeff * * /path/to/core.pt H C O
 
-velocity all create 300 42
-fix 1 all nve
-run 100
+thermo 1
+thermo_style custom step pe fmax
+run 0
 ```
 
-Notes:
-
-- `5.0` is the trained cutoff in ångströms (Å) for this example with `metal` units.
-- The `pair_coeff` element list maps LAMMPS atom types to element symbols. Use
-  `NULL` for atom types that should be skipped.
-- Both `mff/torch` and `mff/torch/kk` can load `.pt2`; the `/kk` variant uses
-  Kokkos for the GPU data path.
-
-## Multi-GPU MPI Runs
-
-LAMMPS multi-GPU execution uses MPI domain decomposition: run one MPI rank per GPU.
-Do not expect one LAMMPS rank to drive all GPUs.
-
-Plain LibTorch/AOTI path:
+After setting the binding and library paths from the build guide, launch
+on one GPU or eight GPUs inside the allocation:
 
 ```bash
-export MFF_DEBUG_BUNDLE=1
-mpirun -np 2 /path/to/lmp -in in.mfftorch
+mff-lammps -in in.mfftorch
+mpirun --bind-to none -np 8 mff-lammps -in in.mfftorch
 ```
 
-with:
+`mff-lammps` enables Kokkos, full neighbors, Newton off and host communication
+for the small owner map. It detects the visible GPU count; use `--gpus N` if
+the site's launcher needs an explicit Kokkos device count. `cuda` is PyTorch's
+GPU device name on the K100 HIP build. The C++ engine binds HP execution to
+the device selected by Kokkos.
 
-```lammps
-pair_style mff/torch 5.0 cuda
-pair_coeff * * /path/to/model.pt2 H C N O
-```
+For plain graph preparation, use `pair_style mff/torch 4.5 cuda` and
+`mff-lammps --plain -in in.mfftorch`. The Kokkos route is the performance default.
 
-Kokkos GPU data path:
+`run 0` evaluates the configuration. Set the pair-style cutoff to `max_radius` recorded in `core.pt.json`.
+Choose the timestep, velocities and
+integrator for the actual potential before running MD. Keep the trained
+cutoff, neighbor normalization, units, E0 convention and element mapping.
+
+## Ghosts and communication
+
+Single-rank execution folds periodic image ghosts into their local owners.
+For native MPI execution, the coordinate halo covers one cutoff. Every force
+evaluation refreshes the ghost owner rank and local index through the current
+LAMMPS communication plan. Intermediate features and their reverse gradients
+use FP32 RCCL; repeated periodic images accumulate their adjoints into the
+same owner. A zero dependency keeps reverse collectives ordered even for
+zero-neighbor domains, while preserving isolated-atom energies. Coordinate derivatives are returned through LAMMPS reverse force
+communication. Migration and atom sorting do not reuse a stale owner map.
+
+Standard MACE models exchange hidden states between interactions. FoundationHP
+models exchange projected features after `linear_up`, retaining only owned
+hidden states. Message depth is restored from the export metadata.
+
+The qualified native MPI scope is one node, one MPI rank per GPU, a single
+LAMMPS communicator and at least one owned atom per rank. LAMMPS partitions
+and empty domains are rejected. Multi-node execution requires separate
+qualification and is not enabled by these defaults.
+
+## Conversion and precision
 
 ```bash
-export MFF_DEBUG_BUNDLE=1
-mpirun -np 2 /path/to/lmp -k on g 2 -sf kk -pk kokkos newton off neigh full comm no -in in.mfftorch
+mff-convert-mace --mace-model original.model --out converted.pth \
+  --product-backend ictd-bridge-u --dtype float64 --device cpu
 ```
 
-with either:
+The standard converter preserves radial MLP depth and hidden widths, normalized
+activations, TP path normalization, E0 and energy scale/shift. An empty hidden
+list is a single linear projection. Legacy checkpoints without
+`radial_mlp_hidden` retain `[64,64,64]`.
 
-```lammps
-pair_style mff/torch/kk 5.0 cuda
-pair_coeff * * /path/to/model.pt2 H C N O
-```
+The supported standard architecture uses ordinary/residual MACE interactions,
+Bessel radial features, natural-parity contiguous hidden degrees with uniform
+multiplicity, uniform correlation, SiLU readout and at least two interactions.
+Nonlinear foundation models use `mff-convert-foundation`; see the
+[conversion API](../docs/HP_API.md#6-checkpoint-conversion-and-lammps-on-k100).
+Native MFF currently exports short-range scalar energy models. Extra input
+heads, physical tensor outputs and long-range/dispersion extensions require
+their corresponding implementation and validation.
 
-or `pair_style mff/torch` when `-sf kk` mapping is available in the build.
+Native inference uses FP32 with TF32 disabled. Export retains the original
+checkpoint; the runtime creates the FP32 inference model. Validate energy
+and complete force vectors against the source model in the same precision.
 
-The plain `mff/torch` engine selects the local GPU device from local-rank
-environment variables such as `SLURM_LOCALID`, `LOCAL_RANK`,
-`OMPI_COMM_WORLD_LOCAL_RANK`, or `MPI_LOCALRANKID`. The Kokkos variant maps
-ranks to Kokkos GPUs correctly for the common single-node, one-rank-per-GPU
-case. Validate multi-node Kokkos runs before production.
+## Pressure and validation scope
 
-With `MFF_DEBUG_BUNDLE=1`, initialization prints the requested and selected
-device. Check that different local ranks select different GPUs. Before a long
-MD run, compare `run 0` energy and forces for `-np 1` and the intended MPI rank count. Small FP32
-roundoff differences are possible; large differences usually mean a domain
-decomposition, cutoff, ghost, or static `.pt2` capacity issue.
+Energy and forces are the primary outputs. Kokkos virial accumulation is
+controlled by `MFF_ENABLE_VIRIAL`, which defaults to `OFF`. Pressure, per-atom
+stress, NPT and long-trajectory stability require their own numerical checks.
+LAMMPS `fmax` is the largest absolute force component, not an atom's force norm.
 
-## Numerical comparison
-
-Compare the original checkpoint, converted model, compiled core and LAMMPS
-energy/forces on the same geometry and energy convention. LAMMPS `fmax` is the
-maximum absolute force component; it differs from the maximum per-atom force
-norm. See the [build and run guide](docs/BUILD_AND_RUN.md#8-troubleshooting)
-for shape, ownership and pressure checks.
+The repository's existing scaling figures were measured with dedicated eager
+ML-IAP/RCCL adapters. Their original scripts have been rerun on K100; the MFF
+native default uses the same native kernels and layerwise transport strategy.
+See the [build guide](docs/BUILD_AND_RUN.md#9-numerical-verification) for the
+separate checks of the shipped MFF path.

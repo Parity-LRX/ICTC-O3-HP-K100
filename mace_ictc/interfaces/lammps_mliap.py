@@ -1497,6 +1497,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 num_layers=config.num_layers,
                 num_interaction=num_interaction,
                 invariant_channels=invariant_channels,
+                radial_mlp_hidden=ckpt.get("radial_mlp_hidden", arch_meta.get("radial_mlp_hidden")),
                 function_type_main=config.function_type,
                 lmax=config.lmax,
                 ictd_tp_path_policy=ictd_tp_path_policy,
