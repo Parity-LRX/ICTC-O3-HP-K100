@@ -1,76 +1,62 @@
-# LAMMPS + Kokkos + LibTorch 完整编译与运行指南
+# Build and run LAMMPS with USER-MFFTORCH
 
-本文档描述如何从零编译带 **Kokkos GPU** 与 **USER-MFFTORCH**（LibTorch 势函数）的 LAMMPS，并完成端到端 MD 运行。
+`USER-MFFTORCH` runs exported MACE-ICTC potentials through LibTorch, the C++
+interface to PyTorch. The `mff/torch/kk` pair style additionally uses Kokkos for
+GPU graph preparation and force writes. Molecular dynamics (MD) uses the
+checkpoint's trained cutoff, species, normalization and energy convention.
 
-## 目录
+This guide covers package installation, model export and execution. For the
+Python operators and model configuration, see the [HP API](../../docs/HP_API.md).
+For deployment limitations and optional eager interfaces, see the
+[package overview](../README.md).
 
-1. [前置条件](#1-前置条件)
-2. [获取 LAMMPS 源码](#2-获取-lammps-源码)
-3. [安装 USER-MFFTORCH](#3-安装-user-mfftorch-到-lammps-源码树)
-4. [修改 CMakeLists.txt](#4-修改-lammps-cmakeliststxt一次性)
-5. [CMake 配置](#5-cmake-配置)
-6. [编译](#6-编译)
-7. [导出 LAMMPS 模型 core](#7-导出-lammps-模型-core)
-8. [运行 LAMMPS](#8-运行-lammps)
-9. [一键测试脚本](#9-一键测试脚本)
-10. [故障排查](#10-故障排查)
+## 1. Requirements and execution environment
 
----
+Use Linux with:
 
-## 1. 前置条件
+- A C++17 compiler and CMake compatible with the selected LAMMPS, LibTorch and
+  GPU toolchain versions.
+- Python 3.10 or later and PyTorch 2.7 or later for this Python package.
+- LibTorch matching the export/runtime stack, including its C++ ABI.
+- A matching CUDA toolchain for NVIDIA GPUs, or the vendor HIP/DTK toolchain
+  and HIP-enabled PyTorch for K100.
+- MPI for domain decomposition across multiple processes; Kokkos built for the
+  target GPU backend when using `mff/torch/kk`.
 
-### 1.1 系统与工具
-
-| 依赖 | 要求 |
-|------|------|
-| 操作系统 | Linux（推荐，用于 CUDA） |
-| CMake | ≥ 3.20 |
-| C++ 编译器 | GCC 7+ 或 Clang，支持 C++17 |
-| CUDA | 11+（与 PyTorch/LibTorch 版本匹配） |
-| Python | 3.9+（用于 MACE-ICTC 导出 `.pt2` / `core.pt`） |
-
-### 1.2 Python 环境
-
-- 安装 PyTorch（含 CUDA 支持，与 GPU 驱动版本匹配）：
-  ```bash
-  pip install torch  # 或根据 CUDA 版本选择 torch+cu118 等
-  ```
-- 安装本仓库：
-  ```bash
-  pip install -e .  # 在 rebuild 仓库根目录
-  ```
-
-### 1.3 LibTorch 路径
-
-USER-MFFTORCH 通过 `find_package(Torch)` 查找 LibTorch。推荐使用 **Python 内置的 LibTorch**：
+Install this repository into an environment that already has the appropriate
+vendor PyTorch and Triton packages:
 
 ```bash
-python -c "import torch; print(torch.utils.cmake_prefix_path)"
+python -m pip install -e '.[hp,conversion]'
 ```
 
-输出示例：`/path/to/python/site-packages/torch/share/cmake/Torch`。将该路径传给 CMake 的 `CMAKE_PREFIX_PATH`。
+Do not replace the K100 vendor stack with a generic CUDA PyTorch installation.
+In HIP-enabled PyTorch, `device="cuda"` and `torch.cuda` remain the GPU API
+names; see [PyTorch HIP semantics](https://docs.pytorch.org/docs/2.7/notes/hip.html).
 
----
+On Slurm clusters, submit builds, export/conversion, validation and MD through
+`sbatch`. The computation commands below belong inside an allocated batch job;
+use `srun` only within that job and follow the site's GPU binding policy.
+Source checkout, file copying and editing can be done before submission.
 
-## 2. 获取 LAMMPS 源码
+## 2. Obtain LAMMPS
+
+Choose a LAMMPS release compatible with your toolchain. For example, to check
+out the [22 July 2025 release](https://github.com/lammps/lammps/releases/tag/stable_22Jul2025):
 
 ```bash
-# 方式 A：下载官方源码
-wget https://download.lammps.org/tars/lammps-22Jul2025.tar.gz
-tar xzf lammps-22Jul2025.tar.gz
-cd lammps-22Jul2025
-
-# 方式 B：Git 克隆
 git clone https://github.com/lammps/lammps.git
 cd lammps
-git checkout 22Jul2025  # 或 develop 等
+git checkout stable_22Jul2025
 ```
 
----
+Keep the LAMMPS and model-export environments consistent. A `.pt2` package
+contains compiled code for its export backend; copying it does not convert
+CUDA kernels to HIP kernels.
 
-## 3. 安装 USER-MFFTORCH 到 LAMMPS 源码树
+## 3. Install USER-MFFTORCH in the LAMMPS source tree
 
-在 **ICTC-O3-HP 仓库根目录**，将接口源码复制到目标 LAMMPS 源码树：
+From the ICTC-O3-HP-K100 repository root:
 
 ```bash
 lammps_source=/path/to/lammps
@@ -78,568 +64,394 @@ mkdir -p "$lammps_source/src/USER-MFFTORCH"
 cp -R lammps_user_mfftorch/src/USER-MFFTORCH/. "$lammps_source/src/USER-MFFTORCH/"
 ```
 
-然后根据目标 LAMMPS 的目录约定复制对应 CMake 文件：
+Copy the package CMake file to the layout used by that LAMMPS release.
+For releases using `cmake/Modules/Packages`:
 
 ```bash
 cp lammps_user_mfftorch/cmake/Modules/Packages/USER-MFFTORCH.cmake \
   "$lammps_source/cmake/Modules/Packages/"
-# 对采用 cmake/Packages 的版本，改用该目录下的同名文件。
 ```
 
-本仓库不分发内部测试或安装任务脚本。完成上述复制后，按下一节配置 LAMMPS。
+For releases using `cmake/Packages` instead:
 
----
-
-## 4. 修改 LAMMPS CMakeLists.txt（一次性）
-
-LAMMPS 默认不识别 `USER-MFFTORCH`，需手动修改 `LAMMPS/cmake/CMakeLists.txt`。
-
-### 4.1 添加 USER-MFFTORCH 到 STANDARD_PACKAGES
-
-找到 `set(STANDARD_PACKAGES ...)`，在列表末尾添加 `USER-MFFTORCH`：
-
-```cmake
-set(STANDARD_PACKAGES
-   ...
-   VTK
-   YAFF
-   USER-MFFTORCH)  # 添加此行
+```bash
+cp lammps_user_mfftorch/cmake/Packages/USER-MFFTORCH.cmake \
+  "$lammps_source/cmake/Packages/"
 ```
 
-### 4.2 添加 USER-MFFTORCH 到 PKG_WITH_INCL
-
-找到 `foreach(PKG_WITH_INCL ...)` 的 include 列表（用于链接外部库的包，如 GRAPHICS、PYTHON、ML-IAP 等），在其中加入 `USER-MFFTORCH`。
-
-**方式 A：加入现有 foreach 列表**
-
-```cmake
-foreach(PKG_WITH_INCL GRAPHICS KSPACE PYTHON ML-IAP ... USER-MFFTORCH)
-  if(PKG_${PKG_WITH_INCL})
-    include(Packages/${PKG_WITH_INCL})
-  endif()
-endforeach()
-```
-
-**方式 B：单独添加（若找不到合适列表）**
-
-在 `foreach(PKG_WITH_INCL ...)` 附近添加：
+In `LAMMPS/cmake/CMakeLists.txt`, add `USER-MFFTORCH` to the
+`STANDARD_PACKAGES` list. Also add it to the existing `PKG_WITH_INCL` loop
+that includes external-library package definitions. If that loop is absent,
+add one conditional include, using the same layout as the copied file:
 
 ```cmake
 if(PKG_USER-MFFTORCH)
-  include(Packages/USER-MFFTORCH)
-  # 若报错找不到文件，改为：include(Modules/Packages/USER-MFFTORCH)
+  include(Modules/Packages/USER-MFFTORCH)
 endif()
 ```
 
-> `Packages/` 对应 `cmake/Packages/USER-MFFTORCH.cmake`；`Modules/Packages/` 对应 `cmake/Modules/Packages/USER-MFFTORCH.cmake`。安装脚本会拷贝到两个位置，按你 LAMMPS 版本的实际 include 路径选择其一。
+For the other layout, use `include(Packages/USER-MFFTORCH)` instead. Include the
+package definition only once.
 
----
+## 4. Configure and build
 
-## 5. CMake 配置
-
-### 5.1 获取 LibTorch 路径
+Use the LibTorch CMake prefix from the environment used for deployment:
 
 ```bash
-LIBTORCH_PREFIX=$(python -c "import torch; print(torch.utils.cmake_prefix_path)")
+export LIBTORCH_PREFIX="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
 ```
 
-### 5.2 选择 GPU 架构
+### NVIDIA CUDA build
 
-根据你的 GPU 选择 `Kokkos_ARCH_XXX`：
+Select the architecture for the actual GPU. The
+[Kokkos architecture table](https://kokkos.org/kokkos-core-wiki/get-started/configuration-guide.html)
+lists the options supported by each Kokkos release. Common examples are:
 
-| GPU | Kokkos_ARCH |
-|-----|-------------|
-| NVIDIA A100 | AMPERE80 |
-| NVIDIA A30 / RTX 30 系列 | AMPERE86 |
-| NVIDIA V100 | VOLTA70 |
-| NVIDIA T4 | TURING75 |
-| AMD GPU | 参见 Kokkos 文档 |
+| GPU | Kokkos CMake option |
+| --- | --- |
+| NVIDIA A100 or A30 | `Kokkos_ARCH_AMPERE80=ON` |
+| NVIDIA A10 or A40 | `Kokkos_ARCH_AMPERE86=ON` |
+| NVIDIA V100 | `Kokkos_ARCH_VOLTA70=ON` |
+| NVIDIA T4 | `Kokkos_ARCH_TURING75=ON` |
 
-### 5.3 编译选项：Virial/应力计算
-
-| 选项 | 默认 | 说明 |
-|------|------|------|
-| `MFF_ENABLE_VIRIAL` | OFF | 设为 ON 时，在 GPU 上计算 virial，可输出正确的压力/应力张量 |
-
-- **默认（OFF）**：不计算 virial，`thermo_style` 中的 `press` 等只有动能贡献，数值不完整；吞吐量最高。
-- **ON**：在 GPU 上用 Kokkos 计算 fdotr virial，只拷贝 6 个 double 回 CPU，**几乎无性能损失**；`press`、`pxx`、`pyy`、`pzz`、`pxy`、`pxz`、`pyz` 输出正确。
-
-### 5.4 配置命令
-
-**不启用 virial（默认，最高吞吐）：**
+For an A100/A30 Kokkos build:
 
 ```bash
 cd /path/to/lammps
-
-cmake -S cmake -B build-mfftorch \
-  -D PKG_KOKKOS=ON \
-  -D Kokkos_ENABLE_CUDA=ON \
-  -D Kokkos_ARCH_AMPERE86=ON \
-  -D PKG_USER-MFFTORCH=ON \
+cmake -S cmake -B build-mfftorch-kk \
+  -D CMAKE_BUILD_TYPE=Release \
   -D CMAKE_PREFIX_PATH="$LIBTORCH_PREFIX" \
-  -D CMAKE_BUILD_TYPE=Release
-```
-
-**启用 virial（压力/应力正确）：**
-
-```bash
-cmake -S cmake -B build-mfftorch \
+  -D PKG_USER-MFFTORCH=ON \
   -D PKG_KOKKOS=ON \
   -D Kokkos_ENABLE_CUDA=ON \
-  -D Kokkos_ARCH_AMPERE86=ON \
-  -D PKG_USER-MFFTORCH=ON \
-  -D MFF_ENABLE_VIRIAL=ON \
+  -D Kokkos_ARCH_AMPERE80=ON
+cmake --build build-mfftorch-kk --parallel 8
+```
+
+For a plain LibTorch build, use a separate build directory and omit the
+Kokkos options. Match the number of build workers to the allocated CPU cores.
+
+### K100 HIP build
+
+The package's `MFF_USE_HIP` option links HIP-enabled LibTorch and the HIP host
+runtime. The corresponding Kokkos options are:
+
+```bash
+cmake -S cmake -B build-mfftorch-hip \
+  -D CMAKE_BUILD_TYPE=Release \
   -D CMAKE_PREFIX_PATH="$LIBTORCH_PREFIX" \
-  -D CMAKE_BUILD_TYPE=Release
-```
-
-**若 LibTorch 未被自动找到**，可显式指定：
-
-```bash
-cmake -S cmake -B build-mfftorch \
-  -D PKG_KOKKOS=ON \
-  -D Kokkos_ENABLE_CUDA=ON \
-  -D Kokkos_ARCH_AMPERE86=ON \
   -D PKG_USER-MFFTORCH=ON \
-  -D MFF_ENABLE_VIRIAL=ON \
-  -D CMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')" \
-  -D CMAKE_BUILD_TYPE=Release
+  -D MFF_USE_HIP=ON \
+  -D PKG_KOKKOS=ON \
+  -D Kokkos_ENABLE_HIP=ON
+cmake --build build-mfftorch-hip --parallel 8
 ```
 
----
+Add the compiler and target-architecture options required by the vendor
+Kokkos/DTK stack. K100 `gfx926` support must exist in that toolchain;
+`MFF_USE_HIP=ON` does not add a missing Kokkos architecture definition.
 
-## 6. 编译
+On the K100/DTK 26.04 stack, the portable TorchScript route uses reference
+operators. Optimized eager HP execution uses an experimental in-process Python
+bridge and is not a standalone AOTInductor model. Building the HIP engine alone
+does not establish `.pt2` export/runtime support on that stack. See the
+[package overview](../README.md#build) for this distinction.
 
-```bash
-cmake --build build-mfftorch -j
-```
+### Virial, pressure and stress
 
-编译成功后，可执行文件位于：
+`MFF_ENABLE_VIRIAL` defaults to `OFF` and controls the Kokkos pair style's
+optional virial accumulation. To enable that implementation, configure with
+`-D MFF_ENABLE_VIRIAL=ON` and rebuild. The plain `mff/torch` implementation has
+its own virial path; this option is not a global switch for both pair styles.
 
-```
-build-mfftorch/lmp
-```
+The virial is the configurational contribution used in pressure calculation.
+LAMMPS pressure also includes a kinetic contribution. `press` is scalar
+pressure, and `pxx pyy pzz pxy pxz pyz` are pressure-tensor components.
+They should not be labeled interchangeably as virial or per-atom stress.
+See [LAMMPS pressure](https://docs.lammps.org/compute_pressure.html).
 
----
+With the Kokkos virial path disabled, its missing configurational contribution
+makes pressure unsuitable for pressure control. Enabling the option does not
+by itself validate pressure, cell derivatives or constant-pressure MD for a
+particular model and MPI decomposition. Its overhead depends on the workload.
+The LAMMPS [`stress/atom` convention](https://docs.lammps.org/compute_stress_atom.html)
+uses the opposite sign and pressure-times-volume units; it is not the same
+quantity as the `pxx` thermo field.
 
-## 7. 导出 LAMMPS 模型 core
+## 5. Export a model
 
-当前推荐给 `pair_style mff/torch` / `pair_style mff/torch/kk` 使用的是
-AOTInductor `.pt2` core。TorchScript `core.pt` 路径仍可用于 legacy LibTorch
-部署，也适合调试导出签名和数值差异。
+### AOTInductor `.pt2`
 
-### 7.1 从 MACE-ICTC checkpoint 导出 `.pt2`
+AOTI means AOTInductor, the ahead-of-time deployment backend of TorchInductor.
+The export CLI packages energy/force evaluation and writes a metadata sidecar:
 
 ```bash
 mff-export-aoti \
   --checkpoint /path/to/model.pth \
   --elements H,O \
-  --out model.pt2 \
-  --dynamic \
-  --dtype float32 \
-  --device cuda \
-  --embed-e0
-```
-
-如果目标体系原子数固定，static-N 导出通常更稳，也方便 LAMMPS smoke test：
-
-```bash
-mff-export-aoti \
-  --checkpoint /path/to/model.pth \
-  --elements H,O \
-  --atoms 256 \
-  --degree 32 \
-  --static-n \
-  --dtype float32 \
+  --operator-plan generated \
+  --generated-layout packed \
   --device cuda \
   --embed-e0 \
+  --out model.pt2
+```
+
+Use `generated` to require HP coverage, `auto` to permit a reference fallback,
+or `checkpoint` to retain the checkpoint's execution route. Generated export
+requires a supported frozen FP32 model. The CLI preserves a loaded checkpoint's
+actual dtype; `--dtype float32` does not cast an FP64 checkpoint.
+
+Important export conventions:
+
+- `--elements` selects checkpoint species. Every element mapped by LAMMPS must
+  be present in the exported model. The `pair_coeff` symbols map atom types,
+  one symbol per LAMMPS atom type.
+- `--embed-e0` includes the checkpoint's per-element atomic-energy offsets
+  (E0). Use the same energy convention when comparing against Python.
+- Dynamic node and edge counts are the default. Node count includes ghost rows
+  in an unfolded MPI graph, and can change even when the global atom count is
+  fixed. Dynamic dimensions still have the exported program's shape constraints.
+- `--atoms` sets the example node count. `--degree` sets its average directed
+  degree: the synthetic export graph has `E = atoms * degree`. It is **not** a
+  physical coordination limit or a universal maximum neighbor count.
+- `--static-n` fixes N to `--atoms`; without `--dynamic`, the example edge count
+  is fixed too. `--static-n --dynamic` keeps N fixed and permits dynamic E.
+  Check the exported shapes and metadata, including per-rank owned-plus-ghost
+  capacity, before using a fixed-N package.
+- Keep `model.pt2.meta` next to `model.pt2`. Metadata records ownership support,
+  message-passing depth and dynamic-node/padding settings. Retain any additional
+  exporter-generated metadata for long-range models as well.
+- Check the exporter's eager-versus-compiled energy/force comparisons on the
+  target backend before running LAMMPS. Changing Python settings does not update
+  a previously compiled package; export again to change kernels.
+
+A deliberately fixed-N export with dynamic edges can use:
+
+```bash
+mff-export-aoti \
+  --checkpoint /path/to/model.pth --elements H,O \
+  --atoms 256 --degree 32 --static-n --dynamic \
+  --operator-plan generated --device cuda --embed-e0 \
   --out model_static256.pt2
 ```
 
-常用规则：
+### Convert an upstream MACE checkpoint
 
-- `--elements` 的顺序必须和后续 LAMMPS `pair_coeff` 里的元素顺序一致。
-- `--embed-e0` 会把 atomic reference energy 嵌入导出 core，使 LAMMPS `pe` 返回绝对能量。
-- `--dynamic` 适合变原子数/变邻接规模的部署；如果 dynamic export 失败，先用 `--static-n` 做固定形状验证。
-- `--degree` 是静态导出时为邻居数预留的 directed degree 上限。实际运行不能超过导出时的容量。
-- 导出日志会比较 eager 和 compiled `.pt2` 的能量/力；只有通过数值检查后才应进入 LAMMPS。
-
-### 7.2 从原生 MACE 预训练模型导出
-
-先把原生 `mace-torch` `ScaleShiftMACE` 对象转成 MACE-ICTC checkpoint：
+For compatible MACE architectures, `mff-convert-mace` converts the original
+`ScaleShiftMACE` model to a MACE-ICTC checkpoint:
 
 ```bash
 mff-convert-mace \
   --mace-model /path/to/mace.model \
-  --out mace_ictc.pth \
+  --out mace_ictc_f32.pth \
   --product-backend ictd-bridge-u \
-  --dtype float64 \
-  --device cpu
+  --dtype float32 --device cpu
 ```
 
-很老的公开预训练模型可能只能在对应历史 `mace-torch`/`e3nn` 环境里完成 load 和 conversion。
-如果要做原生 MACE 数值对应审计，先保留 float64 checkpoint；如果要部署到 LAMMPS，
-用同一条转换命令把 `--dtype` 改成 `float32` 再导出 `.pt2`：
+An FP64 conversion can be retained separately for a precision comparison.
+Older MACE pickle files may need matching historical `mace-torch` and e3nn
+versions to load. The nonlinear MACE-MH-1 adapter is a separate interface;
+follow [Nonlinear MACE foundation checkpoints](../../docs/HP_API.md#nonlinear-mace-foundation-checkpoints)
+for that architecture. Its eager inference model is not a drop-in `.pt2`
+checkpoint for the command above.
 
-```bash
-mff-export-aoti \
-  --checkpoint mace_ictc_f32.pth \
-  --elements H,C,N,O,F,P,S,Cl,Br,I \
-  --atoms 6 \
-  --degree 5 \
-  --static-n \
-  --dtype float32 \
-  --device cuda \
-  --embed-e0 \
-  --out mace_ictc_static6.pt2
-```
+### Legacy TorchScript `.pt`
 
-### 7.3 Legacy TorchScript `core.pt`
-
-TorchScript 仍可通过 `mff-export-core` 导出：
+For a deployment that explicitly needs the legacy TorchScript interface:
 
 ```bash
 mff-export-core \
-  --checkpoint /path/to/model.pth \
-  --elements H O \
-  --device cuda \
-  --dtype float32 \
-  --out core.pt
+  --checkpoint /path/to/model.pth --elements H O \
+  --device cuda --dtype float32 --out core.pt
 ```
 
-除非你明确需要 legacy TorchScript runtime，否则优先使用 7.1 的 `.pt2` 路径。
+Unlike `mff-export-aoti`, this CLI takes a space-separated `--elements` list.
+Export and runtime must agree on the core's input signature and backend.
 
----
+## 6. Run LAMMPS
 
-## 8. 运行 LAMMPS
-
-### 8.1 设置环境变量（LibTorch 动态库）
+Expose the matching PyTorch shared libraries at runtime:
 
 ```bash
-export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):${LD_LIBRARY_PATH:-}"
 ```
 
-### 8.2 最小 LAMMPS 输入示例
+### Minimal energy/force input
 
-创建 `in.mfftorch`：
+Prepare `system.data` with a meaningful geometry, masses and atom-type mapping.
+This example assumes an H/O model trained with a 5 Å cutoff, `metal` units,
+and a compatible `.pt2` runtime:
 
 ```lammps
 units metal
 atom_style atomic
+atom_modify map array
 boundary p p p
-
-region box block 0 40 0 40 0 40
-create_box 2 box
-create_atoms 1 random 200 12345 box
-create_atoms 2 random 100 12346 box
-mass 1 1.008
-mass 2 15.999
+read_data system.data
 
 neighbor 1.0 bin
-
 pair_style mff/torch 5.0 cuda
 pair_coeff * * /path/to/model.pt2 H O
 
-velocity all create 300 42
-fix 1 all nve
-thermo 20
-thermo_style custom step temp pe etotal fmax
-run 200
+thermo 1
+thermo_style custom step pe fmax
+run 0
 ```
 
-当前 `.pt2` 部署路径支持能量和力输出。Physical tensor outputs 不是当前公开支持的
-LAMMPS 接口；不要在生产输入中使用 `compute mff/torch/phys`。
+For Kokkos, use `pair_style mff/torch/kk 5.0 cuda`. A single-GPU launch inside
+an allocated batch job is:
 
-若导出的模型 core 来自带外场架构的 checkpoint，可在运行时通过 LAMMPS equal-style 变量传入 rank-1 外场：
+```bash
+/path/to/lmp -k on g 1 -sf kk -pk kokkos newton off neigh full comm no -in in.mfftorch
+```
+
+Here, `neigh full` requests a full neighbor list, and `newton off` selects the
+supported Newton setting for this interface. After checking energy and forces,
+choose velocities, timestep and integration settings appropriate to the
+potential and system. For example, microcanonical (NVE) integration uses `fix ... nve`;
+`run 0` above evaluates a configuration without advancing MD.
+
+Current public deployment output is energy and forces. Physical tensor outputs
+are not supported by the public `.pt2` interface; `compute mff/torch/phys` is
+not a supported production output interface.
+
+### MPI domain decomposition
+
+Use one MPI rank per GPU. MPI partitions physical atoms into owned atoms and
+communicates ghost copies near subdomain boundaries. The interface evaluates
+owned energies and returns force contributions on ghost coordinates to their
+owners through reverse communication.
+
+For example, inside a batch allocation with two GPUs visible to Kokkos:
+
+```bash
+export MFF_DEBUG_BUNDLE=1
+mpirun -np 2 /path/to/lmp \
+  -k on g 2 -sf kk -pk kokkos newton off neigh full comm no -in in.mfftorch
+```
+
+For the plain pair style, omit the Kokkos command-line options. GPU visibility
+and local-rank mapping must match the scheduler/MPI launch configuration.
+When each rank sees only one GPU, use the corresponding one-GPU Kokkos setup.
+`MFF_DEBUG_BUNDLE=1` prints device selection; verify distinct devices for distinct
+local ranks. An inherited `SLURM_LOCALID=0` in every child of an Intel MPI Hydra
+launcher does not provide valid per-rank binding.
+
+Single-rank periodic execution folds image ghosts into local owners. Multi-rank
+execution uses depth-dependent halos. The sidecar's `message_passing_depth`
+must match the model's interaction depth; for an older artifact without it,
+set `depth <layers>` in `pair_style`. An unfolded MPI graph also needs an
+ownership-aware exported core. Re-export older packages with
+`--owned-energy-mask` or `--operator-plan generated` when that input is absent.
+
+For fixed-N packages, capacity applies to each rank's model input, including
+its ghosts. A fixed global atom count does not fix those input sizes.
+Compare single-rank and multi-rank energy and forces for the same geometry
+before a trajectory. Different FP32 reduction orders can cause small numerical
+differences. Large discrepancies require checking ownership, halo depth, cutoff,
+neighbor filtering, device mapping and exported shape constraints.
+
+### Pressure output
+
+With a validated virial path, pressure can be requested as:
+
+```lammps
+thermo_style custom step temp pe ke etotal press pxx pyy pzz pxy pxz pyz
+```
+
+See [Virial, pressure and stress](#virial-pressure-and-stress) for the build
+option and definitions. Energy/force agreement alone does not establish
+pressure accuracy or constant-pressure ensemble support.
+
+## 7. Model-specific optional inputs
+
+These inputs require an architecture and exported signature that explicitly
+support them. They are not enabled by a short-range HP operator plan.
+
+### External fields
+
+The legacy TorchScript interface can accept a vector external field through
+LAMMPS equal-style variables:
 
 ```lammps
 variable Ex equal 0.0
 variable Ey equal 0.0
 variable Ez equal 0.01
-
 pair_style mff/torch 5.0 cuda field v_Ex v_Ey v_Ez
-pair_coeff * * /path/to/model.pt2 H O
+pair_coeff * * /path/to/core.pt H O
 ```
 
-说明：
-- `field v_Ex v_Ey v_Ez` 会在每个 force call 重新求值，可用于时间相关外场。
-- 也支持 rank-2 外场：
-  - `field9`：全量 `3x3`，行主序 `xx xy xz yx yy yz zx zy zz`
-  - `field6`：对称 `3x3` 简写，顺序 `xx yy zz xy xz yz`
-- 若模型 core 需要外场但未提供 `field ...`，LAMMPS 初始化时会报错；反之，普通模型 core 也不能搭配 `field ...` 使用。
+`field` supplies a polar vector (`1o`); `mfield` supplies an axial vector
+(`1e`) when required by the model. These are tensor ranks, distinct from MPI
+process ranks. Variables are evaluated at each force call. A model requiring
+an external field cannot omit it, and a core without that input cannot accept
+these options.
 
-rank-2 示例：
+A supported rank-two tensor input uses `field9` in row-major order
+`xx xy xz yx yy yz zx zy zz`, or `field6` for the symmetric tensor entries
+`xx yy zz xy xz yz`. Supply nine or six equal-style variable references,
+respectively. Do not combine these rank-two options with vector-field options.
 
-```lammps
-variable Txx equal 1.0
-variable Txy equal 0.0
-variable Txz equal 0.0
-variable Tyx equal 0.0
-variable Tyy equal 1.0
-variable Tyz equal 0.0
-variable Tzx equal 0.0
-variable Tzy equal 0.0
-variable Tzz equal 1.0
+### Many-body dispersion
 
-pair_style mff/torch 5.0 cuda field9 v_Txx v_Txy v_Txz v_Tyx v_Tyy v_Tyz v_Tzx v_Tzy v_Tzz
-pair_coeff * * /path/to/model.pt2 H O
-```
-
-### 8.2.1 独立色散邻居表 / MBD
-
-带 `--long-range-dispersion-mode mbd` 或 `--long-range-dispersion-mode mbd-slq`
-训练并通过 `export_libtorch_core.py` 导出的 TorchScript `core.pt` 会接收第二套色散 edge list。
-`mbd` 是 dense eigensolve oracle；`mbd-slq` 是 cutoff matrix-free stochastic-Lanczos 近似，
-可用 `--dispersion-slq-num-probes` 和 `--dispersion-slq-lanczos-steps` 调节成本/精度。
-LAMMPS 侧用
-`dispersion <cutoff>` 指定色散邻居表 cutoff，主 cutoff 仍用于 message passing：
+MBD means many-body dispersion. For models with a separate real-space
+dispersion graph, supply its trained cutoff independently of the short-range
+message-passing cutoff:
 
 ```lammps
 pair_style mff/torch 4.0 cuda dispersion 6.0
 pair_coeff * * /path/to/core.pt H C N O
 ```
 
-这会让 LAMMPS 请求 `max(4.0, 6.0)` 的候选邻居，在 `mff/torch` / `mff/torch/kk`
-内部拆成主 edge list 和 dispersion edge list。对 `mbd` / `mbd-slq` core，若省略
-`dispersion <cutoff>`，初始化/运行会直接报错；不要让 MBD 静默复用短程 message-passing edge list。
-这里的 `<cutoff>` 必须等于 checkpoint/export metadata 里的 `dispersion_cutoff`；MBD 的 cutoff
-定义了耦合矩阵的稀疏图，部署时改 cutoff 等价于换了训练时的长程色散模型。
-显式的 dispersion list 可以为空（例如低密度或单原子体系），但不能缺省。
-
-AOTI `.pt2` 对 `mbd-slq` 会导出 `dispersion_edges 1` sidecar metadata，并接收第二套
-dispersion edge list；`mff/torch` 和 `mff/torch/kk` build 都支持这一路径。导出时会把 SLQ 切到
-atom-rademacher probes + Newton-Schulz quadrature，以避免有限 Cartesian probe 破坏旋转等变性，
-并避开 AOTI 对本征分解的限制。dense `mbd` 仍只作为 dense eigensolve oracle，不建议也不会导出为
-AOTI 部署 core。
-
-### 8.3 输出压力/应力（virial）
-
-若编译时启用了 `MFF_ENABLE_VIRIAL=ON`，可在 `thermo_style` 中加入压力与应力分量：
-
-```lammps
-thermo_style custom step temp pe ke etotal press pxx pyy pzz pxy pxz pyz
-thermo 20
-```
-
-| 字段 | 含义 |
-|------|------|
-| `press` | 总压力（标量） |
-| `pxx pyy pzz` | 压力张量对角分量 |
-| `pxy pxz pyz` | 压力张量非对角分量（剪切应力） |
-
-未启用 virial 时，`press` 等只有动能贡献，数值不完整。
-
-### 8.4 使用 Kokkos GPU 运行
-
-```bash
-/path/to/lammps/build-mfftorch/lmp \
-  -k on g 1 \
-  -sf kk \
-  -pk kokkos newton off neigh full \
-  -in in.mfftorch
-```
-
-说明：
-
-- `-k on g 1`：启用 Kokkos，使用 1 块 GPU
-- `-sf kk`：将 `pair_style mff/torch` 映射到 Kokkos 变体 `mff/torch/kk`
-- `-pk kokkos newton off neigh full`：Kokkos 使用 `neigh full` 时必须 `newton off`
-
-### 8.5 多 MPI rank / 多 GPU 运行
-
-`USER-MFFTORCH` 的多卡运行方式是 MPI domain decomposition：通常每张 GPU
-对应一个 MPI rank。不要把它理解成一个 LAMMPS rank 同时调度多张 GPU。
-
-普通 `mff/torch` 路径：
-
-```bash
-export MFF_DEBUG_BUNDLE=1
-mpirun -np 2 /path/to/lammps/build-mfftorch/lmp -in in.mfftorch
-```
-
-LAMMPS input 中使用：
-
-```lammps
-pair_style mff/torch 5.0 cuda
-pair_coeff * * /path/to/model.pt2 H O
-```
-
-普通路径会从本地 rank 环境变量选择 CUDA 设备，例如 `SLURM_LOCALID`、
-`LOCAL_RANK`、`OMPI_COMM_WORLD_LOCAL_RANK`、`MV2_COMM_WORLD_LOCAL_RANK` 或
-`MPI_LOCALRANKID`。设置 `MFF_DEBUG_BUNDLE=1` 后，初始化日志会打印 requested
-device 和 selected device，生产前要确认不同 local rank 选择了不同 GPU。
-
-Kokkos 路径：
-
-```bash
-export MFF_DEBUG_BUNDLE=1
-mpirun -np 2 /path/to/lammps/build-mfftorch-kk/lmp \
-  -k on g 2 \
-  -sf kk \
-  -pk kokkos newton off neigh full \
-  -in in.mfftorch
-```
-
-input 中可以显式使用：
-
-```lammps
-pair_style mff/torch/kk 5.0 cuda
-pair_coeff * * /path/to/model.pt2 H O
-```
-
-也可以写 `pair_style mff/torch`，让 `-sf kk` 在支持的 build 中映射到
-`mff/torch/kk`。当前 Kokkos 设备映射对单节点、每 GPU 一个 MPI rank 的情况是目标路径；
-多节点 Kokkos 运行必须先做 local-rank/device 映射验证。
-
-Slurm 示例：
-
-```bash
-#!/bin/bash
-#SBATCH -p GPU
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2
-#SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=8
-
-source /path/to/conda.sh
-conda activate mff
-export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):${LD_LIBRARY_PATH:-}"
-export MFF_DEBUG_BUNDLE=1
-
-srun /path/to/lammps/build-mfftorch/lmp -in in.mfftorch
-```
-
-如果用 static-N `.pt2`，导出时的 `--atoms` 和 `--degree` 必须覆盖每个 MPI rank
-上的 local atoms、ghost atoms 和边数。长 MD 前应先比较 `-np 1` 和 `-np N` 的
-`run 0` energy/force。fp32 下不同 domain decomposition 可能造成很小的归约顺序差异；
-如果能量或力出现明显偏差，先检查 cutoff、neighbor skin、ghost halo 和 `.pt2` 容量。
-
-### 8.6 仅 CPU 运行（无 Kokkos）
-
-```bash
-/path/to/lammps/build-mfftorch/lmp -in in.mfftorch
-```
-
----
-
-## 9. 编译和运行 smoke test
-
-### 9.1 编译检查
-
-从 LAMMPS 源码根目录编译：
-
-```bash
-export LIBTORCH_PREFIX="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
-cmake --build build-mfftorch -j 8
-cmake --build build-mfftorch-kk -j 8
-```
-
-如果链接阶段出现 CUDA runtime 版本冲突 warning，需要核对 Python 环境中的 PyTorch CUDA
-版本和系统 CUDA runtime。warning 不一定导致运行失败，但不应在生产环境中忽略。
-
-### 9.2 OFF23 converted `.pt2` smoke
-
-先按第 7 节导出一个 fixed-N `.pt2`。然后准备最小 LAMMPS input：
-
-```lammps
-units metal
-atom_style atomic
-boundary p p p
-
-read_data system.data
-neighbor 1.0 bin
-
-pair_style mff/torch 4.5 cuda
-pair_coeff * * /path/to/MACE-OFF23_small_ictd_bridge_u_f32_static6.pt2 H C N O
-
-thermo 1
-thermo_style custom step temp pe etotal fmax
-run 0
-```
-
-运行：
-
-```bash
-export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):${LD_LIBRARY_PATH:-}"
-/path/to/lammps/build-mfftorch/lmp -in in.off23_static6
-/path/to/lammps/build-mfftorch-kk/lmp -in in.off23_static6
-```
-
-4090 验证记录中，普通 build 和 Kokkos build 均能加载 `.pt2`。fresh OFF23 static-6
-导出的 `run 0` 与 Python checkpoint 对应到：
-
-| 量 | LAMMPS `mff/torch` | Python checkpoint |
-|---|---:|---:|
-| energy (eV) | `-6633.036` | `-6633.03613281` |
-| 最大绝对力分量 (eV/A) | `11.767612` | `11.76760674` |
-
-这里 LAMMPS `fmax` 是最大绝对力分量。Python 侧应比较 `max(abs(forces))`，不要比较逐原子力向量范数最大值。
-
-### 9.3 原生 MACE 到 ICTC 的数值对应
-
-转换桥接本身应先在 Python 中验证，再进入 LAMMPS。OFF23 small 的 float64 验证记录为：
-
-- native `mace-torch` vs converted ICTC，苯 same-frame 轨迹；
-- 最大能量绝对差：`2.73e-12 eV`；
-- 最大力分量差：`4.44e-15 eV/A`。
-
-这个测试验证 checkpoint conversion；AOTI `.pt2` 仍要单独验证 eager-vs-compiled 和
-LAMMPS-vs-Python，因为编译器 lowering 会改变浮点运算顺序。
-
----
-
-## 10. 故障排查
-
-### 10.1 `torch/torch.h: No such file or directory`
-
-- 原因：LibTorch 未被找到。
-- 解决：确保 `CMAKE_PREFIX_PATH` 包含 `torch.utils.cmake_prefix_path` 的路径，且 `USER-MFFTORCH` 已加入 `PKG_WITH_INCL` 的 include 列表。
-
-### 10.2 `Unrecognized pair style 'mff/torch'`
-
-- 原因：USER-MFFTORCH 未正确编译或未启用。
-- 解决：确认 `-D PKG_USER-MFFTORCH=ON`，且 `USER-MFFTORCH` 已加入 `STANDARD_PACKAGES`，`src/USER-MFFTORCH/` 存在且包含 `pair_mff_torch.cpp` 等文件。
-
-### 10.3 `error while loading shared libraries: libtorch.so`
-
-- 原因：运行时找不到 LibTorch 动态库。
-- 解决：设置 `LD_LIBRARY_PATH`（见 8.1 节）。
-
-### 10.4 `Must use 'newton off' with KOKKOS package option 'neigh full'`
-
-- 原因：Kokkos 配置要求。
-- 解决：在 `lmp` 命令行加上 `-pk kokkos newton off neigh full`。
-
-### 10.5 `Kokkos_ARCH` 与 GPU 不匹配
-
-- 现象：运行时报错或 JIT 编译耗时很长。
-- 解决：根据 GPU 型号选择正确的 `Kokkos_ARCH_XXX`（见 5.2 节）。
-
-### 10.6 能量/温度恒不变
-
-- 若使用 dummy 模型，输出常数为预期行为（dummy 模型梯度近似为 0）。
-- 使用真实训练模型后，能量和温度会随时间变化。
-
-### 10.7 需要压力/应力但未启用 virial
-
-- 现象：`thermo_style` 含 `press` 时，数值只有动能贡献，不完整。
-- 解决：用 `-D MFF_ENABLE_VIRIAL=ON` 重新配置并编译，virial 在 GPU 上计算，几乎无性能损失。
-
----
-
-## 11. 附录：目录结构速览
-
-```
-ICTC-O3-HP/
-├── lammps_user_mfftorch/
-│   ├── src/USER-MFFTORCH/          # 源码
-│   ├── cmake/Modules/Packages/USER-MFFTORCH.cmake
-│   ├── cmake/Packages/USER-MFFTORCH.cmake  # 部分版本
-│   ├── examples/
-│   └── docs/BUILD_AND_RUN.md       # 本文档
-└── mace_ictc/
+The engine requests candidate neighbors out to the larger cutoff and constructs
+separate edge lists. The dispersion cutoff must equal the checkpoint/export
+metadata; changing it changes the coupling graph. A graph with no dispersion
+edges is different from omitting a required dispersion input.
+
+`mbd` uses a dense eigensolver as a reference. `mbd-slq` denotes the approximate
+MBD route based on stochastic Lanczos quadrature (SLQ); probe count and
+Lanczos steps control its approximation. For AOTI export of the `edge_sparse`
+backend, the exporter selects `atom-rademacher` probes and the
+`newton-schulz` matrix-square-root approximation instead of eigendecomposition,
+and writes `dispersion_edges 1` metadata. This changes the numerical
+approximation and requires comparison with the intended reference settings.
+The `pme_fft` backend is a separate reciprocal-space particle-mesh Ewald (PME)
+operator and does not use this real-space dispersion edge contract. Dense
+`mbd` is not supported for AOTI export.
+
+Long-range and dispersion routes require their own numerical and backend
+validation; the short-range K100 capacity results do not characterize them.
+
+## 8. Troubleshooting
+
+| Symptom | Checks |
+| --- | --- |
+| `torch/torch.h` missing | Check `CMAKE_PREFIX_PATH`, the copied package file and its conditional include in LAMMPS CMake. |
+| `Unrecognized pair style 'mff/torch'` | Check `PKG_USER-MFFTORCH=ON`, package-list registration and copied source files. |
+| `libtorch.so` missing at runtime | Set `LD_LIBRARY_PATH` to the libraries from the matching PyTorch environment. |
+| Unsupported GPU architecture | Use a Kokkos/compiler configuration supporting the actual device; K100 requires vendor `gfx926` support. |
+| Full-neighbor/Newton error | Launch the Kokkos path with `-pk kokkos newton off neigh full comm no`. |
+| Wrong energy offset | Check E0 inclusion, units, species mapping and the selected checkpoint/head. |
+| Wrong force comparison | Compare complete forces for the same geometry, cell and periodic edges. LAMMPS `fmax` is the maximum absolute force component, not the largest per-atom force norm. |
+| MPI-only discrepancies | Check per-rank GPU mapping, owned-energy input, message depth, ghost communication and fixed-N capacity. |
+| Incomplete Kokkos pressure | Check `MFF_ENABLE_VIRIAL`, rebuild, then validate the model and decomposition's virial path. |
+
+The definition of `fmax` follows [LAMMPS thermo output](https://docs.lammps.org/thermo_style.html).
+
+## 9. Source layout
+
+```text
+ICTC-O3-HP-K100/
+├── ictc_o3/                       # Standalone operator API
+├── mace_ictc/
 │   └── cli/
-│       ├── convert_mace.py          # 原生 MACE -> MACE-ICTC
-│       ├── export_aoti_core.py      # 导出 .pt2
-│       └── export_libtorch_core.py  # legacy TorchScript core
+│       ├── convert_mace.py
+│       ├── convert_foundation.py
+│       ├── export_aoti_core.py
+│       └── export_libtorch_core.py
+└── lammps_user_mfftorch/
+    ├── src/USER-MFFTORCH/
+    ├── cmake/Modules/Packages/USER-MFFTORCH.cmake
+    ├── cmake/Packages/USER-MFFTORCH.cmake
+    └── docs/BUILD_AND_RUN.md
 ```

@@ -1,41 +1,81 @@
 # ICTC-O3-HP-K100 API
 
-`ictc_o3` 提供独立算子 API，`mace_ictc.hp` 提供整网 API；二者是并列的
-顶层 Python 包，随 `ictc-o3-hp-k100` 一起安装。算子速查见 [O3 API](O3_API.md)。
-旧的 `mace_ictc.hp` 算子导入路径继续兼容；
-`models/` 里的 `_source`、`_plan`、原始 CUDA launch 等内部函数无需由用户调用。
-性能对照、测试与验证资料由维护者本地保存，不包含在交付源码和安装包中。
+`ictc_o3` provides standalone operator APIs, and `mace_ictc.hp` provides
+whole-model APIs. These sibling Python packages are installed together with
+`ictc-o3-hp-k100`. See the [O3 operator overview](O3_API.md) for a quick reference.
+Existing operator imports from `mace_ictc.hp` remain compatible. Users do not
+need to call internal functions such as `_source`, `_plan` or GPU kernel launchers
+in `models/`.
 
-## API 一览
+## Terminology and notation
 
-| API | 用途 | 输入 / 输出要点 |
-|---|---|---|
-| `EdgeTensorProduct.create(...)` | 新建独立边 TP | 任意正整数 C、CUDA FP32、非负 L、自然宇称、单位固定基础系数 |
-| `EdgeTensorProduct(tp, ...)` | 包装已有 ICTC TP | 保留已有固定系数、路径和外部门控约定 |
-| `GraphMessage(tp, ...)` | 真实图 gather/TP/gate/scatter | 接收节点/边 degree 字典、门控和重复 src/dst，返回节点路径块 |
-| `PackedGraphMessage(tp, ...)` / `.create(...)` | 原生 packed 图 TP | 与 `EdgeTensorProduct(ir_mul)` 同布局；直接接收/返回二维缓冲及实时 src/dst |
-| `direction_harmonics(n, L, policy=...)` | 笛卡尔方向谐波 | 单位方向 `[E,3]` -> 各阶 `[E,2l+1]` 的列表 |
-| `configure_symmetric_contraction(sc, ...)` | 启用已有 SC 的高性能分解 | 原地选择执行路径；forward 继续使用原模块接口 |
-| `create_symmetric_contraction(...)` | 新建高性能 SC | 可选 C/L/cor，native full-CG bridge-U，返回原类模块 |
-| `channel_linear(x, W, bias=None)` | 共享通道 GEMM | `[*,Cin,m]`、`[Cout,Cin]` -> `[*,Cout,m]` |
-| `normalized_silu(x, scale=1.0)` | 融合标量激活与导数 | 计算 `SiLU(x)*scale`，不自行选择模型归一化系数 |
-| `create_model(...)` | 创建整网演示/新训练模型 | 可选 channels/lmax/edge_lmax/interaction 层数/cor，返回普通 ICTC 模型 |
-| `check_model(model, ...)` | 只读检查整网覆盖 | 返回 `supported` 和 `reasons`，不编译/修改模型 |
-| `configure_model(model, ...)` | 选择整网 eager 执行方案 | 返回选择结果、原因、算子计数和布局 |
-| `energy_and_forces(model, ...)` | 已建图的完整能量/力计算 | 返回 `energy[B]`、`forces[N,3]`、`atomic_energy[N]` |
-| `prepare_for_export(model, ...)` | 准备整网 FX/AOTI 导出 | 注册/准备可被导出降级的独立 Triton 算子；不直接生成文件 |
+| Term | Meaning in this API |
+| --- | --- |
+| O(3), SO(3) | O(3) includes rotations and reflections; SO(3) includes proper rotations. An O(3) irreducible representation (irrep) has degree `l` and parity `p`. |
+| Degree and parity | An irrep of degree `l` has `2l+1` angular components. Natural parity means `p=(-1)^l`. The standalone TP factories use this family, rather than accepting arbitrary `(l,p)` irreps. |
+| `L`, `C`, `P` | Maximum irrep degree, channel count (irrep multiplicity), and number of coupling paths. `input_lmax`, `edge_lmax` and `output_lmax` can differ. |
+| `N`, `E`, `B` | Node count, directed edge count and number of graphs in a batch. In distributed buffers, `N` includes owned and ghost rows unless stated otherwise. Global physical atom counts exclude ghost copies. |
+| Angular basis and layout | ICTC uses Cartesian harmonic blocks. Packing changes memory order, not the angular basis. In `[*,C,m]`, `m=2l+1` denotes the block width, not a magnetic quantum number. |
+| TP, CG | Tensor product and Clebsch–Gordan coupling. A TP path is `(l_in,l_edge,l_out)`. The edge TP couples each feature channel to a single-channel angular input; it retains paths for later channel mixing. |
+| SC, correlation, U | Symmetric contraction, its maximum polynomial order in aggregated features, and its fixed higher-order coupling tensors. Correlation is not interaction depth or a statistical correlation coefficient. |
+| Full CG / reduced CG | Names for this implementation's coupling-basis construction choices. The public factories use the existing full CG bridge-U construction (`use_reduced_cg=False`). SC retains its internal e3nn basis bridge. |
+| Gates | Edge-dependent radial-network outputs multiplying TP paths. Frozen radial-network parameters still produce gates that depend on geometry. Coordinate derivatives must pass through those gates. |
+| MLP, JIT, FX | Multilayer perceptron; just-in-time compilation; PyTorch's graph representation and tracing tools. The radial MLP maps edge descriptors to gates. |
+| VJP, mixed second derivative | A vector–Jacobian product is a reverse-mode derivative. Force-loss training requires mixed derivatives of energy with respect to coordinates and model parameters, without materializing the full Hessian. Option names containing `adjoint` refer to these backward computations. |
+| CSR, GEMM | Compressed sparse row grouping of edges by destination node; general matrix–matrix multiplication. Neither changes the model's mathematical definition. |
+| E0 | Per-element atomic-energy offsets from the checkpoint or training fit. These offsets must be included consistently when comparing total energies. |
+| FP32, FP64, TF32 | 32-bit and 64-bit floating-point arithmetic; TensorFloat-32, an optional reduced-mantissa matrix-multiply mode. HP kernels use FP32 and disable TF32. Triton's `tf32x3` mode is also excluded. |
+| AOTI | AOTInductor: the ahead-of-time deployment backend of TorchInductor, used here to package an exported energy/force graph as `.pt2`. It is distinct from the legacy TorchScript `.pt` route. |
+| Reference route | The original differentiable implementation selected by `policy="reference"`. This selection does not imply FP64 arithmetic. |
 
-导入 API 不会触发 CUDA 编译。首次实际调用可能生成常量计划并 JIT 编译；冷启动
-耗时不能计作热吞吐。生成源码与编译缓存都要指定到对应远端任务目录。
-GPU HP 使用严格 FP32，没有 TF32/TF32x3 执行选项。配置整网、独立 TP/图消息、
-通道 GEMM 和 SC 配置会将 `torch.set_float32_matmul_precision("highest")`、
-matmul/cuDNN 的 `allow_tf32=False` 固定到进程中，不自动恢复此前设置。
-这不会转换张量 dtype 或修改参数 trainability。自定义脚本、导出和其他库的调用
-也应保持这三个设置；已编译的旧二进制需重新导出才能更新编译时算术选择。
+Irrep degree/parity follows the [e3nn irreps convention](https://docs.e3nn.org/en/stable/api/o3/o3_irreps.html).
+The native harmonics use component normalization: on unit directions, the
+squared norm of a degree-`l` block is `2l+1`, as in
+[e3nn component normalization](https://docs.e3nn.org/en/stable/api/o3/o3_sh.html).
+The component coordinates can differ between angular bases even when this
+normalization agrees.
 
-## 1. 独立边 TP
+Throughout this guide, `device="cuda"` and `torch.cuda` denote PyTorch's GPU
+device API. HIP-enabled PyTorch uses these same names on K100; they do not
+identify K100 as NVIDIA hardware. See [PyTorch HIP semantics](https://docs.pytorch.org/docs/2.7/notes/hip.html).
+Backend-specific export support is described separately below.
 
-新建自己的原生 ICTC 算子：
+## API overview
+
+| API | Purpose | Input / output contract |
+| --- | --- | --- |
+| `EdgeTensorProduct.create(...)` | Create a standalone edge TP | Positive integer C, GPU FP32, nonnegative L, natural parity, fixed unit base coefficients |
+| `EdgeTensorProduct(tp, ...)` | Wrap an existing ICTC TP | Preserves fixed coefficients, paths and external-gate conventions |
+| `GraphMessage(tp, ...)` | Graph gather/TP/gate/scatter | Node/edge degree dictionaries, gates and repeated src/dst indices → node path blocks |
+| `PackedGraphMessage(tp, ...)` / `.create(...)` | Native packed graph TP | Same layout as `EdgeTensorProduct(layout="ir_mul")`; 2D input/output buffers and caller-supplied topology |
+| `direction_harmonics(n, L, policy=...)` | Cartesian direction harmonics | Unit directions `[E,3]` → list of `[E,2l+1]` blocks |
+| `configure_symmetric_contraction(sc, ...)` | Enable a fast factorization of an existing SC | Selects a plan in place; forward retains the original module interface |
+| `create_symmetric_contraction(...)` | Create a high-performance SC | Configurable C/L/correlation, existing full CG bridge-U; returns `ICTDBridgeUSymmetricContractionSO3` |
+| `channel_linear(x, W, bias=None)` | Shared channel GEMM | `[*,Cin,m]` and `[Cout,Cin]` → `[*,Cout,m]` |
+| `normalized_silu(x, scale=1.0)` | Fused scalar activation and derivatives | Computes `SiLU(x)*scale`; does not infer a model normalization constant |
+| `create_model(...)` | Create an initialized model for examples or new training | Configurable channels/lmax/edge_lmax/interactions/correlation; returns an ordinary ICTC model |
+| `check_model(model, ...)` | Check whole-model coverage without mutation | Returns `supported` and `reasons`; does not compile or modify the model |
+| `configure_model(model, ...)` | Select a whole-model eager execution plan | Returns the selection, reasons, operator counts and layouts |
+| `energy_and_forces(model, ...)` | Evaluate model energy and forces on an existing graph | Returns `energy[B]`, `forces[N,3]` and `atomic_energy[N]`; does not add E0 |
+| `prepare_for_export(model, ...)` | Prepare whole-model FX/AOTI export | Registers or prepares independent Triton operators for export lowering; does not write an export file |
+
+Importing the API does not trigger GPU compilation. The first actual call may
+build constant plans and JIT-compile kernels; cold-start time must be reported
+separately from warm throughput. Place generated source and compilation caches
+inside the corresponding remote task directory.
+
+HP GPU kernels use strict FP32, with no TF32 or Triton `tf32x3` execution option.
+Whole-model configuration, standalone TP/graph messages, channel GEMM and SC
+configuration set `torch.set_float32_matmul_precision("highest")` and disable
+matmul/cuDNN `allow_tf32` for the process, without restoring the previous settings.
+They do not cast tensors or change parameter trainability. Custom scripts,
+exports and calls into other libraries should retain these three settings.
+Existing compiled binaries must be re-exported to change their compile-time
+arithmetic selection.
+
+## 1. Standalone edge TP
+
+Create a native ICTC operator:
 
 ```python
 import torch
@@ -62,23 +102,25 @@ loss = output.square().mean()
 loss.backward()
 ```
 
-所有浮点输入显式使用 FP32；如果进程默认 dtype 被设为 float64，请在创建输入时
-加 `dtype=torch.float32`。上面的门控是示例；真实调用应使用径向网络的实时输出。
+All floating inputs must be FP32. If the process default dtype is float64,
+add `dtype=torch.float32` when constructing inputs. The gates above are examples;
+real applications should supply the current output of their radial network.
 
-稳定的形状约定：
+Stable shape conventions:
 
-- `features`：`[E, C*(input_lmax+1)^2]`，degree 按 0..L 排列。
-- `harmonics`：`[E, (edge_lmax+1)^2]`，笛卡尔 degree 块按 0..L 排列。
-- `gates`：`[E, P*C]` 或 `[E,P,C]`；**路径顺序以 `op.paths` 为准**。
-- `output`：`[E, op.output_width]`；先按输出 degree，再按原 TP 的路径槽排列。
-- `unpack_output` 返回 `{l: [E, path_count_l*C, 2*l+1]}`，保留路径 multiplicity。
+- `features`: `[E, C*(input_lmax+1)^2]`, with degrees ordered from 0 to L.
+- `harmonics`: `[E, (edge_lmax+1)^2]`, with Cartesian degree blocks ordered from 0 to L.
+- `gates`: `[E, P*C]` or `[E,P,C]`; **use `op.paths` as the path order**.
+- `output`: `[E, op.output_width]`, ordered first by output degree, then by the original TP path slot.
+- `unpack_output` returns `{l: [E, path_count_l*C, 2*l+1]}`, retaining path multiplicity.
 
-`layout="ir_mul"` 在每个 degree/path 内排列 `[magnetic,channel]`；输出具体是
-逐路径 `[E,path_count_l,2l+1,C]` 再展平。`layout="mul_ir"` 对应逐路径
-`[E,path_count_l,C,2l+1]`；必要的输入/输出转换计入调用。
-`pack_input`/`unpack_output` 仅转换内存布局，不旋转角基。
+`layout="ir_mul"` stores `[angular component,channel]` within each degree/path: the
+per-degree output is `[E,path_count_l,2l+1,C]` before flattening.
+`layout="mul_ir"` uses `[E,path_count_l,C,2l+1]`. Required input/output
+conversions are part of the call. `pack_input` and `unpack_output` change memory
+layout without rotating the angular basis.
 
-独立 TP 可显式选择旧生成式执行路线：
+The previous generated execution route remains an explicit option:
 
 ```python
 op = EdgeTensorProduct.create(
@@ -87,14 +129,18 @@ op = EdgeTensorProduct.create(
 )
 ```
 
-`execution="legacy"` 使用原联合伴随调度，在 TP 的 autograd 边界内重算
-`mul_ir` 输入和输出梯度的布局转换；`ir_mul` 继续直接写出原生缓冲。
-它使用当前库的笛卡尔系数生成器及二阶导数实现，保留相同的输入、输出、路径和
-固定系数约定。默认 `execution="direct"` 保持按梯度类型专化的执行路线。
-已有 TP 包装构造也接受此参数。该选项仅控制独立 TP；整网使用 `configure_model`。
+`execution="legacy"` uses the original joint backward schedule and rematerializes
+`mul_ir` input and output-gradient layout conversions inside the TP autograd
+boundary; `ir_mul` still writes native buffers directly. It uses the current
+Cartesian coefficient generator and second-derivative implementation, with the
+same input, output, path and fixed-coefficient contracts. The default
+`execution="direct"` specializes execution by the requested gradient roles.
+The constructor that wraps an existing TP accepts this option too. It controls
+standalone TP only; use `configure_model` for whole models.
 
-新工厂选用原生 ICTC 系数归一化，不会自动按 e3nn/cuEq 做路径尺度转换。
-从已有模型抽取算子，应包装原 TP：
+New factories use native ICTC coefficient normalization and do not automatically
+rescale paths for e3nn/cuEq. To extract an operator from an existing model, wrap
+its original TP:
 
 ```python
 op = EdgeTensorProduct(
@@ -105,17 +151,24 @@ op = EdgeTensorProduct(
 )
 ```
 
-请按该层实际输入阶数填写 `input_lmax`；首层可能仅有 scalar 输入，不能一概填
-整网 L。已有 TP 基础系数必须事先由模型架构设为固定；API 会拒绝仍可训练的系数，
-不会替用户冻结它们。非单位固定系数按原值参与计算；门控仍是可训练的实时输入。
-此 wrapper 用于独立调用，不是原模型 TP 的同签名替代物；自身保存状态有 `tp.*`
-前缀。整网优化请使用 `configure_model`，它不替换原模块或改变 checkpoint keys。
+Set `input_lmax` from the actual layer inputs. The first layer may accept scalar
+inputs only, so the model-wide L is not always appropriate. Existing TP base
+coefficients must already be fixed by the architecture. The API rejects
+trainable coefficients rather than freezing them. Non-unit fixed coefficients
+retain their values; gradients remain available for gates and feature inputs.
 
-独立边算子没有节点聚合，使用直接写出。普通一阶、混合二阶和既有高阶 autograd
-路径保留；不支持直接把该 CUDA JIT wrapper 放进 make_fx、torch.compile、
-functorch 或 autocast。整网 AOTI 使用第 6 节的 prepared 方案。
+This wrapper is intended for standalone calls and has a different signature
+from the original model TP. Its saved state has a `tp.*` prefix. Whole-model
+optimization uses `configure_model`, which does not replace modules or change
+checkpoint keys.
 
-VJP 使用标准 PyTorch API，无需调用内部 CUDA adjoint：
+Standalone edge operators write outputs directly, without node aggregation.
+First-order backward, mixed second derivatives and existing higher-order autograd
+routes remain available. This GPU JIT wrapper cannot be placed directly inside
+`make_fx`, `torch.compile`, functorch transforms or autocast. Whole-model AOTI uses the prepared route
+in section 6.
+
+Use `torch.autograd.grad` for VJPs:
 
 ```python
 vectors = torch.randn(E, 3, device="cuda", dtype=torch.float32, requires_grad=True)
@@ -126,12 +179,14 @@ dx, dr, dg = torch.autograd.grad(
 )
 ```
 
-`create_graph=True` 保留继续对力/几何梯度求参数梯度所需的图。此例保留从方向谐波
-到原始 edge vectors 的链式导数；实际位置/晶胞链路由用户图或整网 helper 提供。
+`create_graph=True` retains the graph needed to differentiate force or geometry
+gradients with respect to parameters. This example preserves the chain from
+direction harmonics to the original edge vectors. Position and cell chains are
+provided by the caller's graph or the whole-model helper.
 
-## 2. 图消息聚合
+## 2. Graph message aggregation
 
-需要真实图聚合时调用 `GraphMessage`，而不是把独立边 TP 当作节点消息：
+Use `GraphMessage` when node aggregation is required:
 
 ```python
 from ictc_o3 import GraphMessage
@@ -142,28 +197,34 @@ message = GraphMessage(
 )
 # node_blocks[l]: [N,C,2l+1], C=tp.channels
 # edge_blocks[l]: [E,1,2l+1]
-# radial_gates: [E,tp.num_paths*C], live radial MLP output
+# radial_gates: [E,tp.num_paths*C], current radial MLP output
 # src/dst: [E] int64 CUDA, valid indices into the same N-node buffer
 node_paths = message(node_blocks, edge_blocks, radial_gates, src, dst, mask=None)
 ```
 
-source/destination 可以重复，真实图 reduction 仍累加到正确节点。路径块保留，后续
-等变线性层可以按原模型混合路径。此 API 不计算径向 MLP，不构建邻居表。
-可选 `mask` 为固定 FP32 `[E]` 或 `[E,1]`；可训练 mask 应使用原参考实现。
-该 wrapper 的布局/分块选项属于自身，不改写共享 TP 的运行选择或参数。
+Source and destination indices may repeat; graph reduction accumulates into
+the correct nodes. Path blocks remain separate so a subsequent equivariant
+linear layer can mix them as in the original model. This API evaluates neither
+the radial MLP nor the neighbor list. An optional `mask` is fixed FP32 `[E]` or
+`[E,1]`; trainable masks require the original reference implementation.
+Layout/chunking options belong to the wrapper and do not modify execution
+settings or parameters on the shared TP.
 
-`reduction="auto"` 在 C>=96、所有 degree<=3、E>=4096、平均每节点至少 16 条
-输入边时启用 CUDA CSR 前向；其他图使用原 atomic 前向。
-`reduction="atomic"` 固定原调度，`reduction="csr"` 强制 L<=3 的 CSR 前向。
-CSR 在 GPU 上对实时 topology 建计划，保留原边数组顺序、不复制整块 gate；
-每个 warp 在寄存器中累加邻居后写回节点。普通一阶与混合二阶导数继续使用
-已有解析 adjoint。FP32 归约顺序会改变，结果不承诺逐位一致。
+`reduction="auto"` enables GPU CSR forward for C>=96, all degrees<=3,
+E>=4096 and at least 16 incoming edges per node on average. Other graphs retain
+atomic forward. `reduction="atomic"` selects the original schedule;
+`reduction="csr"` requires CSR forward with L<=3. CSR plans the current topology
+on the GPU, preserves the original edge array order and does not copy the whole
+gate tensor. Warps accumulate neighbors in registers before writing nodes.
+First-order backward and mixed second derivatives retain the existing analytic kernels.
+FP32 reduction order may change, so results are not guaranteed to be bitwise identical.
 
-`EdgeTensorProduct` 的 `ir_mul/mul_ir` 和图/整网的 `packed/fused_pack` 是不同层次的
-选项，不能互换。`fused_pack` 将图 shader 边界的 degree copy 合并，仍保留真实
-gather/scatter、初始化和图 reduction。默认保持 `packed`。
+Edge TP `ir_mul/mul_ir` and graph/model `packed/fused_pack` operate at different
+layout levels and are not interchangeable. `fused_pack` fuses degree copies at
+graph-kernel boundaries while retaining gather/scatter, initialization
+and graph reduction. The default is `packed`.
 
-## 3. 其他高性能算子
+## 3. Other high-performance operators
 
 ```python
 from ictc_o3 import (
@@ -177,7 +238,7 @@ sc = create_symmetric_contraction(num_elements=3, channels=32, lmax=2,
                                   target_lmax=2, correlation=2)
 # Or keep an existing trained SC: sc = model.products[layer_index]
 info = configure_symmetric_contraction(sc, policy="generated")
-# sc: ICTDBridgeUSymmetricContractionSO3, CUDA FP32/native full CG
+# sc: ICTDBridgeUSymmetricContractionSO3, GPU FP32/full CG bridge-U
 # x: [N, C*(L+1)^2], ICTC mul_ir degree blocks
 # node_attrs: [N,num_elements] fixed one-hot, species_idx: [N] int64
 value = sc(x, node_attrs, node_type_idx=species_idx)
@@ -186,20 +247,28 @@ mapped = channel_linear(block, W)  # block [N,Cin,2l+1], W [Cout,Cin]
 activated_scalar = normalized_silu(scalar_features, scale=model_activation_scale)
 ```
 
-SC 的原权重、parameter identity 与 checkpoint keys 保留。提供离散
-`node_type_idx` 才启用 factorization；只给 `node_attrs` 时按原模块约定执行，
-不会以 argmax 替换可微 species 输入。原保存 U 的重构检查仍在内核计划中。
-SC 保留已验证的内部 e3nn basis bridge，不宣称重新生成纯笛卡尔高阶 U。
+SC preserves the original weights, parameter identities and checkpoint keys.
+Factorization requires discrete `node_type_idx`. Calls with only `node_attrs`
+retain the original module behavior and do not replace differentiable species
+inputs with `argmax`. Kernel planning still checks reconstruction of the saved U.
+SC retains the validated internal e3nn basis bridge; it does not regenerate
+higher-order U entirely from Cartesian algebra.
 
-通道 GEMM 支持普通 autograd，包括矩阵梯度；bias 仅允许 scalar (`m=1`) 块。
-SiLU 只可直接用于标量或模型原本允许的 invariant 输入；逐分量作用于非标量
-角块一般破坏等变性。`scale` 是固定数值，API 不猜测模型的归一化常数。
-方向谐波和 SC 的 `policy="auto"` 保留已建立的参考 fallback；显式 `generated`
-要求覆盖，`reference` 选参考方案。GEMM/SiLU 的可微 CPU fallback 仍可用。
+Channel GEMM supports ordinary autograd, including weight gradients. The API
+allows bias only when `m=1`; the caller must also ensure that the block is an
+even scalar (`0e`) if O(3) equivariance is required. Apply SiLU directly only to
+invariant features such as `0e` scalars. SiLU on odd scalars (`0o`), or
+componentwise on nonscalar blocks, generally breaks O(3) equivariance. `scale` is a fixed
+number; the API does not infer the model's normalization constant.
 
-## 4. 整网建模与求力
+For direction harmonics and SC, `policy="auto"` preserves reference fallbacks,
+explicit `generated` requires coverage, and `reference` selects the reference
+route. Differentiable CPU fallbacks remain available for GEMM/SiLU.
 
-新模型工厂只构建已初始化的网络，不加载已训练势，也不会自动选 HP plan：
+## 4. Whole-model construction and force evaluation
+
+The model factory constructs an initialized network. It does not load a trained
+potential or automatically select an HP plan:
 
 ```python
 from mace_ictc.hp import create_model, check_model, configure_model, energy_and_forces
@@ -212,19 +281,26 @@ model = create_model(
 print(check_model(model, training=True))
 ```
 
-工厂参数可选，默认仍是 C64/L3/两层/cor3。新 TP 基础系数按架构固定，径向、
-线性、SC 参数可训练；不会修改已有 checkpoint 的参数可训练性。
-`channels` 和 `num_interactions` 为任意正整数，`lmax` 为非负整数，
-`edge_lmax` 默认为 `lmax` 且不得小于它。快核按实际 C/路径/角分量数生成；
-非 32 倍数的尾部通道有真实 load/store 掩码。
-`correlation` 支持 2、3，兼容 1。
-native full-CG/baseline bridge-U 保留，`use_reduced_cg=True` 不会启用 cuEq 基生成，
-而是明确报错。它保留调用前的进程默认 dtype。
-为动态 AOTI，工厂以 FX 构建 e3nn 子模块，并恢复调用前的 e3nn 优化默认值。
-interaction 深度和角阶数没有固定为两层/L<=3。结构支持仍受原生模型基构造和
-设备资源约束；尚未验证的高阶/宽网络组合不应被当作已验收性能配置。
+Factory parameters are configurable; defaults are C64/L3, two interactions and correlation=3.
+New TP base coefficients are fixed by construction, while radial, linear and
+SC parameters are trainable. Existing checkpoint trainability is not modified.
+`channels` and `num_interactions` accept positive integers; `lmax` is
+nonnegative. `edge_lmax` defaults to `lmax` and must be at least as large.
+Fast kernels are generated for the actual C, paths and angular widths, with
+load/store masks for channel tails that are not multiples of 32.
 
-求力推理：
+`correlation` supports 2 and 3, with compatibility for 1. The factory uses the
+existing full CG baseline bridge-U. `use_reduced_cg=True` raises an explicit error
+rather than enabling cuEquivariance (cuEq) basis generation. The process default dtype is
+preserved. For dynamic AOTI, the factory builds e3nn submodules through FX and
+restores the previous e3nn optimization defaults afterwards.
+
+Interaction depth and angular degree are not fixed to two layers/L<=3.
+Structural support remains subject to native model basis construction and
+device resources. Unvalidated high-degree/wide combinations are not validated
+performance configurations.
+
+Force inference:
 
 ```python
 model.eval().requires_grad_(False)  # Explicit inference choice, not training.
@@ -235,19 +311,25 @@ energy = result["energy"]          # [B]
 forces = result["forces"]          # [N,3]
 ```
 
-此处 `Z`/`batch`/`src`/`dst` 都为同设备 int64；`pos`/`shifts`/`cell` 为 FP32。
-`shifts[E,3]` 是晶格坐标平移，`cell[B,3,3]` 是每个 graph 的晶胞。
-几何和邻居表须已准备；helper 不添加 fitted E0，不重建图，不进行 MPI/MD。
-能量就是原模型 forward 的原子输出之和；如果模型 core 只输出 interaction energy，
-此 API 也只返回 interaction energy。绝对能量继续使用原 checkpoint/E0 wrapper，
-或者按相同 fitted E0 表补齐；不能在训练时把两种能量标签混用。
+`Z`, `batch`, `src` and `dst` are int64 tensors on the same device; `pos`,
+`shifts` and `cell` are FP32. `shifts[E,3]` contains lattice-coordinate shifts,
+and `cell[B,3,3]` contains each graph's cell. Geometry and neighbor lists must
+already be prepared. This helper does not add fitted E0, rebuild graphs or
+perform MPI/MD.
 
-helper 在 `no_grad` 内仍打开求力所需 autograd，推理结果会 detach。
-`torch.inference_mode()` 不适合坐标求导，API 会明确拒绝。可传
-`owned_mask[N]` 固定所有权掩码，仅对 owned 原子能量求导，返回所有 local/ghost
-坐标的力；实际反向 ghost 通信仍由 LAMMPS 接口负责。
+Energy is the sum of the original model's atomic forward outputs. If the core
+returns interaction energy only, the API returns interaction energy only.
+For absolute energy, retain the checkpoint/E0 wrapper or add the same fitted
+E0 table. Training labels must use a consistent energy convention.
 
-已有 checkpoint：
+The helper enables the autograd needed for forces even inside `no_grad`, then
+detaches inference results. `torch.inference_mode()` is rejected because
+coordinate derivatives are required. An optional fixed `owned_mask[N]`
+restricts the differentiated energy sum to owned atoms while returning forces
+for all local/ghost coordinates. The LAMMPS interface remains responsible for
+reverse ghost communication.
+
+Existing checkpoints:
 
 ```python
 from mace_ictc.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
@@ -260,12 +342,13 @@ potential = LAMMPS_MLIAP_MFF.from_checkpoint(
 model = potential.wrapper.model
 ```
 
-species、训练平均邻居数、cutoff、dtype 与 E0 应来自真实 checkpoint/训练记录。
-新 API 不把 FP64 checkpoint 强制转 FP32，也不把可训练 TP 系数偷偷冻结。
+Species, training average neighbor count, cutoff, dtype and E0 must come from
+the actual checkpoint/training record. The API does not force FP64 checkpoints
+to FP32 or silently freeze trainable TP coefficients.
 
-## 5. 训练
+## 5. Training
 
-在原模型已保持其正确可训练 flags 的前提下配置：
+Configure the original model with its intended parameter trainability flags:
 
 ```python
 configure_model(model, training=True, policy="generated", layout="packed")
@@ -281,23 +364,32 @@ loss.backward(inputs=parameters)
 optimizer.step()
 ```
 
-`training=True` 保留求力图和混合二阶导数；不会自动调用 `model.train()`，也不会
-改变参数 trainability。从推理模型恢复训练时，应按 checkpoint 保存的原 flags
-恢复，避免 `model.requires_grad_(True)` 把固定基础系数也重新设为可训练。
-若确实需要 loss 对 leaf positions 的梯度，调用前令 `pos.requires_grad_(True)`
-并按自己的 targets 请求梯度；普通参数训练使用上面的 parameter-only backward。
+`training=True` retains the force graph and mixed second derivatives. It does
+not call `model.train()` or change parameter trainability. When resuming
+training from an inference model, restore the original checkpoint flags:
+`model.requires_grad_(True)` would also make fixed base coefficients trainable.
+If loss gradients with respect to leaf positions are required, set
+`pos.requires_grad_(True)` before the call and request the intended gradient
+targets. Ordinary parameter training can use the parameter-only backward above.
 
-K100 (`gfx926`) 的 FP32 CG 电路使用原生 HIP 处理特征梯度、实时 SC 权重梯度和
-混合二阶梯度。species bank 直接按节点种类索引，权重梯度按 256 个节点分块归约。
-固定 TP 系数的生成式消息二阶反向直接累加到球谐输入，也支持普通
-`loss.backward()` 请求的坐标梯度。这些路径沿用原有节点／通道和边／通道布局，
-无需 HCU Triton 编译对应的训练伴随内核。三阶及更高阶求导仍使用可微表达式。
-本次范围为 eager FP32、固定 TP 系数、实时可训练门控和 SC 权重；
-`training_gate_schedule="materialized"` 使用上述完整二阶路径。
+On K100 (`gfx926`), FP32 CG contraction kernels use native HIP for feature gradients,
+SC-weight gradients and mixed second derivatives. Species banks are
+indexed directly by node type; weight gradients use reductions over blocks
+of 256 nodes. Generated-message second backward with fixed TP coefficients
+accumulates directly into harmonic inputs and supports coordinate gradients
+requested by ordinary `loss.backward()`.
 
-`ForceTrainer` 和 CLI 同样暴露布局选项：
+These routes retain the original node/channel and edge/channel layouts and use
+native HIP kernels for these backward operations. Third and higher derivatives
+retain differentiable expressions. Coverage is eager FP32 with fixed TP
+coefficients, differentiable gates and trainable SC weights.
+`training_gate_schedule="materialized"` uses the complete second-derivative route.
+
+`ForceTrainer` and the CLI expose layout selection too:
 
 ```python
+from mace_ictc.training import ForceTrainer
+
 trainer = ForceTrainer(
     model, train_loader, config=training_config, device="cuda", dtype=torch.float32,
     operator_plan="generated", generated_layout="fused_pack",
@@ -305,7 +397,8 @@ trainer = ForceTrainer(
 )
 ```
 
-从头训练的命令示例（使用已预处理数据；数据处理也在对应远端任务中运行）：
+Example training command using preprocessed data; preprocessing must also run
+on the designated remote compute resources:
 
 ```bash
 mff-train --data-dir /task/data --dtype float32 \
@@ -315,14 +408,15 @@ mff-train --data-dir /task/data --dtype float32 \
   --backward-targets parameters
 ```
 
-`--freeze-conv-tp-weight` 是新模型架构的显式选择；不能作为任意已有可训练 TP
-checkpoint 的无影响优化。`--operator-plan auto` 默认不会修改 dtype 或冻结权重。
-显式 make_fx 训练 capture 在 `auto` 下使用参考方案，不能把它与 generated eager
-训练速度叠加宣称为同一个模式。
+`--freeze-conv-tp-weight` is an explicit architecture choice for a new model.
+It changes an existing checkpoint whose TP coefficients are trainable.
+`--operator-plan auto` does not change dtype or freeze weights. Explicit make_fx
+training capture uses the reference route under `auto`; its behavior and
+performance must be reported separately from generated eager training.
 
 ## 6. AOTI / LAMMPS
 
-Python 准备入口：
+Python preparation entry point:
 
 ```python
 from mace_ictc.hp import prepare_for_export
@@ -334,12 +428,15 @@ info = prepare_for_export(model, policy="generated", layout="fused_pack")
 # info = prepare_for_export(model, policy="generated", reference_buffer_policy="device")
 ```
 
-`layout=None` 保留已显式选择的布局，新模型默认为 packed。
-`dynamic=True` 是默认值。已有 TorchScript e3nn 子模块会在 symbolic trace 中把 N
-固定为示例大小，API 会提前报出模块名；需在模型重建/加载之前设置
-`e3nn.set_optimization_defaults(jit_script_fx=False)`。仅明确准备固定 N 包时传
-`dynamic=False`。正式导出 CLI 已在模型加载前处理这一设置。
-函数只准备模型；正式包、验证与 LAMMPS metadata 用现有导出 CLI：
+`layout=None` retains an explicitly selected layout; a new model defaults to
+packed. `dynamic=True` is the default. Existing TorchScript e3nn submodules
+would bake the example N into a symbolic trace, so the API reports their names
+before export. Set `e3nn.set_optimization_defaults(jit_script_fx=False)` before
+rebuilding/loading the model. Pass `dynamic=False` only when deliberately
+preparing a fixed-N package. The export CLI sets this option before model loading.
+
+The function prepares the model. Use the existing export CLI to create the
+package, validate it and write LAMMPS metadata:
 
 ```bash
 mff-export-aoti --checkpoint trained_model.pth --elements H,C,O \
@@ -347,61 +444,82 @@ mff-export-aoti --checkpoint trained_model.pth --elements H,C,O \
   --avg-num-neighbors TRAINING_VALUE --embed-e0 --out /task/model.pt2
 ```
 
-CLI 使用 checkpoint 的权重、实际结构和精度。`--generated-layout fused_pack`
-将融合 copy 编入新包；已有 `.pt2` 不会因为 Python 配置改变而更新。
-导出保留 owned-energy 接口、动态 N/E 和消息传递深度；通过 CLI 生成的 `.meta`
-也保存 requested layout。`pair_style mff/torch` / `mff/torch/kk` 的完整构建与
-调用见 [接口文档](../lammps_user_mfftorch/README.md)。
-高 L 推理准备使用有界导出实现：L4/5、cor3 的 SC 使用共享二次前缀、稀疏最终
-耦合及解析一阶伴随；cor2 的非 32 倍数通道、非标量目标也使用稀疏导出路径。
-高 L TP 按输入 degree 和最多两条路径分区，C>=32 再按 32 通道分块，
-保留真实图聚合和几何导数。
-`reference_buffer_policy="auto"` 默认在合格单设备 cor3 的分解完成后将原始 U 留在
-CPU；`"device"` 只改变准备阶段原缓冲驻留，不改变导出算子。CLI 对应选项为
-`--reference-buffer-policy auto|device`。准备不在每步传输这些常量。
-稠密 U 仍以原 checkpoint keys 注册；只有求力图实际引用的分解表、投影和冻结权重
-进入导出包。准备后修改参数或 U 必须重新准备/导出，不能继续使用旧冻结银行。
-不能把单边直接写出的 CUDA wrapper 直接塞入该导出图，图消息需要真实 reduction。
+The CLI uses the checkpoint weights, actual architecture and precision.
+`--generated-layout fused_pack` compiles fused copies into the new package.
+Changing Python configuration does not update an existing `.pt2` file.
+Export preserves the owned-energy interface, dynamic N/E and message-passing
+depth. The CLI-generated `.meta` also records the requested layout. For complete
+build and usage instructions for `pair_style mff/torch` / `mff/torch/kk`, see the
+[interface documentation](../lammps_user_mfftorch/README.md).
 
-## 7. 支持范围、默认与回退
+High-L inference preparation uses bounded export implementations. L4/5, correlation=3
+SC uses a shared quadratic prefix, sparse final coupling and analytic first
+backward kernels. Correlation=2 with channel tails and nonscalar targets also uses sparse export.
+High-L TP is partitioned by input degree and at most two paths; C>=32 adds
+32-channel tiling, retaining graph aggregation and geometry derivatives.
 
-整网自动覆盖：CUDA FP32、内部 FP32、正整数 channels、非负 hidden/edge L
-（edge L>=hidden L）、正整数 interaction 层数、笛卡尔 ICTC、
-cor=2/3（兼容 1）、native full-CG/baseline bridge-U、无 interaction attention、无 cuEq 混合。
-推理要求参数已冻结；训练要求架构的 TP 基础系数固定。径向/线性/SC 权重保持原样。
-API 的覆盖与正确性门槛不保证每个图/层数/配置都更快。
+The default `reference_buffer_policy="auto"` leaves original U on the CPU
+after factorization for validated single-device correlation=3 models. `"device"`
+changes preparation-time residency of the original buffers without changing
+exported operators. The CLI option is `--reference-buffer-policy auto|device`.
+These constants are not transferred at every step.
 
-### 统一策略入口
+Dense U remains registered with its original checkpoint keys. Only the
+factorization tables, projections and frozen weights actually referenced by
+the force graph enter the export package. Parameter or U changes after
+preparation require preparation/export again; old frozen banks are no longer
+valid. A standalone edge wrapper that writes outputs directly cannot replace
+graph messages in the export graph, which require node reduction.
 
-用户通过一个入口启用整组已验证的 HP 策略，无需逐层设置内部开关：
+## 7. Coverage, defaults and fallbacks
+
+Whole-model automatic coverage requires GPU FP32, internal FP32, positive
+integer channels, nonnegative hidden/edge L with edge L>=hidden L, positive
+interaction depth, Cartesian ICTC, correlation=2/3 with compatibility for 1, the
+existing full CG baseline bridge-U, no interaction attention and no cuEq mixing.
+Inference requires already frozen parameters; training requires fixed
+architecture-level TP base coefficients. Radial, linear and SC weights retain
+their original trainability. API coverage and correctness validation do not
+guarantee a speedup for every graph, layer count or configuration.
+
+### Unified policy entry point
+
+One entry point enables the applicable validated HP strategies:
 
 ```python
-# Existing CUDA FP32 model; preserve its parameters and checkpoint keys.
+# Existing GPU FP32 model; preserve its parameters and checkpoint keys.
 info = configure_model(model, training=True, policy="generated")
 print(info["selected"], info["counts"])
 ```
 
-`wide_channel_policy` 和 `high_l_policy` 默认均为 `auto`。`generated` 要求覆盖，
-条件不满足时明确报错；`auto` 允许返回参考方案和原因。两者都不自动冻结权重。
-推理时显式冻结参数并传 `training=False`，沿用第 4 节的完整求力调用。
+`wide_channel_policy` and `high_l_policy` both default to `auto`. `generated`
+requires coverage and raises an explicit error when its conditions are not met;
+`auto` may select the reference route and return the reasons. Neither freezes
+weights. For inference, explicitly freeze parameters, pass `training=False`
+and use the complete force evaluation in section 4.
 
-| 模块 | 统一策略的适用规则 |
-|---|---|
-| TP、消息与径向网络 | 启用生成消息、实时门控与径向重算，保留真实 gather/scatter 和力导数 |
-| SC | cor2 使用电路；L4/5 训练及 L5 尾部通道推理按 degree 拆分；cor3 在 L4/5 使用有界稀疏耦合 |
-| 通道与元素矩阵 | 推理使用共享通道 GEMM；C>=96、hidden/edge L<=3、元素数<=4 时启用共享元素 GEMM |
-| 节点聚合 | C>=96、hidden/edge L<=3 且 E>=4096、平均入度>=16 时选择 CSR 前向 |
-| 高阶 TP | L4/5、C>=64 时流式几何计算；按训推阶段和设备选择通道分块，详见下文 |
-| 精度与参数 | 始终严格 FP32、TF32 关闭；SC、径向和线性权重实时参与计算与求导 |
+| Component | Rules used by the unified policy |
+| --- | --- |
+| TP, messages and radial network | Generated messages, differentiable gates and radial recomputation, retaining gather/scatter and force derivatives |
+| SC | Circuits for correlation=2; degree partitioning for L4/5 training and L5 inference with channel tails; bounded sparse coupling for L4/5 correlation=3 |
+| Channel and species matrices | Shared channel GEMM in inference; shared species GEMM for C>=96, hidden/edge L<=3 and at most four species |
+| Node aggregation | CSR forward for C>=96, hidden/edge L<=3, E>=4096 and average indegree>=16 |
+| High-L TP | Streamed geometry for L4/5 and C>=64; channel tiling depends on training/inference and device, as described below |
+| Precision and parameters | Strict FP32 with TF32 disabled; trainable SC, radial and linear weights participate in evaluation and differentiation |
 
-这些条件属于同一自动策略集。不同 SC 电路和聚合内核是互斥调度；
-统一入口会选择适用路径。启用一组策略不能保证每个架构都同时降低延迟和显存。
+These conditions form one automatic policy set. Different SC circuits and
+aggregation kernels are mutually exclusive schedules; the entry point selects
+the applicable route. Enabling the set does not guarantee simultaneous latency
+and memory reductions for every architecture.
 
-对 C>=96 且 hidden/edge L<=3 的整网默认启用两项优化：
-元素数<=4 时，按元素共享 GEMM，避免 `[N,C,C]` 权重复制及其梯度 scatter；
-大且较密的图使用上文的 CSR 前向。元素银行、径向、通道与 SC 权重仍可训练。
-较低通道仍保留原宽通道调度，interaction 层数和 cor=2/3 的选择仍独立。
-`wide_channel_policy="off"` 关闭这两项宽通道优化，保留其他 HP 算子：
+For C>=96 and hidden/edge L<=3, two whole-model optimizations are enabled by
+default. With at most four species, shared GEMM by species avoids `[N,C,C]`
+weight copies and their gradient scatter. Large, sufficiently dense graphs use
+the CSR forward described above. Species banks, radial, channel and SC weights
+remain trainable. Lower channel counts retain the preceding HP schedules;
+interaction depth and correlation=2/3 remain independent choices.
+`wide_channel_policy="off"` disables these two wide-channel optimizations while
+retaining the other HP operators:
 
 ```python
 configure_model(model, training=True, policy="generated", wide_channel_policy="auto")
@@ -409,12 +527,16 @@ configure_model(model, training=True, policy="generated", wide_channel_policy="a
 configure_model(model, training=True, policy="generated", wide_channel_policy="off")
 ```
 
-显式 `species_linear_schedule="grouped"` 可对整数物种索引的元素条件线性层
-（包括 `self_connection`）按实际物种分组，每个非空组调用一次 GEMM，避免
-`[N,C_out,C_in]` 临时权重。该算法不限定 C、L、物种数或 interaction 数；
-按实际张量形状运行，参数梯度和高阶导数保留普通 PyTorch autograd。
-每次调用重新建立节点分组，同一调用中的各角动量块复用分组；不缓存会随
-ghost/owner 变化的成员关系。显存开销随节点特征大小增长。
+Explicit `species_linear_schedule="grouped"` groups element-conditioned linear
+maps with integer species indices, including `self_connection`, by the actual
+species present. Each nonempty group uses one GEMM, avoiding temporary
+`[N,C_out,C_in]` weights. The algorithm accepts configurable C, L, species count
+and interaction depth, using actual tensor shapes. Parameter and higher
+gradients retain ordinary PyTorch autograd.
+
+Node groups are rebuilt for each call and reused across angular blocks within
+that call. Membership that changes with ghost/owner topology is not cached.
+Memory overhead scales with node features.
 
 ```python
 configure_model(model, policy="generated", species_linear_schedule="grouped")
@@ -422,25 +544,37 @@ configure_model(model, policy="generated", species_linear_schedule="grouped")
 configure_model(model, policy="generated", species_linear_schedule="gather")
 ```
 
-该选项只支持 eager：分组计数需少量 GPU→CPU 元数据同步，不支持 capture；
-小体系未必提速。`auto` 保留上表原有默认策略，`reference` 恢复参考路径。
-它与对称收缩的 `species_schedule` 独立；软物种混合的 `forward(node_attrs)`
-仍保留原公式。整网 HP 的覆盖范围仍由 `check_model` 判定。
-大体系 MD 还须协调 PyTorch 缓存池与 LAMMPS/RCCL 原生分配器；
-本次复现脚本在 Torch 池超过显存容量比例时，求力结束后返还闲置缓存，
-开销包含在 MD 测速中。该策略位于接口层，不以模型超参数或固定 N 分派。
+This option is eager-only: group counts require a small GPU-to-CPU metadata
+synchronization, so capture is unsupported. Small systems may not become faster.
+`auto` retains the defaults in the table, and reference mode restores the
+reference route. This setting is independent of SC `species_schedule`.
+Soft species mixtures through `forward(node_attrs)` retain the original
+formula. `check_model` still determines whole-model HP coverage.
 
-高阶整网默认由 `high_l_policy="auto"` 选择 L4/5 调度：cor3 的 SC 使用共享
-二次 CG 前缀和稀疏最终耦合，避免生成过大的整段 cubic 电路；cor2 保留
-原电路，训练及 L5 非 32 倍数通道推理的非标量输出按 degree 拆分，限制编译复杂度。
-C>=64 的高阶 TP 使用逐输入/输出 magnetic 分量生成的几何计算。L4 训练用
-32 通道分块、推理用原分块；L5 cor2 训练用原分块、推理用 32 分块；
-L5 cor3 训练使用 32 分块；推理在 SM 8.9 GPU 使用原分块，其余保持 32 分块。
-这个硬件选择已在 4090D 和 A100 40GB 上验证，不保证同架构的所有卡/图都有收益。
-cor3 稀疏计算按每行系数数目控制计算块，避免大 K
-导致每线程中间数组过大。所有原始 SC 学习权重经实时投影参与求值和求导，
-没有缓存训练权重、截断系数或改变模型参数化。TP 和对外特征保持笛卡尔基；
-SC 继续沿用既有 bridge-U 与独立 CG 前缀的实现。
+Large-system MD also uses memory outside PyTorch's caching allocator, including
+LAMMPS buffers and communication buffers. Account for these allocations when
+choosing a gate-cache budget; the Python HP settings do not cap total process
+GPU memory.
+
+For high-L models, `high_l_policy="auto"` selects L4/5 schedules. Cor3 SC uses
+a shared quadratic CG prefix and sparse final coupling to avoid an oversized
+monolithic cubic circuit. Cor2 keeps its circuit, partitioning nonscalar outputs
+by degree during training and during L5 inference with non-multiple-of-32
+channels to bound compilation complexity.
+
+High-L TP with C>=64 generates geometry by input/output angular component.
+L4 training uses 32-channel tiles, while inference retains the original tiling.
+L5 correlation=2 training retains the original tiling and inference uses 32-channel tiles.
+L5 correlation=3 training uses 32-channel tiles; inference uses the original tiling on
+NVIDIA GPUs with compute capability 8.9 and 32-channel tiles elsewhere. This
+device-dependent schedule does not guarantee a speedup for every graph.
+
+Cor3 sparse execution sizes work blocks by coefficient count per row, bounding
+per-thread intermediates when a row has many coefficients. Original SC learned weights enter
+evaluation and differentiation through differentiable projections. Training weights are
+not cached, coefficients are not truncated, and model parameterization is
+preserved. TP and public features retain the Cartesian basis; SC retains the
+existing bridge-U and independent CG-prefix implementation.
 
 ```python
 model = create_model(channels=128, lmax=5, correlation=3, num_interactions=3)
@@ -450,48 +584,62 @@ print(info["high_l_active"], info["counts"])
 configure_model(model, training=True, policy="generated", high_l_policy="off")
 ```
 
-独立 SC 使用相同策略；力损失混合反向可传
-`configure_symmetric_contraction(sc, training=True)` 选择有界训练电路。
-可传 `configure_symmetric_contraction(sc,
-high_l_policy="off")` 恢复原整段电路。L<=3 的默认执行方案保持原样。
-高阶调度的覆盖不等于所有 channels、图大小和 GPU 都有性能收益；较小图的
-启动开销、首次常量规划和 JIT 编译仍需单独考虑。
+Standalone SC uses the same policy. For force-loss mixed backward,
+`configure_symmetric_contraction(sc, training=True)` selects bounded training
+circuits. Pass `configure_symmetric_contraction(sc, high_l_policy="off")` to
+restore the previous monolithic circuit. L<=3 default schedules are unchanged.
+High-degree coverage does not imply a performance gain for every channel count,
+graph size or GPU. Small-graph launch costs, initial constant planning and JIT
+must be considered separately.
 
-默认将单设备 L4/5、cor3 的原始稠密 U 和其衍生转置缓冲在分解计划
-验收后移到 CPU。GPU 热运行使用已有分解系数，特征、门控、全部学习权重和
-反向计算继续保持 GPU FP32。此处只移动固定常量，不逐步搬运激活或训练权重。
-原缓冲仍以相同 checkpoint keys、形状、dtype 和数值注册，`named_buffers()`
-因此可能同时包含 CPU 和 CUDA 张量。参考调用和设备驻留选择会还原
-原始设备缓冲；可微 `node_attrs` 的参考路径仍保留。高 L generated 导出准备
-沿用 CPU 驻留；checkpoint/回退导出准备仍恢复设备缓冲。
+For single-device L4/5 correlation=3, original dense U and derived transpose buffers move
+to the CPU by default after the factorization plan passes validation. Warm GPU
+execution uses the factorized coefficients, while features, gates, learned
+weights and backward computation remain GPU FP32. Only fixed constants move;
+activations and training weights are not transferred at every step.
+
+The original buffers remain registered with identical checkpoint keys, shapes,
+dtypes and values, so `named_buffers()` may contain both CPU and GPU tensors.
+Reference calls and device-residency selection restore the buffers to their
+original device. Differentiable `node_attrs` retain the reference route.
+High-L generated export preparation retains CPU residency; checkpoint/fallback
+export preparation restores device buffers.
 
 ```python
-# Same default one-call HP strategy, including qualified high-L memory savings.
+# Same default one-call HP strategy, including validated high-L memory savings.
 configure_model(model, training=True, policy="generated")
 # Retain conventional device buffers for external tooling or a control run.
 configure_model(model, training=True, policy="generated", reference_buffer_policy="device")
-# Standalone SC has the same escape.
+# The same residency option is available for standalone SC.
 configure_symmetric_contraction(sc, training=True, reference_buffer_policy="device")
 ```
 
-已初始化的分布式进程组及 DDP/DataParallel 封装自动保留设备缓冲。请在封装后
-配置 HP；若要在已有 CPU 常量驻留的模型上新建并行封装，先选择 `device`。
-频繁交替离散 species 的 HP 调用与可微属性参考调用会产生常量传输；这种用法
-可固定 `device`。高 L generated 导出默认保留 CPU U，也可通过
-`prepare_for_export(..., reference_buffer_policy="device")` 选择设备驻留。
-prepared Python、独立 `.pt2` 运行器和实际 LAMMPS 进程的峰值分别测量；
-不能直接把 eager 减少的常量字节数当作另外两种进程的峰值差值。
+Initialized distributed process groups and DistributedDataParallel (DDP) or DataParallel wrappers
+automatically retain device buffers. Configure HP after wrapping. Before
+creating a parallel wrapper around a model that already has CPU constants,
+select `device`. Frequent alternation between discrete-species HP calls and
+differentiable-attribute reference calls transfers constants; such workloads
+can keep `device` residency.
 
-新的 CUDA CSR 调度用于 eager 训推。AOTI 继续使用 prepared Triton 消息内核；
-高阶 prepared SC/TP 按第 6 节选择独立的有界实现；AOTI/LAMMPS 的速度仍以
-该导出包的完整求力实测为准，不能直接套用 eager 的加速比。
-显式 `generated` 会保留真实 U 张量的重构精度检查；不满足预算时直接报错，
-不会把原始 SC 回退伪装成高性能支持。首次规划/JIT 成本单独于热吞吐。
+High-L generated export defaults to CPU U; use
+`prepare_for_export(..., reference_buffer_policy="device")` for device residency.
+Measure peak memory separately for prepared Python, standalone `.pt2` runners
+and actual LAMMPS processes. Eager constant-byte savings cannot directly predict
+the peak-memory difference in the other execution modes.
+
+The GPU CSR schedule applies to eager training/inference. AOTI retains
+prepared Triton message kernels, with separate bounded high-L SC/TP
+implementations from section 6. Measure complete forces with the actual
+AOTI/LAMMPS package; eager speedups do not transfer automatically.
+Explicit `generated` retains reconstruction-accuracy checks against the actual
+U tensors. Exceeding the reconstruction budget raises an error rather than
+reporting an original-SC fallback as HP support. Initial planning/JIT is
+separate from warm throughput.
 
 ```python
 # Keep the established default; auto reports unsupported-model reasons.
 info = configure_model(model, training=True, policy="auto", layout="packed")
-# Opt in to fused copies on a qualified model.
+# Opt in to fused copies on a validated model.
 info = configure_model(model, training=True, policy="generated", layout="fused_pack")
 # Revert only the HP layout.
 configure_model(model, training=True, policy="generated", layout="packed")
@@ -499,18 +647,23 @@ configure_model(model, training=True, policy="generated", layout="packed")
 configure_model(model, training=True, policy="reference")
 ```
 
-训练 CLI 回退 `--operator-plan reference`；checkpoint/export 保留原路径使用
-`operator_plan="checkpoint"` / `--operator-plan checkpoint`。
-`prepare_for_export(..., policy="checkpoint")` 保留当前 checkpoint 路径，不负责
-撤销已经准备的 deployment callable；需要干净原路径时先重新加载原 checkpoint。
+The training CLI selects the reference route with `--operator-plan reference`.
+Checkpoint/export paths can retain their original route with
+`operator_plan="checkpoint"` / `--operator-plan checkpoint`.
+`prepare_for_export(..., policy="checkpoint")` retains the current checkpoint
+route but does not undo an already prepared deployment callable. Reload the
+original checkpoint when a clean original route is required.
 
-`fused_pack` 保持可选，速度与显存效果随图形、模型和执行模式变化。默认 `packed`。
+`fused_pack` remains opt-in; its speed and memory effects depend on graph,
+model and execution mode. The default is `packed`.
 
-## 8. 已单独资格验证的高级组合
+## 8. Advanced combinations requiring separate validation
 
-cor=2/reduced-CG 不在当前 `auto` 覆盖内；保留原来的公开低层 API
-`mace_ictc.models.operator_plans.set_mace_backbone_plan` 用于显式组合。对已经由
-调用者单独验证的 FP32/C64 模型，可以显式选择：
+Cor2 configurations using reduced CG are outside current `auto` coverage.
+The existing low-level selector
+`mace_ictc.models.operator_plans.set_mace_backbone_plan` remains available for
+explicit combinations. For an FP32/C64 model independently validated by the
+caller:
 
 ```python
 from mace_ictc.models.operator_plans import set_mace_backbone_plan
@@ -525,67 +678,81 @@ set_mace_backbone_plan(
 )
 ```
 
-低层 selector 返回注册模块计数，不保证任意架构/输入都命中快核。必须保留对应
-数值资格验证，不能用它绕过高层 `generated` 的覆盖/可训练性检查来宣称自动支持。
-验证应覆盖 FP32 E/F、原子 reference energy、所有 force-loss 参数梯度和实际
-保存 U 的 span 重构，不用模块计数代替正确性验证。
+This selector returns registered-module counts and does not guarantee fast-kernel
+dispatch for arbitrary architectures or inputs. Preserve the corresponding
+numerical validation; bypassing high-level `generated` coverage/trainability
+checks does not establish automatic support. Validation should cover FP32
+energy/forces, per-atom energy predictions with a consistent E0 convention,
+every force-loss parameter gradient and reconstruction of the actual saved U.
+Module counts cannot establish
+correctness.
 
-## 低阶求导与图消息调度
+## Low-degree derivatives and graph message schedules
 
-独立 `EdgeTensorProduct` 在 L<=3 时默认按实际请求的一阶/二阶梯度类型选择
-内核。逐边二阶路径保留原生 packed 布局并直接写回，不再绕行图聚合的布局
-转换和原子加法。几何二阶直接归约到球谐输入，更高阶导数仍有原生表达式回退。已有可训练 TP
-基础系数依然不会被 API 自动冻结；学习的径向门控保持实时计算和求导。
+For L<=3, standalone `EdgeTensorProduct` selects kernels by the first/second
+gradient roles actually requested. The edge second-derivative route retains
+native packed buffers and writes directly, avoiding graph-aggregation layout
+conversions and atomic additions. Geometry second derivatives reduce directly
+into harmonic inputs; higher derivatives retain a native-expression fallback.
+The API still does not freeze existing trainable TP base coefficients. Learned
+radial gates remain differentiable functions of geometry.
 
-整网新增显式 `message_schedule`，默认为 `"native"`，保留既有高性能方案：
+Whole-model `message_schedule` defaults to `"native"`, retaining the existing
+HP schedule:
 
 ```python
-# 已有模型和 checkpoint 可直接配置，权重/模型架构均不改变。
+# Configure existing models/checkpoints without changing weights or architecture.
 configure_model(model, training=True, policy="generated", layout="fused_pack",
                 message_schedule="roles")
 configure_model(model, training=False, policy="generated", layout="fused_pack",
                 message_schedule="roles")
 
-# 回到原调度，其他 SC/高阶/宽通道策略仍由既有参数控制。
+# Restore the original message schedule; other SC/high-L/wide policies stay configurable.
 configure_model(model, training=True, policy="generated", message_schedule="native")
 ```
 
-`"roles"` 使用原笛卡尔坐标和按梯度类型编译的 CUDA 伴随。
-`"compact"` 坐标切换调度不受支持。调用方应使用 `"roles"` 或 `"native"`，
-保持当前原生笛卡尔基；此限制不涉及独立 TP 的 `execution="legacy"` 布局兼容路线。
+`"roles"` uses the original Cartesian basis and native GPU backward kernels compiled
+for the requested gradient inputs. The retired `"compact"` coordinate-switching schedule is
+unsupported. Use `"roles"` or `"native"` to retain the native Cartesian basis.
+This restriction does not affect standalone TP `execution="legacy"` layout
+compatibility.
 
-按梯度类型选择的显式消息方案只覆盖 hidden/edge L<=3；高阶仍可用既有 `native`
-方案、`high_l_policy` 和 AOTI。特别是 `canonical` 访存和实验性的多 warp/分组
-方案不属于默认推荐配置。channels、interaction 层数和 cor 的结构参数
-仍由用户选择；具体设备和形状的性能验收范围应另行确认。
+Explicit role-based message scheduling covers hidden/edge L<=3. Higher degrees
+retain the `native` route, `high_l_policy` and AOTI. In particular, `canonical`
+memory access and experimental multi-warp/grouped schedules are not default
+recommended configurations. Channels, interaction depth and correlation remain
+caller-selected architecture parameters. Performance validation depends on
+the actual device and shapes.
 
-原生 packed 图接口供已经持有二维缓冲的调用方使用：
+The native packed graph interface accepts existing 2D buffers:
 
 ```python
 from ictc_o3 import PackedGraphMessage
 
 op = PackedGraphMessage.create(channels=64, input_lmax=3, edge_lmax=3,
                                cartesian_schedule="native", reduction="csr")
-# x: [N, C*(L_in+1)**2]，每阶 magnetic 在前、channel 在后
-# sh: [E, (L_edge+1)**2]；g: [E, op.gate_width]
-# src/dst: [E]，int64 CUDA，有效节点索引，可重复或未排序
-# 输出: [N, op.output_width]，路径不归约，布局同 EdgeTensorProduct.ir_mul
+# x: [N, C*(L_in+1)**2], angular component before channel within each degree
+# sh: [E, (L_edge+1)**2]; g: [E, op.gate_width]
+# src/dst: [E], int64 CUDA, valid node indices; repeated/unsorted entries allowed
+# Output: [N, op.output_width], separate paths, same layout as EdgeTensorProduct.ir_mul
 out = op(x, sh, g, src, dst)
 grad_x, grad_g = torch.autograd.grad(out, (x, g), output_cotangent)
 ```
 
-包装已有固定系数 TP 时使用 `PackedGraphMessage(tp, input_lmax=..., edge_lmax=...)`；
-`create` 构造新的单位固定基础系数 TP。`cartesian_schedule="native"` 使用原坐标，
-也是当前唯一支持的坐标方案。接口支持普通及混合 autograd；此接口为 eager
-CUDA FP32，不直接用于 AOTI。现有字典接口 `GraphMessage` 保持可用，便于兼容
-使用 `[N,C,2l+1]` 特征块的调用方。不要将纯边吞吐当作完整能量/力吞吐。
+Use `PackedGraphMessage(tp, input_lmax=..., edge_lmax=...)` to wrap an existing
+TP with fixed coefficients. `create` constructs new fixed unit base coefficients.
+`cartesian_schedule="native"` uses the original coordinates and is the only
+supported coordinate schedule. This interface supports ordinary and mixed
+autograd in eager GPU FP32 and is not a direct AOTI entry point. The dictionary
+`GraphMessage` interface remains available for `[N,C,2l+1]` feature blocks.
+Edge-only throughput does not represent complete energy/force throughput.
 
-## 大图的设备端 CSR
+## Device-side CSR for large graphs
 
-整网可以显式选择 CSR 前向和设备端分组；一阶/混合反向保持既有方案。
-本轮 C64/L3、50 邻居的图消息同卡复测有收益，显存峰值基本相同。
-整网推理的单独进程优势未在同卡配对中稳定复现，因此这些开关用于显式
-调优，不替换默认方案；结论不推广到所有 channels、L 或 GPU。
+Whole models can explicitly select CSR forward and device-side grouping while
+retaining existing first-order and mixed second-order backward schedules.
+These are tuning options; their effect on complete energy/force evaluation
+depends on C, L, graph topology and GPU.
 
 ```python
 configure_model(model, training=False, policy="generated", layout="fused_pack",
@@ -601,63 +768,85 @@ op = PackedGraphMessage.create(channels=64, input_lmax=3, edge_lmax=3,
 out = op(x, sh, g, src, dst)
 ```
 
-`graph_reduction="auto"` 默认沿用已有宽通道/高 L 策略；`"atomic"`/`"csr"`
-显式选择前向归约。`topology_backend="native"` 默认用稳定排序分组；
-`"device"` 每次调用在 GPU 上重新计数、构造指针并分组，支持未排序和重复
-节点索引，不缓存图、特征或学习权重。已排序输入由 GPU 检测并保留边顺序；
-未排序输入的节点内部边顺序不保证稳定，浮点
-归约顺序可改变，验收采用数值容差。`csr_accumulator_limit=None` 保留原策略
-的分块设置；正整数控制 CSR 内核的累加器预算。参考模式不使用设备端快路径。
+`graph_reduction="auto"` retains the existing wide-channel/high-L policy.
+`"atomic"` and `"csr"` explicitly select forward reduction.
+`topology_backend="native"` uses stable sorting by default. `"device"`
+recounts, builds pointers and groups indices on the GPU for every call,
+supporting unsorted and repeated indices without caching graphs, features or
+learned weights. Sorted input is detected on the GPU and keeps its edge order.
+For unsorted input, within-node edge order is not guaranteed to be stable;
+floating reduction order can change, so validation uses numerical tolerances.
+`csr_accumulator_limit=None` retains the original tiling policy. A positive
+integer controls the CSR accumulator budget. Reference mode does not use this
+device fast path.
 
-这些开关不改变模型结构、dtype 或参数的可训练性。已验证的配置仍为 eager
-CUDA FP32；新 CSR 调度没有增加 AOTI 性能验收范围。源节点融合反向、跨阶
-融合和持久化 warp 调度的实验未表现出稳定收益，因此没有作为默认方案。
+These options preserve architecture, dtype and parameter trainability.
+Validated coverage remains eager GPU FP32; the CSR schedule does not expand
+AOTI performance validation. Experiments with source-fused backward,
+cross-degree fusion and persistent warp scheduling did not show consistent
+benefits and are not defaults.
 
-## 原生基的实现边界
+## Native-basis implementation boundaries
 
-前向、反向和训练状态始终保持已有 ICTC 角向基与 CG/SC 约定，不在 TP 内
-切换到仅选择z指标数<=1的 STF 分量。保留逐边二阶直接写回、按梯度类型
-编译、原生 packed 缓冲、分块径向门控及既有高L/宽通道方案。
-`compact_contraction` 指既有 SC 实现的压缩策略，不是已退役的坐标切换。
+Forward, backward and training state retain the established ICTC angular basis
+and CG/SC conventions. Direct edge second-derivative stores, gradient-role
+compilation, native packed buffers, chunked radial gates and existing
+high-L/wide-channel schedules are retained. `compact_contraction` names the
+existing SC compression strategy, not the retired coordinate switch.
 
-加载带旧实验标志的模型后调用 `configure_model(...,message_schedule="roles")`
-会清除该标志和临时坐标缓存，保留权重、架构、dtype和参数可训练性。
-明确请求旧 `compact` 的调用会报错，不会静默替换并沿用旧性能结论。
+After loading a model with old experimental flags,
+`configure_model(..., message_schedule="roles")` clears those flags and temporary
+coordinate caches while preserving weights, architecture, dtype and trainability.
+Explicit requests for the old `compact` route raise an error rather than
+silently substituting a route and reusing obsolete performance claims.
 
-原生基的 CSR 分块可显式启用 `csr_slice_search=True`。稳定分组中的原始边ID
-按节点单调排列时，用上下界搜索缩小当前chunk的邻居遍历范围；节点没有本块
-边时直接结束计算。device分组只有GPU确认输入有序才使用该搜索，否则沿用
-完整扫描，避免把未排序的原始边ID误当有序。整个过程不改变CG、坐标、路径
-或求导公式；默认关闭，需对使用形状验收性能。
+Native-basis CSR chunking can explicitly enable `csr_slice_search=True`.
+When original edge IDs are monotonic within each node's stable group, lower/upper
+bound searches restrict neighbor traversal to the current chunk; nodes with no
+edges in that chunk finish immediately. Device grouping uses this search only
+when the GPU confirms sorted input, otherwise retaining a full scan so unsorted
+edge IDs are not treated as ordered. CG, coordinates, paths and differentiation
+formulas are unchanged. The option defaults off and needs performance validation
+for the actual shapes.
 
-## 可选按节点索引读取 SC 元素权重
+## Optional SC species weights indexed by node
 
-`configure_model(..., species_schedule="indexed")` 和
-`configure_symmetric_contraction(..., species_schedule="indexed")` 为 L<=3 的
-原生 full-CG circuit 选择按节点读取元素系数的路径。它沿用已有 CG 多项式与
-实时权重银行，省去按元素 `nonzero`、节点分组和整块回填；不缓存输入特征、
-元素分组或学习参数。首阶、参数梯度和混合二阶仍可计算。
+`configure_model(..., species_schedule="indexed")` and
+`configure_symmetric_contraction(..., species_schedule="indexed")` select a
+node-indexed species-coefficient route for native full CG circuits with L<=3.
+It retains the CG polynomial and trainable weight bank while eliminating per-species
+`nonzero`, node grouping and full-buffer scatter-back. Input features, species
+groups and learned parameters are not cached. First, parameter and mixed second
+gradients remain available.
 
-默认 `species_schedule="grouped"` 保留原执行路径。高阶与已有分区/稀疏 SC
-继续用原计划；返回信息中的 `indexed_species_circuits` 计数（独立 SC 为
-`indexed_species_active`）说明实际覆盖。`policy="reference"` 清除索引执行选择。
-离散 `node_type_idx` 必须为同设备 int64 `[N]`，且每个值均在元素银行范围内。
-只有 `node_attrs` 的调用继续用原约定，不将可微元素输入替换成离散索引。
+The default `species_schedule="grouped"` retains the original route.
+High-L and existing partitioned/sparse SC retain their plans. Returned
+`indexed_species_circuits` counts, or standalone SC `indexed_species_active`,
+report actual coverage. `policy="reference"` clears indexed execution.
+Discrete `node_type_idx` must be int64 `[N]` on the same device, with every
+index inside the species-bank range. Calls with only `node_attrs` retain the
+original convention; differentiable species attributes are not replaced by
+discrete indices.
 
-这项选择不改变径向分页或门控缓存预算。调用方可分别选择容量与吞吐配置，
-并对实际网络检查能量、力、参数梯度、热吞吐和峰值显存。固定形状 CUDA Graph
-仍是调用方单独准备、验证的执行协议；启用本选项本身不会捕获或缓存整网调用。
+This setting preserves radial paging and gate-cache budgets. Select capacity
+and throughput configurations for the workload and check actual energy, forces,
+parameter gradients, warm throughput and peak memory. Fixed-shape CUDA Graphs
+require a separate caller-managed preparation and validation protocol; enabling
+this option does not capture or cache whole-model calls.
 
-## 原生几何调度与边块大小
+## Native geometry schedules and edge chunks
 
-生成 CG 表现在沿用原生稀疏 TP 的 `1e-12` 数值零规则。L3 表中删去的
-构造残差约为 `1e-16`；不生成新的基，也不改变参考投影矩阵或学习权重。
+Generated CG tables use the native sparse TP numerical-zero rule of `1e-12`.
+Removed L3 construction residuals are approximately `1e-16`. The basis,
+reference projection matrices and learned weights are preserved.
 
-`geometry_schedule="auto"` 保留已有计划；`"streamed"` 在一阶伴随中
-按输入分量计算原生几何项，降低同时存活的临时量；`"native"` 显式恢复
-此前的几何计算顺序。不同 channels/L/设备的速度仍须按实际配置测量。
+`geometry_schedule="auto"` retains the current plan. `"streamed"` computes
+native geometry by input component during first-order backward, reducing the
+intermediates that must remain in registers at the same time. `"native"`
+restores the previous geometry evaluation order.
+Measure performance for the actual C/L/device combination.
 
-已经持有全部 gates 的独立图算子可以使用较大的边块：
+Standalone graph operators that already hold all gates can use larger chunks:
 
 ```python
 op = PackedGraphMessage.create(
@@ -669,7 +858,7 @@ op = PackedGraphMessage.create(
 y = op(x, sh, gates, src, dst)
 ```
 
-整网训练可显式选择相同的几何调度和块大小：
+Whole-model training can explicitly use the same geometry and chunk settings:
 
 ```python
 configure_model(
@@ -680,10 +869,10 @@ configure_model(
 )
 ```
 
-容量求力推理保留小块径向门控：
+Capacity-oriented force inference retains smaller radial-gate chunks:
 
 ```python
-model.eval().requires_grad_(False)  # 由调用方明确选择冻结推理参数
+model.eval().requires_grad_(False)  # Caller explicitly freezes inference parameters.
 configure_model(
     model, training=False, policy="generated", layout="packed",
     message_schedule="roles", graph_reduction="csr", topology_backend="device",
@@ -693,15 +882,19 @@ configure_model(
 )
 ```
 
-`message_chunk_edges=None` 保留已有块大小；正整数显式覆盖每一层。训练或
-独立图算子已有完整 gates 时，大块减少调用开销；流式径向推理的大块会扩大
-临时 gate 缓冲，须同时看峰值显存。默认不自动扩大容量推理的边块。
-本轮未把这些 eager 调度的速度结论扩展到 AOTI 或已有部署包。
+`message_chunk_edges=None` retains current chunk sizes; a positive integer
+overrides every layer. When training or standalone graph calls already hold
+full gates, larger chunks reduce launch overhead. In streamed radial inference,
+larger chunks enlarge temporary gate buffers, so measure peak memory too.
+Capacity-oriented inference does not automatically enlarge edge chunks.
+These eager-schedule performance observations have not been extended to AOTI
+or existing deployment packages.
 
-### K100 上 C64/L2 大体系的前向与反向分块
+### Forward/backward chunks for large C64/L2 systems on K100
 
-对已冻结参数的两层 C64、hidden/edge L2、full-CG correlation3 模型，
-K100/DTK2604 的大体系求力可显式扩大前向块，同时固定较小的反向块：
+For a frozen two-interaction C64 model with hidden/edge L2 and full CG correlation=3,
+large-system force evaluation on K100/DTK 26.04 can explicitly use larger forward
+chunks and independent smaller backward chunks:
 
 ```python
 model.eval().requires_grad_(False)
@@ -718,27 +911,48 @@ configure_model(
 )
 ```
 
-CSR 每个前向块都会为全部目标节点启动任务，再排除块外节点。较大的
-前向块减少重复查找和启动次数；独立的反向块限制求力临时量。该配方
-保持 FP32、关闭 TF32，不改变权重或 CG/SC 公式，不启用 gate 缓存。
+Each CSR forward chunk launches work for all destination nodes before excluding
+nodes outside that chunk. Larger forward chunks reduce repeated searches and
+launches; independent backward chunks bound force intermediates. This recipe
+uses FP32 with TF32 disabled, preserves weights and CG/SC formulas, and keeps
+gate caching disabled.
 
-实际部署应按模型、图规模和设备预算选择前向及反向块大小，并单独验证显存。
+Choose both chunk sizes for the actual model, graph and device budget, and
+validate memory use separately.
 
-## 可选训练 gate 显存调度与混合反向分块
+The inference options in this example control different operations:
 
-`configure_model(..., training=True, training_gate_schedule=...)` 可在原来的
-Cartesian/full-CG 消息公式上改变 gate 中间量的保存方式：
+| Option | Meaning |
+| --- | --- |
+| `message_chunk_edges` | Edges per TP forward chunk. Also determines backward chunks unless overridden. |
+| `inference_message_adjoint_edges` | Edges per TP backward chunk with frozen parameters. `0` retains the forward chunk size; absent cached gates are recomputed for each backward chunk. |
+| `inference_gate_adjoint_rows` | Maximum rows per radial gate-gradient GEMM with frozen parameters. `0` retains the original GEMM. This does not set a cache budget. |
+| `inference_gemm_policy="dtk2604"` | Selects specialized FP32 gate GEMMs for supported K100/DTK 26.04 shapes; other shapes/stacks retain PyTorch operations. |
+| `inference_basis_fusion=True` | Fuses basis conversion and packing around indexed low-degree SC kernels on K100. A feature tensor is retained for differentiable fallbacks, so measure its memory cost. |
 
-| 值 | 保存和重算行为 |
-|:---|:---|
-| `"materialized"` | 默认，保留既有训练路径。 |
-| `"cached"` | 保留本次 forward 的 gates；第一反向只保留窄径向特征梯度，混合二阶反向按块重算 gate 梯度。 |
-| `"recompute"` | 在上述基础上，反向也按块重算 forward gates。 |
+These options do not freeze parameters and do not remove the gates' geometry
+dependence. The chunk, GEMM and basis-fusion settings are independent of
+`gate_cache_bytes`.
 
-这两个可选方案以重算和额外矩阵乘法换取较低峰值显存，不保证提速。
-`message_chunk_edges` 控制其边块大小。`gate_cache_bytes` 仍只控制冻结参数
-的求力推理缓存，训练时必须为零；`cached` 训练方案保存本次 tape 的全部
-forward gates，不受该推理缓存预算控制，也不跨调用缓存活跃特征或权重。
+## Optional training gate memory schedules and mixed-backward tiling
+
+`configure_model(..., training=True, training_gate_schedule=...)` changes how
+gate intermediates are saved, using the original Cartesian/full CG message
+formula:
+
+| Value | Storage and recomputation behavior |
+| --- | --- |
+| `"materialized"` | Default; retains the established training route. |
+| `"cached"` | Saves gates from the current forward; first backward retains narrow radial-feature gradients, and mixed second backward recomputes gate gradients in chunks. |
+| `"recompute"` | Also recomputes forward gates in chunks during backward. |
+
+The two optional routes trade recomputation and extra matrix multiplication
+for lower peak memory; a speedup is not guaranteed. `message_chunk_edges`
+controls their edge chunk size. `gate_cache_bytes` still controls only the
+force-inference cache with frozen parameters and must be zero during training.
+The `cached` training schedule saves all forward gates for the current autograd graph,
+independently of that inference cache budget. It does not cache activations
+or weights across calls.
 
 ```python
 info = configure_model(
@@ -747,48 +961,61 @@ info = configure_model(
     graph_reduction="csr", topology_backend="device",
     csr_accumulator_limit=24, csr_slice_search=True,
     geometry_schedule="streamed", message_chunk_edges=65_536,
-    training_gate_schedule="cached",  # 更低显存，同时增加训练耗时
+    training_gate_schedule="cached",  # Lower memory, with additional training time.
 )
 ```
 
-适用范围为 eager CUDA FP32、hidden/edge L<=3、原来的固定 TP 系数，以及
-活跃径向线性层参数。参数对象、可训练性、checkpoint keys 和原有 CG/SC
-多项式保持不变。快速混合反向针对 `autograd.grad(loss, trainable_parameters)`
-这样的参数梯度请求；包含坐标 Hessian 的反向和更高阶导数保留可微参考表达式，
-不承诺同样的显存收益。此方案未用于 AOTI 或推理加速。
+Coverage requires eager GPU FP32, hidden/edge L<=3, the original fixed TP
+coefficients and trainable radial-network parameters. Parameter objects,
+trainability, checkpoint keys and the CG/SC polynomials are preserved.
+Fast mixed backward targets parameter-gradient requests such as
+`autograd.grad(loss, trainable_parameters)`. Backward involving coordinate
+Hessians and higher derivatives retains differentiable reference expressions,
+without promising the same memory savings. These schedules are not used for
+AOTI or inference acceleration.
 
-再次调用 `configure_model` 且不指定 `training_gate_schedule`，或切换到
-`policy="reference"`，会恢复 `"materialized"`。接口返回所选 schedule 和
-`counts["paged_training_gates"]`，不会自动启用这两个增加重算的方案。
+Reconfiguring without `training_gate_schedule`, or switching to
+`policy="reference"`, restores `"materialized"`. Returned information includes
+the selected schedule and `counts["paged_training_gates"]`. The API does not
+automatically enable the two schedules that add recomputation.
 
-`mixed_channel_tile=64` 或 `32` 只调整生成式混合二阶 TP 内核的通道分块，
-不改变第一反向或 forward 的分块，也不增加 gate 重算。默认 `None` 保留
-既有调度；`0` 明确使用完整通道的单个分块。该选项同样只覆盖训练的 L<=3，
-并可与 `training_gate_schedule` 独立组合。宽通道可能受益，C64 不保证收益。
-不要把单个形状的速度推广到全部通道数。切换配置时省略该参数会清除旧值。
+`mixed_channel_tile=64` or `32` changes only the channel tiling of generated
+mixed second-derivative TP kernels. It does not change first-backward or
+forward tiling and does not add gate recomputation. The default `None` retains
+the established schedule; `0` explicitly selects one full-channel tile.
+This option covers training L<=3 and can be combined independently with
+`training_gate_schedule`. Wide channels may benefit; C64 benefits are not
+guaranteed. One shape's speedup does not establish performance for all channel
+counts. Omitting the option when reconfiguring clears its previous value.
 
-### K100 含力训练的算子布局
+### Operator layouts for force training on K100
 
-`training_adjoint_channel_tile=32` 或 `64` 单独调整第一 TP 反向的通道布局，
-同时覆盖 `create_graph=True` 求力和 loss backward 中的一阶 VJP。
-前向和混合二阶保持各自的布局选择。默认 `None` 保留既有调度，`0` 使用
-完整通道展开。该选项要求 materialized、eager、hidden/edge L<=3。
-K100 C128/256、L3 实测采用第一反向 64 通道、混合二阶 32 通道更快。
+`training_adjoint_channel_tile=32` or `64` independently changes the channel
+layout of first TP backward, covering both `create_graph=True` force evaluation
+and VJPs inside loss backward. Forward and mixed second derivatives
+retain their own layout selections. The default `None` retains the existing
+schedule; `0` uses full-channel unrolling. This option requires materialized
+gates, eager execution and hidden/edge L<=3. Measurements on K100 C128/256, L3
+favored 64-channel first backward with 32-channel mixed second backward.
 
-`mixed_geometry_schedule="split"` 将 TP 的球谐二阶伴随放到独立的
-edge/channel 内核，沿用 32 lane 通道归约，直接写回球谐梯度。
-该布局降低特征、门控和输出伴随内核的寄存器压力。默认 `"fused"`
-保留联合内核；C128/256、L3 周期图实测适合 `"split"`，C64/L2 适合
-`mixed_channel_tile=32` 配合 `"fused"`。应按实际 channel/lmax 和图大小选择。
+`mixed_geometry_schedule="split"` moves the TP harmonic-input part of second backward into
+a separate edge/channel kernel, using the existing 32-lane channel reduction
+and direct harmonic-gradient stores. This reduces register pressure in the
+feature, gate and output-cotangent kernel. The default `"fused"` retains the
+joint kernel. Periodic C128/256, L3 graphs favored `"split"`; C64/L2 favored
+`mixed_channel_tile=32` with `"fused"`. Choose for the actual C/L and graph size.
 
-`training_gate_gemm_policy="k100_tiled"` 对已验证的径向末层投影使用
-16384 行的特征和权重梯度 GEMM，保留原 forward 线性映射。首阶和混合二阶
-梯度均覆盖实时权重和输入，包含标准 `loss.backward()` 的坐标梯度。
-适用条件为 gfx926、PyTorch 2.7.1/HIP 6.3.26093、FP32、704×64 权重，
-且至少 65536 条边；其他形状继续使用原线性层。默认值为 `"torch"`。
-FP32 归约次序会变化，参数对象、精度和 checkpoint keys 保持原约定。
+`training_gate_gemm_policy="k100_tiled"` uses 16384-row feature- and
+weight-gradient GEMMs for the validated final radial projection, retaining the
+original forward linear map. First-order and mixed second derivatives cover trainable
+weights and inputs, including coordinate gradients from standard
+`loss.backward()`. Conditions are gfx926, PyTorch 2.7.1/HIP 6.3.26093, FP32,
+704×64 weights and at least 65536 edges. Other shapes retain the original linear
+layer. The default is `"torch"`. FP32 reduction order may change; parameter
+objects, precision and checkpoint keys retain their original contracts.
 
-两项新调度均要求 eager、materialized gates。C64/L2 的配置示例：
+The explicit schedules require eager execution and materialized gates.
+Example for C64/L2:
 
 ```python
 configure_model(
@@ -802,46 +1029,58 @@ configure_model(
 )
 ```
 
-C128/256、L3 使用 `mixed_geometry_schedule="split"` 和
-`training_adjoint_channel_tile=64`；C256/L3 同时将 `csr_accumulator_limit` 设为 48。
-K100 原生 CG/TP 的能量、力及混合伴随
-继续使用同一组 CG 系数和实时训练参数。
+C128/256, L3 uses `mixed_geometry_schedule="split"` and
+`training_adjoint_channel_tile=64`; C256/L3 also sets `csr_accumulator_limit=48`.
+K100 native CG/TP energy, forces and mixed second derivatives continue to use the same
+CG coefficients and trainable parameters.
 
-### 消息线性层的节点／角分量行布局
+### Node/component row layout for message linears
 
-generated eager training 默认使用 `training_message_linear_layout="node_component"`，将消息线性层的
-`[N,Cin,2l+1]` 输入整理为连续的 `[N*(2l+1),Cin]`，共享同一份
-`[Cout,Cin]` 实时权重执行 GEMM，再恢复原有输出分量顺序。这与已有通道
-adapter 的共享 GEMM 布局一致，避免 `einsum` 在大图上整理
-`[channel,node,angular]` 大张量产生的跨步复制。
+Generated eager training defaults to
+`training_message_linear_layout="node_component"`. It packs message-linear
+inputs `[N,Cin,2l+1]` into contiguous `[N*(2l+1),Cin]` rows, applies GEMM with
+one shared trainable `[Cout,Cin]` weight matrix, then restores the original component
+order. This matches the shared GEMM layout of the channel adapters and avoids
+strided copies when `einsum` arranges large `[channel,node,angular]` tensors.
 
 ```python
 configure_model(
     model, training=True, policy="generated", layout="fused_pack",
 )
-# 显式恢复旧布局：
+# Explicitly restore the previous layout:
 configure_model(model, training=True, training_message_linear_layout="einsum")
 ```
 
-该开关可与上述 TP/gate 调度同时使用；它不替代这些调度。权重、输入和上游
-特征的混合伴随通过普通可微 `linear` 计算，包含力损失及坐标二阶反传。
-参数对象、trainability、state_dict keys 和对外特征顺序保持原样，FP32
-归约顺序可能改变。该默认值同时适用于 `ForceTrainer` 和训练 CLI；CLI 可用
-`--training-message-linear-layout einsum` 恢复旧布局。CUDA FP32 且未启用 autocast
-时使用新布局，其他 dtype/设备沿用原计算。重新配置 eager generated training
-时省略该选项，会重新启用默认布局；推理、`policy="reference"` 或 `auto` 的
-reference 回退会清除该布局标志。`capture=True` 的训练在 `auto` 下沿用
-reference 路径，显式 `policy="generated"` 仍因不支持训练 capture 而报错。
+This option works alongside the TP/gate schedules above. Mixed second derivatives for
+weights, inputs and upstream features use ordinary differentiable `linear`,
+including force losses and coordinate second backward. Parameter objects,
+trainability, state_dict keys and public feature ordering are preserved.
+FP32 reduction order may change.
 
-## 径向重算与逐层 gate 调度
+The same default applies to `ForceTrainer` and the training CLI. Use
+`--training-message-linear-layout einsum` to select the previous layout.
+The layout applies to GPU FP32 without autocast; other dtypes/devices
+retain the original calculation. Reconfiguring eager generated training
+without this option re-enables the default. Inference, `policy="reference"`
+and `auto` reference fallbacks clear the layout flag. Training with
+`capture=True` uses the reference route under `auto`; explicit
+`policy="generated"` still rejects unsupported training capture.
 
-`radial_checkpoint=True` 通过 non-reentrant checkpoint 按需重算径向 MLP
-激活。在完整 gate 路径中覆盖原来的整个 `fc`；在流式 gate 路径中覆盖隐藏层，
-末层线性投影仍由原 gate 调度执行。此选项同时在消息算子完成后及时释放
-布局转换的临时输入，再分配返回张量。默认关闭，不修改参数、精度或模型公式。
+## Radial checkpointing and per-layer gate schedules
 
-`training_gate_schedule` 还可接受 tuple/list，长度必须等于 interaction 数量。
-原来的单个字符串继续应用到全部层。两层 C128/L3 的速度/显存折中配置为：
+`radial_checkpoint=True` uses non-reentrant activation checkpointing
+(`use_reentrant=False`) to recompute radial
+MLP activations as needed. It covers the entire original `fc` in the full-gate
+route and hidden layers in the streamed-gate route; the final linear projection
+retains its gate schedule. Layout-conversion input temporaries are also released
+after the message operation, before allocating the returned tensor.
+The option defaults off and preserves parameters, precision and model formulas.
+See [PyTorch activation checkpointing](https://docs.pytorch.org/docs/stable/checkpoint)
+for the recomputation mechanism.
+
+`training_gate_schedule` also accepts a tuple/list with one entry per
+interaction. A single string still applies to every layer. A speed/memory
+tradeoff configuration for two-interaction C128/L3 is:
 
 ```python
 configure_model(
@@ -856,27 +1095,33 @@ configure_model(
 )
 ```
 
-第一层保留 forward gates、按需重算 gate 梯度，第二层保留原速度路径。
-两层径向 MLP 的中间激活按需重算。该方案仍有额外计算，不能把显存下降
-表述为零成本；速度与显存应以同一工作负载的测量为准。
+The first layer saves forward gates and recomputes gate gradients as needed;
+the second retains the original speed-oriented route. Intermediate activations
+of both radial MLPs are recomputed as needed. The memory reduction has an
+additional compute cost; measure speed and memory on the same workload.
 
-新选项限定 eager CUDA FP32、hidden/edge L<=3 的训练。请求 capture 会报错；
-编译/代理张量、functorch、CPU 或非 FP32 的径向调用保留普通计算路径。
-省略 `radial_checkpoint` 的再次配置、推理配置和 `policy="reference"`
-均清除该选项。参数对象、可训练性、state_dict 和 checkpoint keys 保持不变。
-推荐配置按两层模型验证，不能直接把两个 schedule 值用于不同层数的模型。
+These options require eager GPU FP32 training with hidden/edge L<=3. Capture
+requests raise an error. Compiling/proxy-tensor, functorch, CPU and non-FP32
+radial calls retain ordinary computation. Reconfiguring without
+`radial_checkpoint`, selecting inference, or selecting `policy="reference"`
+clears the option. Parameter objects, trainability, state_dict and checkpoint
+keys are preserved. The example is validated for a two-interaction model;
+models with different depth need a schedule entry for every interaction.
 
-## 能量与力推理的消息布局
+## Message layouts for energy and force inference
 
-`inference_message_layout="degree"` 让 TP 直接按 L 分段生成适合后续线性层
-的缓冲区，并让计算力的第一反向直接读取这个布局，省去大块消息的重排。
-这是原生 ICTC 消息的存储布局调整，CG/SC、多项式、参数和精度都不变。
-另外，特征的逐 L 独立切片改成一次 `split`，反向只合并一次不重叠的梯度。
+`inference_message_layout="degree"` makes TP produce buffers partitioned by L
+that suit subsequent linear layers. First backward for forces reads this layout
+directly, avoiding large message rearrangements. This changes storage layout
+within native ICTC messages while preserving CG/SC, polynomials, parameters
+and precision. Independent per-degree feature slices also become one `split`,
+whose backward concatenates the disjoint gradients once.
 
-A100 上两层、correlation=3、N8192、每节点 50 条边的速度配置：
+Example for a model with two interactions and correlation=3, using a larger
+gate cache to reduce radial recomputation:
 
 ```python
-# 调用方在专用推理模型上明确固定参数；configure_model 本身不改变可训练性。
+# Caller freezes a dedicated inference model; configure_model preserves trainability.
 model.eval().requires_grad_(False)
 configure_model(
     model, training=False, policy="generated", layout="fused_pack",
@@ -889,65 +1134,91 @@ configure_model(
 )
 ```
 
-`gate_cache_bytes` 是每个 interaction 的预算，不是网络的总显存上限。
-分页大小、缓存预算和图规模共同决定峰值。预算为 0 时继续按页重算 gates，
-可用于容量优先的部署；速度配置的结果不代表所有节点数下都达到相同收益。
+`gate_cache_bytes` is a budget per interaction, not a total-model memory cap.
+Page size, cache budget and graph size jointly determine the peak. A zero
+budget continues to recompute gates by page and is suitable for
+capacity-oriented deployment. Speed-oriented results do not imply the same
+gain at every node count.
 
-新布局默认关闭，限定 eager CUDA FP32、hidden/edge L<=3 和 `fused_pack`。
-显式请求训练、capture 或高 L 会报错。流式 frozen-gate 路径的既有条件仍然
-适用，不支持的张量/参数上下文保留原计算路径。高阶导数使用可微表达式；
-缓存不会被反向原地覆盖，因此保留图后再次求导仍然可用。
+The new layout defaults off. It requires eager GPU FP32, hidden/edge L<=3
+and `fused_pack`. Explicit training, capture or high-L requests raise an error.
+The streamed-gate route requires frozen radial-network and TP parameters;
+the gates still depend on geometry. Unsupported tensor or parameter contexts
+retain the original computation. Higher derivatives use
+differentiable expressions. Backward does not overwrite the cache in place,
+so repeated differentiation remains possible when the graph is retained.
 
-再次配置而省略此选项，或切换到 `policy="reference"` / 训练配置，会清除
-新的消息布局。参数对象、可训练性和 state_dict keys 保持不变。
+Reconfiguring without this option, switching to `policy="reference"`, or
+selecting training clears the new message layout. Parameter objects,
+trainability and state_dict keys are preserved.
 
-### 求力伴随通道分块
+### Channel tiling for force backward kernels
 
-上述配置现在默认使用 `inference_adjoint_channel_tile="auto"`；也可显式固定为
-`64`。此选项复用已有 CUDA
-分块内核，只对需要输入特征梯度的 frozen-gate 第一伴随按通道切分工作，
-第一层的纯几何/门控伴随和前向调度不变。不增加中间张量；球谐梯度的
-分块归并使用原有输出缓冲。浮点归并顺序会变化，不保证逐位相同。
+The configuration above defaults to
+`inference_adjoint_channel_tile="auto"`; `64` can also be selected explicitly.
+This option reuses existing GPU tiled kernels for first-order backward when
+radial-network parameters are frozen and input-feature gradients are needed.
+Forward and the first layer's geometry/gate-only backward kernels keep their schedules.
+No extra intermediate tensor is added; tiled harmonic-gradient reductions
+reuse the existing output buffer. Floating reduction order changes, so
+bitwise equality is not guaranteed.
 
-取值为 `"auto"`（默认）、`0`（原调度）、`32` 或 `64`。
-训练时 auto 自动关闭，显式 32/64 不允许 `training=True`。
-它不会冻结参数，也不改变高阶导数的可微回退。
-再次配置省略此选项会恢复 auto；设为 `0` 或切换到 reference 清除分块设置。
-容量优先保持 `gate_cache_bytes=0`，速度优先保持原缓存预算；两者均可
-使用该选项。其他设备和配置应单独验证。
+Allowed values are `"auto"` (default), `0` (original schedule), `32` and `64`.
+Auto disables tiling during training; explicit 32/64 is invalid with
+`training=True`. The option does not freeze parameters or alter differentiable
+higher-order fallbacks. Reconfiguring without it restores auto; setting `0`
+or selecting reference clears tiling. Both capacity-oriented operation with
+`gate_cache_bytes=0` and speed-oriented operation with the original cache
+budget can use this option. Validate other devices/configurations separately.
 
-`"auto"` 使用有边界的结构规则，避免把固定 64 通道方案推广到所有模型。
-它目前仅针对 A100 和 RTX 4090 D、degree 布局、streamed 几何、roles 伴随，要求边数至少
-4096、C 在 128–256 内，且最大角输入/输出宽度均为 7（L3 路径）。
-内核源级活跃值估计 `ceil(C/32) * max(2*输入宽度 + 输出宽度 + 3)`
-至少为 144 时选择 64，其余保留原调度。该估计不是硬件寄存器计数。
-两种设备共用同一结构规则；C192 在 4090 D 上可能小幅回退，验收上限为 5%。
-显存和数值标准不放宽；A100 的选择范围不变。
-普通 RTX 4090 和其他 Ada 卡尚未纳入自动启用范围。
-它只读取形状/设备元数据，不进行在线调优、GPU 分配或同步；不同原子数
-复用同一组内核，不按 N 单独编译。未知设备、低负载和未覆盖角宽度自动回退。
-容量/速度模式共用同一个调度器，二者只由门控缓存预算区分。
-这仍是有验证范围的经验策略，不保证所有图分布或通道数都达到最优速度。
+Auto uses bounded structural rules rather than applying a fixed 64-channel
+schedule to every model. Current automatic coverage is A100 and RTX 4090 D,
+degree layout, streamed geometry and role-specific backward kernels, with at least 4096 edges,
+C between 128 and 256, and maximum angular input/output widths both equal to
+7 (L3 paths). It selects 64 when the source-level live-value estimate
+`ceil(C/32) * max(2*input_width + output_width + 3)` is at least 144; otherwise
+it retains the original schedule. This estimate is not a hardware register count.
 
-## 非线性 MACE foundation checkpoint
+Both devices use the same structural rule. Standard RTX 4090 and other Ada
+cards are not automatically enabled by this policy.
 
-`mace_ictc.interfaces.foundation_hp.FoundationHP` 支持 MH-1 使用的
-`RealAgnosticResidualNonLinearInteractionBlock` 架构。节点与边通道可不同，
-维数、路径、截断、元素及 head 从 checkpoint 读取。转换保留原始 Agnesi、
-ZBL、元素径向网络、LayerNorm、密度归一化、非线性门控和全部 readout heads。
-TP 与对称收缩使用 ICTC HP；径向网络分块重算，保留真实几何导数。
-HP 对称收缩直接接收前级非线性层已有的 CG 基特征，消去等价的基变换往返与
-大规模临时布局缓冲；`product_basis="bridge"` 可选择保留往返的对照路径。
-两条路径均使用实际 checkpoint U 张量的重构校验和原始学习系数。
+The policy reads only shape/device metadata; it performs no online tuning,
+GPU allocation or synchronization. Different atom counts reuse the same
+kernels rather than compiling separately for each N. Unknown devices, small
+workloads and unvalidated angular widths fall back automatically. Capacity
+and speed modes share the same scheduler and differ in gate-cache budget.
+This remains an empirical policy with a defined validation range, without
+guaranteeing optimal speed for every graph distribution or channel count.
 
-在指定远端计算资源上转换：
+## Nonlinear MACE foundation checkpoints
+
+`mace_ictc.interfaces.foundation_hp.FoundationHP` supports the
+`RealAgnosticResidualNonLinearInteractionBlock` architecture used by MH-1.
+Node and edge channel counts can differ. Dimensions, paths, cutoff, elements
+and heads are read from the checkpoint. Conversion preserves the original
+Agnesi radial-distance transform, Ziegler–Biersack–Littmark (ZBL) repulsion,
+species-dependent radial networks, layer normalization (LayerNorm), density
+normalization, nonlinear gates and all readout heads.
+
+TP and symmetric contraction use ICTC HP. Radial networks are recomputed in
+chunks with geometry derivatives retained. HP symmetric contraction
+directly consumes e3nn-basis features already produced by the preceding nonlinear
+layer, eliminating equivalent round-trip basis transforms and large temporary
+layout buffers. `product_basis="bridge"` retains that round trip as a control
+route. Here, `product_basis="native"` means the input basis already emitted by
+that checkpoint's nonlinear layer, rather than the standalone ICTC Cartesian
+feature basis. Both routes use reconstruction checks against the actual checkpoint U
+tensors and preserve the original learned coefficients.
+
+Run conversion on the designated remote compute resources:
 
 ```bash
 python -m mace_ictc.cli.convert_foundation \
   --mace-model mace-mh-1.model --head omat_pbe --out mace-mh-1-ictc-hp.pt
 ```
 
-转换文件保存 FP64 模块。使用时显式设置精度与冻结权重，再启用 HP：
+The converted file stores an FP64 module. At runtime, explicitly set precision
+and freeze weights before enabling HP:
 
 ```python
 import torch
@@ -963,11 +1234,22 @@ value = model.forward_vectors(vectors, species, src, dst)
 edge_derivative = torch.autograd.grad(value["interaction_energy"].sum(), vectors)[0]
 ```
 
-`vectors[E,3]` 为从 src 指向 dst 的实时位移，需开启梯度；`species[N]` 为
-checkpoint 元素列表中的索引。结果包含每原子 `interaction_energy` 和含 E0
-的 FP64 `node_energy`。采用 node-owned 分域时传入 `owned` 与
-`exchange(layer, projected_state)`；回调应交换经过当前层 `linear_up` 的特征，
-并实现其反向通信，返回与输入相同布局的 owned+ghost 状态。
+`vectors[E,3]` contains displacement vectors from `src` to `dst`, including
+periodic image shifts, and must require gradients. `species[N]` contains indices
+into the checkpoint element list. `edge_derivative` is an energy derivative
+with respect to edge vectors; the caller must assemble atomic forces through
+its coordinate/edge mapping.
 
-此接口用于 eager、冻结权重的求力推理；额外电荷/自旋嵌入不在当前覆盖范围。
-转换后需要对实际 checkpoint 做能量与力校验，容量随模型、材料密度和邻居数变化。
+Results contain `interaction_energy[owned]` and `node_energy[owned]`, where
+`node_energy` includes E0 and is accumulated in FP64 even when the model is
+cast to FP32. For decomposition by node ownership, `owned` is the integer
+count of leading owned nodes, not a mask. It defaults to all input nodes.
+Supply `exchange(layer, projected_state)` for distributed hidden features.
+For layers after the first, this callback exchanges features after `linear_up`
+and returns owned-plus-ghost projected states in the same layout. It must
+also propagate reverse communication through autograd.
+
+This interface covers eager force inference with frozen weights. Additional
+charge/spin embeddings are outside current coverage. Validate energy and
+forces against the actual checkpoint after conversion. Capacity depends on
+the model, material density and neighbor count.
