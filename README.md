@@ -189,39 +189,104 @@ and material configurations shown above.
 
 </details>
 
-## Energy-and-force training
+## Training and inference
 
-![Four selected single-K100 HP training workloads: the default node_component message-linear layout raises absolute training throughput by up to 1.70 times and reduces step time by up to 41.2 percent.](docs/assets/training-throughput.svg)
+HP and FastEq are compared on one Hygon K100 (64 GiB), using complete MACE
+models in eager FP32, with TF32 and `torch.compile` disabled. The paired
+benchmark snapshot dated 21 October 2026 covers 44 configurations:
+C64/C128/C256, `lmax=1/2/3`, and 1,024–65,536 atoms, with the tested sizes
+varying by architecture. Each pair starts from equivalent randomly
+initialized MACE models and uses the same fixed neighbor graph. These
+results use two interactions, full CG `correlation=3`, periodic H/C/O,
+cutoff 4.5 Å and approximately 50 directed neighbors/atom.
 
-The comparison isolates the HP message-linear layout change from `einsum` to
-the current default `node_component`, with the same model, parameters and
-FP32 arithmetic. Each step includes forward evaluation, forces with
-`create_graph=True`, the complete energy-plus-force loss backward including
-second derivatives, and an AdamW update.
+### Training
 
-The four plotted cases are selected large-graph workloads from a 44-point
-screen. The largest measured gain is 1.70× training throughput, equivalent
-to 41.2% less time per step. No point in that screen showed a step-time
-regression over 5%; the median throughput gain across all 44 points was 3.2%.
-The layout passed 18 operator checks and 9 whole-model gradient comparisons
-against the independent HP reference.
+![HP and FastEq full energy-and-force training throughput on one K100, across 44 model and atom-count configurations. A cross denotes a measured out-of-memory result.](docs/assets/training-throughput.svg)
 
-Training measurements use one K100, two interactions, `correlation=3`, periodic
-H/C/O with spacing 2 Å and cutoff 4.5 Å, and a fixed neighbor graph. There are
-10 warmup steps and three 5-step rounds; the reported time is the median of
-the round medians. Data loading, neighbor rebuilding, compilation, profiling
-and multi-GPU communication are outside this training timing. These training
-throughputs have a different workload and timing scope from the MD figures.
+Across 43 paired measurements, the median HP/FastEq training throughput
+ratio is 1.65×, with ratios ranging from 1.03× to 2.46×. HP is faster at all
+43 paired points and completes all 44 configurations. FastEq runs out of
+memory at C64, `lmax=2`, 65,536 atoms.
+
+Each training step includes energy evaluation, forces with
+`create_graph=True`, the complete energy-plus-force loss backward with
+second derivatives, and an AdamW update. HP uses the default
+`training_message_linear_layout="node_component"`.
+
+### Inference
+
+![HP performance mode, HP capacity mode and FastEq energy-and-force inference throughput on one K100, across all 44 configurations.](docs/assets/inference-throughput.svg)
+
+For energy-and-force inference, the median HP/FastEq throughput ratio is
+1.40× in performance mode and 1.27× in capacity mode. HP is faster at 44/44
+and 41/44 measured points, respectively; FastEq is faster at the remaining
+three capacity-mode points.
+
+Performance mode uses a larger forward edge chunk and retains gates for
+force evaluation. Capacity mode uses smaller chunks and recomputes gates
+to reduce memory use. Both use frozen model parameters and the same FP32
+accuracy criteria.
 
 <details>
-<summary>Training step times and throughput</summary>
+<summary>Energy-only inference</summary>
 
-| Channels / lmax / atoms | Previous HP, ms/step | Default HP, ms/step | Previous → default throughput (atom-steps/s) | Throughput gain |
-| --- | ---: | ---: | ---: | ---: |
-| 256 / 1 / 32,768 | 1,877.40 | 1,103.57 | 17,454 → 29,693 | 1.701× |
-| 128 / 1 / 65,536 | 1,861.39 | 1,386.72 | 35,208 → 47,260 | 1.342× |
-| 128 / 3 / 16,384 | 2,239.03 | 1,838.09 | 7,317 → 8,914 | 1.218× |
-| 256 / 3 / 8,192 | 1,985.31 | 1,692.95 | 4,126 → 4,839 | 1.173× |
+![HP performance mode, HP capacity mode and FastEq energy-only inference throughput on one K100.](docs/assets/energy-only-throughput.svg)
+
+For energy-only evaluation, the median HP/FastEq throughput ratios are
+1.26× in performance mode and 1.25× in capacity mode. HP is faster at 38/44
+and 34/44 measured points, respectively; some configurations favor FastEq.
+
+</details>
+
+### GPU memory
+
+![Paired peak allocated GPU memory: FastEq on the horizontal axis and HP on the vertical axis, for training, energy-and-force inference and energy-only inference. Points below the dashed equality line use less memory with HP.](docs/assets/memory-comparison.svg)
+
+Across paired configurations, the median reduction in peak allocated
+memory is 12.3% for training, 19.3% for energy-and-force inference in
+performance mode, and 60.7% in capacity mode. HP uses less memory at 32/43,
+37/44 and 44/44 points, respectively. At the C64, `lmax=2`, 65,536-atom
+training point where FastEq runs out of memory, HP uses 53.4 GiB.
+
+For energy-only inference, capacity mode reduces peak allocation at all
+44 points, with a median reduction of 62.7%. Performance mode has a median
+increase of 2.9% relative to FastEq. These values measure PyTorch peak
+allocated GPU memory; driver allocations and external runtime buffers
+are excluded.
+
+<details>
+<summary>Measurement scope, presets and validation</summary>
+
+Throughput is the number of atoms divided by the optimizer-step or
+inference-evaluation time. Ratios are calculated per configuration and
+summarized with an equally weighted median. Curves connect measured sizes;
+their endpoints do not establish maximum capacity. These random-model
+results do not describe pretrained MACE-MH-1.
+
+Training uses 10 warmup steps followed by three 5-step timing rounds.
+Inference uses at least three warmup calls and three 10-call rounds;
+startup-sensitive cases receive two additional seconds of untimed warmup.
+The reported time is the median of the round medians. Model loading,
+conversion, compilation, data transfers, neighbor-list construction,
+MD integration and multi-GPU communication are excluded. This timing scope
+differs from the complete MD steps in the multi-GPU figures above.
+
+The HP inference presets use 81,920/32,768 forward/backward edges per chunk
+and a gate-cache budget of 5 GiB per interaction in performance mode;
+capacity mode uses 32,768/32,768 edges and no gate cache. These budgets are
+not total-model memory limits.
+
+FastEq uses its native HIP tensor-product and symmetric-contraction kernels
+within a MACE/PyTorch wrapper. Its force-training path includes a validated
+autograd correctness fix. Diagnostic output and diagnostic synchronizations
+are disabled; required input-contiguity copies remain inside the timing.
+
+All 44 inference configurations pass initial energy/force checks with
+absolute and relative tolerances of `2e-5` and relative L2 error at most
+`2e-5`. All nine architectures pass force-loss parameter-gradient and
+coordinate-second-derivative checks. Equivalent initial model functions do
+not imply identical optimizer trajectories across parameter bases.
 
 </details>
 
