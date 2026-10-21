@@ -1,5 +1,8 @@
 # ICTC-O3-HP-K100 API
 
+Native monopole, dipole and quadrupole mesh operations and model integration
+are described in the [electrostatics guide](ELECTROSTATICS.md).
+
 `ictc_o3` provides standalone operator APIs, and `mace_ictc.hp` provides
 whole-model APIs. These sibling Python packages are installed together with
 `ictc-o3-hp-k100`. See the [O3 operator overview](O3_API.md) for a quick reference.

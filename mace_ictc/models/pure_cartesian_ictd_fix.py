@@ -3272,6 +3272,7 @@ class PureCartesianICTDFix(nn.Module):
         self.ictd_fix_route = str(ictd_fix_route)
         self.ictd_fix_contraction_combine = str(ictd_fix_contraction_combine)
         self.ictd_fix_requested_product_backend = requested_product_backend
+        self.save_contraction_order = int(save_contraction_order)
         self.ictd_fix_product_backend = (
             "ictd-bridge-u"
             # native ICTC U generation is the reliability limit on the contraction INPUT degree,
@@ -3543,6 +3544,11 @@ class PureCartesianICTDFix(nn.Module):
         # layer_states[-1] for baseline, both invariant -> equivariance-safe);
         # energy_scale inits to 0 -> zero contribution at init.
         self.long_range_mode = str(long_range_mode)
+        self.long_range_hidden_dim = int(long_range_hidden_dim)
+        self.long_range_filter_hidden_dim = int(long_range_filter_hidden_dim)
+        self.long_range_kmax = int(long_range_kmax)
+        self.long_range_include_k0 = bool(long_range_include_k0)
+        self.long_range_source_channels = int(long_range_source_channels)
         self.long_range_reciprocal_backend = str(long_range_reciprocal_backend)
         self.long_range_assignment = str(long_range_assignment)
         self.long_range_backend = str(long_range_backend)
@@ -3551,6 +3557,7 @@ class PureCartesianICTDFix(nn.Module):
         self.long_range_boundary = str(long_range_boundary)
         self.long_range_neutralize = bool(long_range_neutralize)
         self.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
+        self.long_range_mesh_fft_reciprocal_only = bool(long_range_mesh_fft_reciprocal_only)
         self.long_range_mesh_size = int(long_range_mesh_size)
         self.long_range_slab_padding_factor = int(long_range_slab_padding_factor)
         self.long_range_module = build_long_range_module(
@@ -3593,6 +3600,14 @@ class PureCartesianICTDFix(nn.Module):
             if self.long_range_module is not None
             else False
         )
+        _lr = self.long_range_module
+        _emit = self.long_range_exports_reciprocal_source
+        self.long_range_runtime_backend = str(getattr(_lr, "runtime_backend", "none")) if _emit else "none"
+        self.long_range_runtime_source_kind = str(getattr(_lr, "source_kind", "none")) if _emit else "none"
+        self.long_range_runtime_source_channels = int(getattr(_lr, "source_channels", 0)) if _emit else 0
+        self.long_range_runtime_source_layout = str(getattr(_lr, "source_layout", "none")) if _emit else "none"
+        self.long_range_runtime_source_boundary = str(long_range_boundary)
+        self.long_range_runtime_source_slab_padding_factor = int(long_range_slab_padding_factor)
 
         # Multipole long-range: tap the deepest full-SO(3) node features for equivariant
         # Cartesian monopole/dipole/quadrupole sources (a degree-l carrier IS a rank-l
@@ -3631,16 +3646,16 @@ class PureCartesianICTDFix(nn.Module):
                     self.long_range_module.energy_scale.fill_(1.0)
             # at export the multipole route emits a packed [q|mu|Q] reciprocal_source for the
             # C++ solver (instead of computing the reciprocal energy in-model).
-            self.long_range_exports_reciprocal_source = True
+            self.long_range_exports_reciprocal_source = str(long_range_green_mode) == "poisson"
             # Deploy metadata read by export_libtorch_core -> .json -> the C++ engine/solver.
             # The packed per-atom source is [q | dipole_xyz | quad_3x3] per channel (channel-major);
             # the C++ reciprocal solver rebuilds q/mu/Q from source_channels + max_multipole_l, and
             # multipole_reciprocal_energy mirrors the in-model multipole_energy (screened |S(k)|^2 PME).
-            self.long_range_runtime_backend = "mesh_fft"
-            self.long_range_runtime_source_kind = "latent_multipole"
-            self.long_range_runtime_source_channels = int(long_range_source_channels)
-            self.long_range_runtime_source_layout = "packed_q_dipole_quad"
-            self.long_range_runtime_source_boundary = "periodic"
+            self.long_range_runtime_backend = "mesh_fft" if self.long_range_exports_reciprocal_source else "none"
+            self.long_range_runtime_source_kind = "latent_multipole" if self.long_range_exports_reciprocal_source else "none"
+            self.long_range_runtime_source_channels = int(long_range_source_channels) if self.long_range_exports_reciprocal_source else 0
+            self.long_range_runtime_source_layout = "packed_q_dipole_quad" if self.long_range_exports_reciprocal_source else "none"
+            self.long_range_runtime_source_boundary = str(long_range_boundary)
             # Deploy config the .json writer reads, taken from the built mesh kernel (the source of
             # truth) so the C++ reciprocal solver reproduces the in-model multipole_energy exactly:
             # screened |S(k)|^2 PME with green_mode/mesh_size/boundary/full_ewald all matched.

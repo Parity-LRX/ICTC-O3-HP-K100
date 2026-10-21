@@ -1,5 +1,8 @@
 # ICTC O3 Operator API
 
+`MeshElectrostatics`, `mesh_spread` and `mesh_gather` are available from
+`ictc_o3`; see [native reciprocal electrostatics](ELECTROSTATICS.md).
+
 `ictc_o3/` and `mace_ictc/` are sibling packages in the repository. The former
 provides standalone operators; the latter provides MACE-compatible models,
 training and conversion interfaces. Both are installed with `ictc-o3-hp-k100`

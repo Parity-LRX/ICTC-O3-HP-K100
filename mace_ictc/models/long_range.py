@@ -120,6 +120,9 @@ def _prepare_frac_for_boundary_batched(
     boundary: str,
     slab_padding_factor: int,
 ) -> torch.Tensor:
+    if cell.shape[0] == 1:
+        return _prepare_frac_for_boundary(
+            pos, cell[0], boundary=boundary, slab_padding_factor=slab_padding_factor)
     inv_cell = _inverse_3x3(cell)
     atom_inv_cell = inv_cell.index_select(0, batch)
     frac = torch.einsum("ni,nij->nj", pos, atom_inv_cell)
@@ -203,7 +206,7 @@ def _assignment_weights_from_scaled(scaled: torch.Tensor, assignment: str) -> tu
         weight_components[0][:, :, None, None]
         * weight_components[1][:, None, :, None]
         * weight_components[2][:, None, None, :]
-    ).reshape(scaled.size(0), -1)
+    ).reshape(scaled.size(0), _assignment_stencil_size(assignment) ** 3)
     return base, weights
 
 
@@ -308,7 +311,7 @@ def _gather_source_from_mesh(
         boundary=boundary,
     )
     flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
-    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), -1, channels)
+    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), _assignment_stencil_size(assignment) ** 3, channels)
     return (gathered * stencil_weights.unsqueeze(-1)).sum(dim=1)
 
 
@@ -335,7 +338,7 @@ def _gather_source_from_mesh_batched(
     flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
     graph_offset = batch.to(dtype=flat_idx.dtype).unsqueeze(-1) * mesh_points
     flat_idx = flat_idx + graph_offset
-    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), -1, channels)
+    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), _assignment_stencil_size(assignment) ** 3, channels)
     return (gathered * stencil_weights.unsqueeze(-1)).sum(dim=1)
 
 
@@ -1079,6 +1082,8 @@ class MeshLongRangeKernel3D(nn.Module):
         full_ewald: bool = False,
         reciprocal_only: bool = False,
         k_norm_floor: float = 1.0e-6,
+        mesh_backend: str = "auto",
+        fuse_multipole_fft: bool = True,
     ):
         super().__init__()
         if boundary not in {"periodic", "slab"}:
@@ -1088,6 +1093,12 @@ class MeshLongRangeKernel3D(nn.Module):
         if assignment not in {"cic", "tsc", "pcs"}:
             raise ValueError(f"Unsupported mesh assignment: {assignment!r}")
         self.mesh_size = int(mesh_size)
+        if self.mesh_size < 1:
+            raise ValueError("mesh_size must be positive")
+        if mesh_backend not in {"auto", "hip", "reference"}:
+            raise ValueError("mesh_backend must be auto, hip or reference")
+        self.mesh_backend = mesh_backend
+        self.fuse_multipole_fft = bool(fuse_multipole_fft)
         self.boundary = str(boundary)
         self.slab_padding_factor = max(int(slab_padding_factor), 1)
         self.include_k0 = bool(include_k0)
@@ -1195,9 +1206,43 @@ class MeshLongRangeKernel3D(nn.Module):
         return k_cart, k_norms, volume
 
     def _graph_counts(self, batch: torch.Tensor, cell: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
-        graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
-        graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=dtype)
-        return graph_mask.sum(dim=0).clamp_min(1.0)
+        if cell.shape[0] == 1:
+            return torch.full((1,), max(batch.shape[0], 1), device=batch.device, dtype=dtype)
+        return torch.zeros(cell.size(0), device=batch.device, dtype=dtype).index_add(
+            0, batch, torch.ones(batch.shape[0], device=batch.device, dtype=dtype)
+        ).clamp_min(1.0)
+
+    def _native_mesh(self, value: torch.Tensor) -> bool:
+        backend = getattr(self, "mesh_backend", "auto")
+        if backend == "reference":
+            return False
+        from .hip_electrostatics import supported
+        enabled = supported(value)
+        if backend == "hip" and not enabled:
+            raise ValueError("HIP electrostatics requires K100 gfx926 FP32 or FP64")
+        return enabled
+
+    def _spread(self, frac, batch, source, num_graphs, *, channels_first=False):
+        if self._native_mesh(source):
+            from .hip_electrostatics import spread
+            return spread(frac, batch, source, mesh_size=self.mesh_size,
+                          num_graphs=num_graphs, assignment=self.assignment,
+                          boundary=self.boundary, channels_first=channels_first)
+        mesh = _spread_source_to_mesh_batched(
+            frac, batch, source, num_graphs=num_graphs, mesh_size=self.mesh_size,
+            assignment=self.assignment, assignment_offsets=self.assignment_offsets,
+            boundary=self.boundary)
+        return mesh.permute(0, 4, 1, 2, 3).contiguous() if channels_first else mesh
+
+    def _gather(self, frac, batch, mesh):
+        if self._native_mesh(mesh):
+            from .hip_electrostatics import gather
+            return gather(frac, batch, mesh, mesh_size=self.mesh_size,
+                          num_graphs=mesh.shape[0], assignment=self.assignment,
+                          boundary=self.boundary)
+        return _gather_source_from_mesh_batched(
+            frac, batch, mesh, mesh_size=self.mesh_size, assignment=self.assignment,
+            assignment_offsets=self.assignment_offsets, boundary=self.boundary)
 
     def multipole_energy(
         self,
@@ -1228,6 +1273,9 @@ class MeshLongRangeKernel3D(nn.Module):
         dipole: torch.Tensor | None,
         quadrupole: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self._native_mesh(source) and getattr(self, "fuse_multipole_fft", True):
+            from .hip_reciprocal_fft import multipole_energy
+            return multipole_energy(self, pos, batch, cell, source, dipole, quadrupole)
         src_c = source.size(1)
         frac = _prepare_frac_for_boundary_batched(
             pos,
@@ -1248,16 +1296,7 @@ class MeshLongRangeKernel3D(nn.Module):
         spectral = torch.where(k_norms_flat > self.k_norm_floor, spectral, torch.zeros_like(spectral))
 
         def _spread_fft(field: torch.Tensor) -> torch.Tensor:
-            mesh = _spread_source_to_mesh_batched(
-                frac,
-                batch,
-                field,
-                num_graphs=cell.size(0),
-                mesh_size=self.mesh_size,
-                assignment=self.assignment,
-                assignment_offsets=self.assignment_offsets,
-                boundary=self.boundary,
-            )
+            mesh = self._spread(frac, batch, field, cell.size(0))
             return torch.fft.fftn(mesh, dim=(1, 2, 3)).reshape(cell.size(0), -1, field.size(1)).contiguous()
 
         S = _spread_fft(source).reshape(cell.size(0), -1, src_c)
@@ -1283,6 +1322,9 @@ class MeshLongRangeKernel3D(nn.Module):
         mesh: torch.Tensor,
         cell: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        if self._native_mesh(mesh):
+            from .hip_reciprocal_fft import scalar_potential
+            return scalar_potential(self, mesh, cell)
         mesh_dtype = mesh.dtype
         mesh_complex = torch.fft.fftn(mesh, dim=(1, 2, 3))
         k_norms, volume = self.build_k_norms_batched(cell, dtype=mesh_dtype)
@@ -1349,26 +1391,9 @@ class MeshLongRangeKernel3D(nn.Module):
             boundary=self.boundary,
             slab_padding_factor=self.slab_padding_factor,
         )
-        mesh = _spread_source_to_mesh_batched(
-            frac,
-            batch,
-            source,
-            num_graphs=cell.size(0),
-            mesh_size=self.mesh_size,
-            assignment=self.assignment,
-            assignment_offsets=self.assignment_offsets,
-            boundary=self.boundary,
-        )
+        mesh = self._spread(frac, batch, source, cell.size(0))
         potential_mesh, alpha, effective_volume, real_cutoff = self.apply_green_kernel_batched(mesh, cell)
-        reciprocal_potential = _gather_source_from_mesh_batched(
-            frac,
-            batch,
-            potential_mesh,
-            mesh_size=self.mesh_size,
-            assignment=self.assignment,
-            assignment_offsets=self.assignment_offsets,
-            boundary=self.boundary,
-        )
+        reciprocal_potential = self._gather(frac, batch, potential_mesh)
         total_potential = reciprocal_potential
         if self.full_ewald and not self.reciprocal_only:
             assert alpha is not None and real_cutoff is not None
@@ -1462,7 +1487,11 @@ class LatentReciprocalLongRange(nn.Module):
                 full_ewald=self.mesh_fft_full_ewald,
                 reciprocal_only=self.mesh_fft_reciprocal_only,
             )
-            self.exports_reciprocal_source = True
+            # The external reciprocal-only solver cannot reproduce a learned
+            # Green filter or optional real/self/background Ewald corrections.
+            self.exports_reciprocal_source = self.green_mode == "poisson" and (
+                not self.mesh_fft_full_ewald or self.mesh_fft_reciprocal_only)
+            self.runtime_backend = "mesh_fft" if self.exports_reciprocal_source else "none"
             self.energy_scale = nn.Parameter(torch.tensor(0.0))
         else:
             self.kernel = ReciprocalSpectralKernel3D(
@@ -1484,10 +1513,10 @@ class LatentReciprocalLongRange(nn.Module):
     def _neutralize_source(self, source: torch.Tensor, batch: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
         if not self.neutralize:
             return source
-        graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
-        graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=source.dtype)
-        counts = graph_mask.sum(dim=0).clamp_min(1.0).unsqueeze(-1)
-        graph_mean = torch.einsum("nb,nc->bc", graph_mask, source) / counts
+        if cell.shape[0] == 1:
+            return source - source.sum(dim=0, keepdim=True) / max(source.shape[0], 1)
+        counts = source.new_zeros(cell.size(0)).index_add(0, batch, source.new_ones(source.shape[0])).clamp_min(1).unsqueeze(-1)
+        graph_mean = source.new_zeros((cell.size(0), source.shape[1])).index_add(0, batch, source) / counts
         return source - graph_mean.index_select(0, batch)
 
     def forward(

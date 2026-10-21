@@ -412,6 +412,7 @@ def build_baseline_model(
     long_range_assignment: str = "pcs",
     long_range_slab_padding_factor: int = 2,
     long_range_mesh_fft_full_ewald: bool = False,
+    long_range_mesh_fft_reciprocal_only: bool = False,
     long_range_max_multipole_l: int = 0,
     long_range_multipole_gate_init: float = 0.1,
     long_range_dispersion_mode: str = "none",
@@ -493,6 +494,7 @@ def build_baseline_model(
         long_range_assignment=long_range_assignment,
         long_range_slab_padding_factor=long_range_slab_padding_factor,
         long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
+        long_range_mesh_fft_reciprocal_only=long_range_mesh_fft_reciprocal_only,
         long_range_max_multipole_l=long_range_max_multipole_l,
         long_range_multipole_gate_init=long_range_multipole_gate_init,
         long_range_dispersion_mode=long_range_dispersion_mode,
@@ -623,6 +625,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--long-range-slab-padding-factor", type=int, default=2)
     ap.add_argument("--long-range-mesh-fft-full-ewald", action="store_true",
                     help="Use full-Ewald-style mesh FFT correction terms for mesh_fft.")
+    ap.add_argument("--long-range-mesh-fft-reciprocal-only", action="store_true",
+                    help="Retain only the screened reciprocal functional; omit real/self/background terms.")
+    ap.add_argument("--electrostatics-backend", default="auto", choices=["auto", "hip", "reference"],
+                    help="Mesh execution backend; hip requires eager K100 FP32/FP64.")
     ap.add_argument("--long-range-max-multipole-l", type=int, default=0,
                     help="Maximum learned multipole rank emitted for mesh_fft reciprocal long-range export.")
     ap.add_argument("--long-range-multipole-gate-init", type=float, default=0.1,
@@ -1152,6 +1158,7 @@ def main(argv=None):
         long_range_assignment=args.long_range_assignment,
         long_range_slab_padding_factor=args.long_range_slab_padding_factor,
         long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
+        long_range_mesh_fft_reciprocal_only=args.long_range_mesh_fft_reciprocal_only,
         long_range_max_multipole_l=args.long_range_max_multipole_l,
         long_range_multipole_gate_init=args.long_range_multipole_gate_init,
         long_range_dispersion_mode=args.long_range_dispersion_mode,
@@ -1291,6 +1298,7 @@ def main(argv=None):
         long_range_green_mode=args.long_range_green_mode,
         long_range_assignment=args.long_range_assignment,
         long_range_mesh_fft_full_ewald=bool(args.long_range_mesh_fft_full_ewald),
+        long_range_mesh_fft_reciprocal_only=bool(args.long_range_mesh_fft_reciprocal_only),
         long_range_max_multipole_l=int(args.long_range_max_multipole_l),
         long_range_multipole_gate_init=float(args.long_range_multipole_gate_init),
         long_range_dispersion_mode=args.long_range_dispersion_mode,
@@ -1344,6 +1352,7 @@ def main(argv=None):
         operator_plan=args.operator_plan,
         generated_layout=args.generated_layout,
         training_message_linear_layout=args.training_message_linear_layout,
+        electrostatics_backend=args.electrostatics_backend,
         backward_targets=args.backward_targets,
         require_train_makefx_compile=bool(args.train_makefx_compile and args.product_backend == "cueq"),
         makefx_max_slots=args.makefx_max_slots,

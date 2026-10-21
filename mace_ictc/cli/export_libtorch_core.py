@@ -910,6 +910,7 @@ def _export_single_core(
         "long_range_green_mode": str(getattr(metadata_model, "long_range_green_mode", "poisson")),
         "long_range_assignment": str(getattr(metadata_model, "long_range_assignment", "pcs")),
         "long_range_mesh_fft_full_ewald": bool(getattr(metadata_model, "long_range_mesh_fft_full_ewald", False)),
+        "long_range_mesh_fft_reciprocal_only": bool(getattr(metadata_model, "long_range_mesh_fft_reciprocal_only", False)),
         "long_range_dispersion_mode": str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
         "long_range_dispersion": bool(getattr(metadata_model, "long_range_dispersion", False)),
         "dispersion_cutoff": float(getattr(metadata_model, "dispersion_cutoff", 0.0)),

@@ -128,6 +128,7 @@ class ForceTrainer:
         operator_plan: str = "auto",
         generated_layout: str = "packed",
         training_message_linear_layout: str = "node_component",
+        electrostatics_backend: str | None = None,
         backward_targets: str = "auto",
         # plumbing
         train_sampler=None,
@@ -268,6 +269,12 @@ class ForceTrainer:
             generated_layout=generated_layout,
             training_message_linear_layout=training_message_linear_layout,
         )
+        if electrostatics_backend == "hip" and self.train_makefx_compile:
+            raise ValueError("Native HIP electrostatics requires eager training")
+        mesh_backend = "reference" if operator_plan == "reference" or self.train_makefx_compile else electrostatics_backend
+        if mesh_backend is not None:
+            from mace_ictc.hp.electrostatics import configure_electrostatics
+            self.operator_plan_info["electrostatics"] = configure_electrostatics(self.model, backend=mesh_backend)
         if backward_targets not in ("auto", "parameters", "all"):
             raise ValueError("backward_targets must be auto, parameters or all")
         self.backward_targets = (
@@ -1912,6 +1919,8 @@ class ForceTrainer:
                 "long_range_reciprocal_backend", "long_range_energy_partition",
                 "long_range_green_mode", "long_range_assignment",
                 "long_range_mesh_fft_full_ewald", "long_range_max_multipole_l",
+                "long_range_mesh_fft_reciprocal_only",
+                "long_range_multipole_gate_init",
                 "long_range_dispersion_mode", "long_range_dispersion", "dispersion_cutoff",
                 "dispersion_min_cutoff", "dispersion_switch_width",
                 "dispersion_max_num_neighbors", "dispersion_neighbor_method",

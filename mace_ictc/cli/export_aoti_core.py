@@ -90,6 +90,7 @@ def _long_range_deploy_metadata(
         # C++ cuFFT solver reads this and dispatches the matching spread/deconvolution stencil.
         "long_range_assignment": str(getattr(model, "long_range_assignment", "pcs")),
         "long_range_mesh_fft_full_ewald": bool(getattr(model, "long_range_mesh_fft_full_ewald", False)),
+        "long_range_mesh_fft_reciprocal_only": bool(getattr(model, "long_range_mesh_fft_reciprocal_only", False)),
         "long_range_dispersion_mode": str(getattr(model, "long_range_dispersion_mode", "none")),
         "long_range_dispersion": bool(getattr(model, "long_range_dispersion", False)),
         "dispersion_cutoff": float(getattr(model, "dispersion_cutoff", 0.0)),

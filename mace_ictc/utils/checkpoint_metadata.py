@@ -54,6 +54,7 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "long_range_green_mode": "poisson",
     "long_range_assignment": "pcs",
     "long_range_mesh_fft_full_ewald": False,
+    "long_range_mesh_fft_reciprocal_only": False,
     "long_range_max_multipole_l": 0,
     "long_range_dispersion_mode": "none",
     "long_range_dispersion": False,
@@ -673,6 +674,10 @@ def resolve_model_architecture(
             "long_range_max_multipole_l",
             DEFAULT_MODEL_ARCHITECTURE["long_range_max_multipole_l"],
         )
+    )
+    resolved["long_range_mesh_fft_reciprocal_only"] = bool(
+        _resolve_value(overrides, checkpoint, arch_meta, "long_range_mesh_fft_reciprocal_only",
+                       DEFAULT_MODEL_ARCHITECTURE["long_range_mesh_fft_reciprocal_only"])
     )
     resolved["long_range_dispersion_mode"] = str(
         _resolve_value(
