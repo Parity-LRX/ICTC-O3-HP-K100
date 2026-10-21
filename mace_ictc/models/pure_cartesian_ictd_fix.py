@@ -3956,6 +3956,7 @@ class PureCartesianICTDFix(nn.Module):
         compact_local_projection: bool = False,
         compact_local_messages: bool = False,
         distributed_atom_count: int | None = None,
+        long_range_energy_callback: callable | None = None,
     ):
         if return_physical_tensors:
             raise ValueError("pure-cartesian-ictd-fix does not currently support return_physical_tensors=True")
@@ -3980,7 +3981,7 @@ class PureCartesianICTDFix(nn.Module):
                 or isinstance(local_atom_count, bool) or not 0 < local_atom_count <= pos.shape[0]):
             raise ValueError("local_atom_count must select a nonempty owned prefix")
         if local_mode and (self.training or return_combined_features or return_reciprocal_source
-                or self.long_range_module is not None or self.dispersion is not None
+                or (self.long_range_module is not None and long_range_energy_callback is None) or self.dispersion is not None
                 or self.ictd_fix_interaction_attn_heads != 0
                 or layer_channel_gains is not None or edge_block_callback is not None
                 or pre_product_state_callback is not None
@@ -4258,8 +4259,12 @@ class PureCartesianICTDFix(nn.Module):
                 raise RuntimeError(
                     "multipole long-range needs a full-SO(3) node-feature layer; none found"
                 )
+            if long_range_energy_callback is not None and local_atom_count is not None:
+                mp_feat = mp_feat[:local_atom_count]
             monopole, dipole, quadrupole = self.multipole_readout(mp_feat)
-            if return_reciprocal_source and self.long_range_exports_reciprocal_source:
+            if long_range_energy_callback is not None:
+                out = out + long_range_energy_callback(pos, batch, cell, monopole, dipole, quadrupole)
+            elif return_reciprocal_source and self.long_range_exports_reciprocal_source:
                 # deployment: emit the packed [q|mu|Q] per-atom source for the C++ reciprocal
                 # solver (mff_reciprocal_solver) to do the long-range sum; defer the energy here.
                 from mace_ictc.models.multipole_readout import pack_multipole_source
@@ -4283,7 +4288,12 @@ class PureCartesianICTDFix(nn.Module):
             else:
                 lr_feat = _split_irreps(last_state, self.channels, self.lmax)[0].reshape(last_state.shape[0], self.channels)
             defer = False
-            if return_reciprocal_source and self.long_range_exports_reciprocal_source:
+            if long_range_energy_callback is not None:
+                if local_atom_count is not None:
+                    lr_feat = lr_feat[:local_atom_count]
+                long_range_energy = long_range_energy_callback(
+                    pos, batch, cell, self.long_range_module.emit_source(lr_feat), None, None)
+            elif return_reciprocal_source and self.long_range_exports_reciprocal_source:
                 # Deploy: emit ONLY the latent charge source (source_head); defer the reciprocal
                 # energy + neutralization to the C++ solver. emit_source avoids the kernel's per-graph
                 # torch.nonzero so make_fx/AOTI can trace it (forward(return_source=True) would not).

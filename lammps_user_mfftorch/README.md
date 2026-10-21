@@ -143,8 +143,12 @@ Bessel radial features, natural-parity contiguous hidden degrees with uniform
 multiplicity, uniform correlation, SiLU readout and at least two interactions.
 Nonlinear foundation models use `mff-convert-foundation`; see the
 [conversion API](../docs/HP_API.md#6-checkpoint-conversion-and-lammps-on-k100).
-Native MFF currently exports short-range scalar energy models. Extra input
-heads, physical tensor outputs and long-range/dispersion extensions require
+Native MFF exports short-range scalar energy models and learned monopole,
+dipole and quadrupole reciprocal models. The latter use the native HIP mesh
+backend, owned-source counting and differentiable RCCL Fourier-amplitude
+reductions. Three-axis grids and fixed screening are preserved. See the
+[electrostatics guide](../docs/ELECTROSTATICS.md#native-lammps-mfftorchkk).
+Extra input heads, physical tensor outputs and dispersion extensions require
 their corresponding implementation and validation.
 
 Native inference uses FP32 with TF32 disabled. Export retains the original

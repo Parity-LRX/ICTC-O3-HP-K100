@@ -364,8 +364,105 @@ shortest periodic lattice vector and has a nondifferentiable minimum at tied
 shortest lengths. Fixed-sigma screening removes that minimum from the
 reciprocal energy.
 
-Each graph must supply its physical atoms once. This backend uses one
-device per graph and does not implement distributed FFTs or halo-charge
-exchange. Independent-graph DDP can use a local mesh per rank.
-Domain-decomposed MD needs a global long-range solver. Existing C++ source
-export/deployment paths are separate from these eager HIP kernels.
+The standalone API supplies each physical atom once on one device.
+Independent-graph DDP can use a local mesh per rank. Native MFF additionally
+supports a domain-decomposed graph through the global reductions below.
+
+## Native LAMMPS `mff/torch/kk`
+
+The native MFF interface from `main` loads learned reciprocal models through
+the same public export and launch commands as short-range models:
+
+```bash
+# Inside a scheduled K100 allocation, using a checkpoint with trained
+# long-range heads and the chosen physical screening/grid resolution:
+mff-export-core --checkpoint electrostatic.pth --elements H C O --out core.pt
+mpirun --bind-to none -np 8 mff-lammps -in in.mff
+```
+
+```lammps
+units metal
+atom_style atomic
+atom_modify map array
+boundary p p p
+read_data system.data
+neighbor 0.5 bin
+pair_style mff/torch/kk 4.5 cuda
+pair_coeff * * core.pt H C O
+thermo 1
+thermo_style custom step pe fmax
+run 0
+```
+
+Use the checkpoint's element mapping, cutoff and units. Keep the native
+archive and its `.checkpoint.pth`, `.json` and `.meta` sidecars together.
+The JSON records mesh dimensions, assignment, screening and the native
+reciprocal transport. The public MFF bootstrap registers the installed HIP
+runtime and evaluates the complete reciprocal contribution inside autograd.
+
+Each rank predicts moments only for its owned prefix. Global charge
+neutralization uses the physical atom count and a summed owned charge.
+Local B-spline assignment and real FFTs form reciprocal source amplitudes;
+RCCL sums those amplitudes before the quadratic energy evaluation. Both
+folded Nyquist partners are retained for triclinic or mixed even/odd grids.
+The multipole transport sums two complex source amplitudes per source
+channel, instead of every Cartesian moment grid. Scalar potential-based
+per-atom energy partitioning is retained; multipoles use uniform partitioning.
+
+The reverse amplitude/charge reductions and the main interface's reverse
+feature exchanges retain both direct electrostatic forces and the response
+of learned moments to geometry. LAMMPS reverses ghost-coordinate forces to
+their owners. Ghost copies never enter the global source sum; the current
+owner map and source values are rebuilt after migration and sorting.
+
+The supported MFF scope is one node, one rank per K100, a single communicator
+and nonempty owned domains, matching the native `main` interface. FFTs and
+spectral geometry remain replicated on each rank. At a fixed global grid,
+that work limits strong scaling even though atom-dependent work is divided
+and amplitude communication replaces atom replication. Full real-space Ewald, dispersion,
+multi-node operation, pressure/NPT and long-trajectory stability are outside
+this qualification; the existing Kokkos virial flag remains unchanged.
+
+
+### MFF multi-GPU results
+
+![Native mff/torch/kk complete-step throughput, latency, strong scaling and peak PyTorch allocation per GPU.](assets/electrostatics-mff-k100.svg)
+
+One K100 node, one rank per GPU, C64/lmax=2/two interactions/correlation=3,
+65,536 atoms, about 50 neighbors per atom, PCS, sigma=1, one source channel
+and a 128×128×256 mesh. Models are randomly initialized with a nonzero
+long-range contribution. Timings include the complete MD step, neighbor
+rebuilding on every step and all communication. The median of three
+five-step means follows three warmup steps; bars show the range of means.
+Compilation and export are excluded. Execution is eager FP32 with TF32 off.
+The dashed line denotes ideal strong scaling.
+
+- Monopoles: 571 → 127 ms/step from one to eight GPUs, 4.51× speedup and
+  56.3% parallel efficiency. Eight-GPU throughput is 517,000 atom-steps/s.
+- Adding dipoles: 710 → 261 ms/step, 2.72× speedup and 34.0% efficiency.
+- Adding quadrupoles: 988 → 540 ms/step, 1.83× speedup and 22.9% efficiency.
+  Eight-GPU throughput is 121,000 atom-steps/s. Maximum per-rank PyTorch
+  allocation falls from 12.01 to 3.16 GiB; external runtime buffers are excluded.
+- The matched short-range backbone takes 552 → 112 ms/step, 4.91× speedup.
+
+The diminishing multipole speedup is consistent with the replicated FFT and
+spectral work. Communication avoids gathering global atom/source arrays,
+but the full FFT does not shrink with the owned atom count. Distributed
+FFTs are required to remove that scaling limit.
+
+Validation uses separate C8/lmax=2/two-interaction/correlation=1 models,
+two source channels and a 16×20×24 mesh in a triclinic periodic cell.
+All three moment orders pass at 1/2/4/8 GPUs before and after motion and
+sorting; every multi-GPU dense case exercises owned-atom migration. Complete force vectors agree with the same-model,
+same-grid Torch reference within `6.4e-6` relative L2 and `9e-7` maximum
+absolute error. Two eight-GPU mixed isolated/connected-domain cases also
+pass. The long-range force change is of the same order as the total force
+in these checks, so zero-initialized heads cannot hide a missing contribution.
+
+An independent 28-case source/partition/rank/constant-domain check matches
+FP64 reference forces and mixed second derivatives. Deliberately detaching
+geometry-dependent moments produces large force errors, confirming that
+source response is exercised. The public `mff-lammps` bootstrap additionally
+completes an eight-GPU six-step run. These checks establish implementation
+consistency on the selected grids; they do not establish trained-potential
+accuracy or long-trajectory stability.

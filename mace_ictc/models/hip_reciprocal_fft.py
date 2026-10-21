@@ -50,12 +50,14 @@ def geometry(kernel, cell, dtype, *, exclude_k0):
     return kp, kn, spectral(kp), spectral(kn), interior, alpha, volume, real_cutoff
 
 
-def scalar_potential(kernel, mesh, cell):
+def scalar_potential(kernel, mesh, cell, *, reduce_spectrum=None):
     mx, my, mz = kernel.mesh_shape
     _, _, sp, sn, _, alpha, volume, cutoff = geometry(
         kernel, cell, mesh.dtype, exclude_k0=kernel.full_ewald or not kernel.include_k0)
     field = mesh.permute(0, 4, 1, 2, 3).contiguous()
     transformed = torch.fft.rfftn(field, dim=(-3, -2, -1))
+    if reduce_spectrum is not None:
+        transformed = torch.view_as_complex(reduce_spectrum(torch.view_as_real(transformed).contiguous()))
     # The original returns the real part of a full inverse FFT. Symmetrizing
     # the folded Green kernel reproduces that real linear map exactly.
     weights = (.5 * (sp + sn)).reshape(cell.shape[0], 1, mx, my, mz//2+1)
@@ -63,7 +65,8 @@ def scalar_potential(kernel, mesh, cell):
     return (filtered * float(mx*my*mz)).permute(0,2,3,4,1), alpha, volume, cutoff
 
 
-def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole):
+def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole,
+                     *, reduce_amplitudes=None, graph_counts=None):
     from .long_range import _prepare_frac_for_boundary_batched
     frac = _prepare_frac_for_boundary_batched(pos, batch, cell,
                 boundary=kernel.boundary, slab_padding_factor=kernel.slab_padding_factor)
@@ -92,9 +95,19 @@ def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole):
             kc = k.to(quad.dtype)
             value = torch.einsum('bkx,bksxy,bky->bks',kc,quad,kc)
             real, imag = real - .5 * value.real, imag - .5 * value.imag
+        if reduce_amplitudes is not None:
+            return torch.stack((real, imag), dim=-1)
         return real.square()+imag.square()
-    density = sp[:, :, None] * amplitude(transformed, kp)
-    density = density + (sn * interior)[:, :, None] * amplitude(transformed.conj(), kn)
+    positive = amplitude(transformed, kp)
+    negative = amplitude(transformed.conj(), kn)
+    if reduce_amplitudes is not None:
+        # Communicate two folded complex source amplitudes, rather than every
+        # Cartesian moment grid. Both Nyquist partners are still explicit.
+        positive, negative = reduce_amplitudes(torch.stack((positive, negative))).unbind(0)
+        positive = positive.square().sum(-1)
+        negative = negative.square().sum(-1)
+    density = sp[:, :, None] * positive
+    density = density + (sn * interior)[:, :, None] * negative
     graph_energy = .5 * density.sum(dim=(1,2))
-    counts = kernel._graph_counts(batch, cell, dtype=source.dtype)
+    counts = kernel._graph_counts(batch, cell, dtype=source.dtype) if graph_counts is None else graph_counts
     return (graph_energy.index_select(0,batch)/counts.index_select(0,batch))[:,None]
