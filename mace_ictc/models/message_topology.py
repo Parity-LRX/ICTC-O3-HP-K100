@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Live device CSR grouping; integer counters, no cached graph or host scalars.
 
 Sorted input is detected on device and keeps identity edge order. Unsorted

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Independent path-grouped exact FP32 edge messages and feature/gate VJPs."""
 from functools import lru_cache
 import importlib.util

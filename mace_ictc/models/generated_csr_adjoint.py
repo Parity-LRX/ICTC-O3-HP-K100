@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Source-owned exact Cartesian feature adjoint with no atomic feature writes."""
 from .generated_cartesian_message import _literal,_sum
 

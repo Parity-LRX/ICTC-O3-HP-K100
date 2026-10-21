@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Public Cartesian operator API, alongside the ``mace_ictc`` model package.
 
 Importing this package does not import MACE models, initialize a GPU or build

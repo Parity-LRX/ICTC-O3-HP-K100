@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Exact shared quadratic prefixes followed by degree-local weighted circuits.
 
 The high-degree cubic circuit otherwise expands each quadratic derivative in

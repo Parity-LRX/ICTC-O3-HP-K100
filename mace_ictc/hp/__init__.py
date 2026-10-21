@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Whole-model HP API and compatibility imports for ``ictc_o3`` operators.
 
 Importing this namespace never builds CUDA extensions or selects a model plan.

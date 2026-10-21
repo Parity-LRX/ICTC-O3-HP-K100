@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Species-conditioned GEMMs without an [N,C_out,C_in] weight expansion.
 
 Grouped GEMMs support arbitrary species banks. The preceding shared FP32

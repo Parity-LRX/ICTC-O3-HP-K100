@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Live species-indexed CG circuits without host-sized node selections.
 
 The original CG circuit and learned coefficient bank are unchanged. Each node

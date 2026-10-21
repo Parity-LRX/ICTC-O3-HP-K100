@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Compatibility imports for the public ``ictc_o3`` operator API.
 
 Keep the original paths resolvable for existing callers and serialized modules.

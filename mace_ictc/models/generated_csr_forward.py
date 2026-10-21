@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Exact FP32 destination-owned TP reduction, with live unsorted edge inputs.
 
 Each warp owns a destination/channel/path slice and sums its neighbors before

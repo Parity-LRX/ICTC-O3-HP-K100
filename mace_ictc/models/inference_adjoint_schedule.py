@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Bounded, metadata-only dispatch for frozen-gate coordinate adjoints.
 
 No shape-specific timing, device allocations or synchronization are performed.

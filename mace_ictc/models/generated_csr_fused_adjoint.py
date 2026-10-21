@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Source-owned FP32 feature/gate adjoints with one shared neighbor traversal.
 
 Each warp owns one node/input-degree/channel slice. Gate gradients are written

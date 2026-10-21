@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """The HP package uses ordinary IEEE FP32, including library GEMMs."""
 import torch
 

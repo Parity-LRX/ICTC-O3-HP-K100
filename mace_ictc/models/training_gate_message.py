@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Page the radial projection and its first/mixed message adjoints.
 
 Only the narrow radial feature cotangent crosses the first-adjoint boundary.

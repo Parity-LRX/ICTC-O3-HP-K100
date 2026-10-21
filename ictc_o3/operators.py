@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Documented Cartesian operators backed by the qualified CUDA/Triton kernels."""
 from __future__ import annotations
 

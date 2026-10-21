@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Bounded generated quadratic CG blocks with exact mixed adjoints.
 
 Each fixed (l1,l2,lout) prefix owns at most 2*lout+1 outputs. Splitting those

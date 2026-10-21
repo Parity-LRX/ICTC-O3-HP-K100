@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Optional generated Cartesian harmonics and analytic first/second adjoints.
 
 Uses the actual component-normalized ICTC polynomial constants. No spherical

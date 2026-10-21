@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Whole-network entrypoints; precision and trainability stay caller-controlled."""
 import torch
 

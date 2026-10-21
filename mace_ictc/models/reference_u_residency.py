@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Lossless residency for dense reference U after GPU factorization is ready.
 
 Only immutable original/derived U buffers move. Parameters and runtime features

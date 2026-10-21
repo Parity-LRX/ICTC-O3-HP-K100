@@ -227,7 +227,8 @@ throughputs have a different workload and timing scope from the MD figures.
 
 ## License
 
+ICTC-O3-HP-K100 is licensed under the [MIT License](LICENSE).
 Derived from [ICTC-O3-HP](https://github.com/Parity-LRX/ICTC-O3-HP).
-Existing PolyForm Noncommercial 1.0.0 and MIT license scopes are retained;
-see [LICENSE_SCOPE.md](LICENSE_SCOPE.md) and [NOTICE](NOTICE).
+Third-party code retains its original licenses; see
+[LICENSE_SCOPE.md](LICENSE_SCOPE.md) and [NOTICE](NOTICE).
 Pretrained model weights have their own upstream licenses.

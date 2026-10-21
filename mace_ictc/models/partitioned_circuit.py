@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Output-degree partitions of the exact independent FP32 CG circuit.
 
 Only immutable final-entry metadata is partitioned. Every projected learned

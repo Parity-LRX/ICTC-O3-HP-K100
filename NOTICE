@@ -1,12 +1,18 @@
-Required Notice: Copyright (c) 2026 The MACE-ICTC RuixiangLin. New MACE-ICTC-HP implementations are offered under PolyForm Noncommercial License 1.0.0; commercial permission is available only through a separate written grant by the rights holder.
-Required Notice: Preserve the MIT copyright and permission notices for the earlier MACE-ICTC implementation and the MACE/e3nn portions identified in LICENSE_SCOPE.md. This release does not withdraw rights already granted under MIT.
+Copyright (c) 2026 The MACE-ICTC RuixiangLin
 
-The PolyForm Noncommercial License 1.0.0 text in LICENSE is the unmodified
-official text from https://polyformproject.org/licenses/noncommercial/1.0.0.txt.
-Its permitted-purpose and noncommercial-organization clauses are not narrowed
-by this notice or by the separate commercial-permission procedure.
+ICTC-O3-HP-K100 project-owned code, including the HP implementations, is
+licensed under the MIT License in LICENSE.
 
-MACE-derived Clebsch-Gordan and symmetric-contraction files retain their
-author notices (Ilyes Batatia) and MIT terms. The e3nn copyright and MIT terms
-are retained separately. Dependencies and third-party weights have their own
-licenses; no commercial grant for them is implied by this project.
+Third-party notices:
+
+- MACE-derived Clebsch-Gordan and symmetric-contraction code retains its
+  original author notices (Ilyes Batatia) and the MIT terms reproduced in
+  LICENSES/MACE-MIT.txt.
+- Earlier MACE-ICTC code retains the MIT notice in LICENSES/MACE-ICTC-MIT.txt.
+- The e3nn copyright and MIT terms are reproduced in LICENSES/e3nn-MIT.txt.
+- mace_ictc/models/_cueq_cg_tools.py retains the NVIDIA CORPORATION & AFFILIATES
+  copyright notice and Apache-2.0 identifier. The Apache License 2.0 text is
+  reproduced in LICENSES/Apache-2.0.txt.
+
+See LICENSE_SCOPE.md for scope. Dependencies, pretrained model weights, and
+training datasets retain their upstream licenses.

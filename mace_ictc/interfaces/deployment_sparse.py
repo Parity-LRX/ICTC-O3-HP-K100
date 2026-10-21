@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Bounded high-degree SC kernels for frozen, dynamic-shape AOTI inference.
 
 The exact prefix and adjoint tables come from the qualified eager plan. Species

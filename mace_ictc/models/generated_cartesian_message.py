@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# SPDX-License-Identifier: MIT
 """Independent generated FP32 Cartesian TP/scatter and joint first adjoints.
 
 The schedule borrows public OpenEquivariance ideas (warp-local work, constant

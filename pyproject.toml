@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "High-performance ICTC-O3 operators and the MACE-ICTC framework, optimized for Hygon K100 GPUs"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "PolyForm-Noncommercial-1.0.0 AND MIT" }
+license = { text = "MIT" }
 dependencies = ["torch>=2.7", "numpy>=1.20", "e3nn>=0.4.4,<0.6", "ase>=3.22", "opt-einsum-fx>=0.1.4"]
 
 [project.optional-dependencies]
@@ -30,7 +30,7 @@ mff-convert-foundation = "mace_ictc.cli.convert_foundation:main"
 mff-preprocess = "mace_ictc.cli.preprocess:main"
 
 [tool.setuptools]
-license-files = ["LICENSE", "LICENSES/*.txt", "NOTICE", "LICENSE_SCOPE.md", "COMMERCIAL_LICENSE.md"]
+license-files = ["LICENSE", "LICENSES/*.txt", "NOTICE", "LICENSE_SCOPE.md"]
 
 [tool.setuptools.packages.find]
 include = ["ictc_o3", "ictc_o3.*", "mace_ictc", "mace_ictc.*"]
