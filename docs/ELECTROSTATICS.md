@@ -4,8 +4,8 @@ The K100 mesh backend accelerates the original ICTC reciprocal functional
 for monopoles, Cartesian dipoles and Cartesian quadrupoles. It supports
 arbitrary atom counts and positive source-channel counts, CIC/TSC/PCS
 assignment, periodic or padded-slab boundaries, batched triclinic cells,
-and FP32/FP64 on Hygon K100 (`gfx926`). Mesh size is a positive integer;
-the current ICTC interface uses a cubic mesh.
+and FP32/FP64 on Hygon K100 (`gfx926`). `mesh_size` accepts a positive
+integer for a cubic grid or three positive integers `(Mx, My, Mz)`.
 
 ## Fixed physical screening
 
@@ -26,15 +26,45 @@ For a bare kernel, use `full_ewald=False, smearing_sigma=None`.
 
 When replicating a periodic cell, increase mesh dimensions by the same factor
 to retain physical grid spacing. A fixed mesh size is not a fixed spatial
-resolution. The cubic-mesh API uses the largest cell dimension to bound
-spacing; an elongated box can therefore need a larger mesh. Converge mesh
+resolution. Set each axis separately to avoid oversampling shorter lattice
+vectors in an elongated box. Converge mesh
 resolution for the chosen source ranks and smoothing length. In particular,
 high multipole derivatives can amplify mesh aliasing even when energy errors
 look small.
 
 Fixed-sigma models retain their reciprocal energy inside exported graphs.
 The separate C++ reciprocal solver currently uses legacy box-dependent
-screening, so fixed-sigma models do not delegate sources to that solver.
+screening and a cubic grid. Fixed-sigma or three-axis-grid models therefore
+keep their energy inside the graph instead of delegating sources to it.
+
+## Grid selection for rectangular and triclinic cells
+
+```python
+from ictc_o3 import MeshElectrostatics, mesh_shape_for_cell
+
+# Setup only: cell rows are lattice vectors, in position units.
+shape = mesh_shape_for_cell(cell, spacing=0.5)
+solver = MeshElectrostatics(mesh_size=shape, smearing_sigma=1.0, backend="hip").cuda()
+# For a 64 x 64 x 128 orthorhombic box, shape is (128, 128, 256).
+```
+
+`mesh_shape_for_cell` rounds each lattice-vector length divided by the
+requested spacing up to a 2/3/5-smooth FFT size, with a minimum of four.
+It accepts `[3,3]` or `[B,3,3]` cells; a batch shares the largest required
+size on each axis. Pass the solver's `boundary` and `slab_padding_factor`
+to include vacuum padding. Alternatively, pass a mesh tuple directly.
+All assignment orders, source ranks, native adjoints and full/reference
+FFTs use the three independent sizes, including mixed even/odd axes.
+
+The helper detaches the cell and reads its dimensions on the host. Call it
+during initialization, keep the selected mesh fixed during differentiated
+energy/force/strain evaluation, and explicitly regrid when needed. Grid
+spacing is not an error tolerance. Strongly skewed cells, narrow screening
+and higher multipole ranks require their own convergence checks. Changing
+grid resolution can change discretization error; it does not change sigma.
+The training CLI accepts `--long-range-mesh-size 128,128,256`; checkpoint
+and JSON metadata preserve all three sizes. Legacy integer configurations
+retain their original meaning.
 
 ## Whole-model overhead with fixed screening
 
@@ -50,32 +80,69 @@ framework default `loss.backward(inputs=trainable_parameters)`.
 Neighbor construction and communication are excluded. Peaks are PyTorch
 allocated memory, excluding driver and external runtime buffers.
 
-For a 64,000-atom cubic box with side 80 and a 160³ mesh:
+The overview uses 64³ grids at 1,024 and 4,096 atoms, 64×128×128 at
+16,384 atoms, and 128×128×256 at 65,536 atoms. The two larger sizes were
+remeasured with three-axis grids; the two smaller points retain the
+qualified cubic-grid measurements. Three synchronized timing rounds follow
+compilation and warmup. Error bars show the range of round medians, rather
+than confidence intervals.
 
-- Monopoles: energy-and-force inference 489 → 502 ms; training 1488 → 1538 ms.
-- Adding dipoles: inference 489 → 626 ms; training 1488 → 1784 ms.
-- Adding quadrupoles: inference 489 → 893 ms; training 1488 → 2342 ms.
-  Peak allocation changes from 17.20 to 17.92 GiB for inference, and
-  from 51.61 to 52.61 GiB for training.
+### Removing short-axis oversampling
 
-The small monopole differences should be read with timing variation in mind.
-Three synchronized timing rounds follow compilation and warmup; figures
-show medians and the range of round medians, rather than confidence intervals.
-The scan also includes a C128/lmax=3 model at 16,384 atoms on a 128³ mesh:
-quadrupoles change inference from 435 to 646 ms and training from 1646 to
-2081 ms. Relative overhead depends on backbone cost, source width, rank,
-physical smoothing length, box shape and mesh resolution.
+![Whole-model time and memory before and after replacing a cubic grid with a rectangular grid for the same elongated box.](assets/electrostatics-box-shape-k100.svg)
 
-![Box-shape dependence of the whole-model time increase for monopoles, dipoles and quadrupoles.](assets/electrostatics-box-shape-k100.svg)
+For 65,536 atoms in a 64×64×128 box, replacing 256³ with 128×128×256
+removes three quarters of the grid points. The maximum lattice step remains
+0.5; the shorter axes change from 0.25 to 0.5. With the same models and graph:
 
-A 65,536-atom rectangular box with sides 64, 64 and 128 uses a 256³ cubic
-mesh to bound grid spacing by 0.5. Its quadrupole inference takes
-507 → 2326 ms. Dipole and quadrupole training encounter OOM with the default
-PyTorch allocator. This records an allocation failure, not a proven hardware
-capacity limit. A rectangular 128×128×256 mesh would use one quarter as many
-grid points at the same spacing; that mesh shape is not yet supported by
-this API. The cubic-mesh restriction is therefore a substantial cost for
-elongated boxes. Tested endpoints do not establish a maximum system size.
+- Monopoles: energy-and-force inference 564 → 519 ms; training 1734 → 1603 ms.
+- Adding dipoles: inference 1096 → 647 ms; training OOM → 1872 ms.
+- Adding quadrupoles: inference 2322 → 927 ms, a 2.50× throughput increase.
+  Peak inference allocation falls from 24.37 to 18.23 GiB. Training changes
+  from OOM to 2458 ms and 53.87 GiB peak allocation.
+
+The short-range backbone takes 503 ms for inference and 1549 ms for training.
+With the rectangular grid, time increases for the three source ranks are
+3.2%, 28.7% and 84.4% for inference; 3.5%, 20.9% and 58.7% for training.
+Quadrupole throughput is 70.7 thousand atom-steps/s for inference and
+26.7 thousand for training. OOM denotes failure with the default PyTorch
+allocator, not a proven hardware capacity bound.
+
+At 16,384 atoms, changing 128³ to 64×128×128 reduces quadrupole inference
+from 332 to 232 ms and training from 803 to 596 ms. These endpoints do not
+establish a maximum system size. Overhead also depends on backbone cost,
+source width, source rank, screening and mesh resolution.
+
+### Cost at fixed volume and resolution
+
+![Reciprocal energy-and-force time and peak allocated memory as the box aspect ratio increases at fixed physical volume and grid-point count.](assets/electrostatics-aspect-k100.svg)
+
+The standalone scan holds 32,768 atoms, physical volume, spacing 0.5,
+PCS, sigma=1 and the total grid-point count (128³) fixed. The boxes are
+64×64×64, 32×64×128 and 16×64×256, with respective meshes
+128×128×128, 64×128×256 and 32×128×512. Only prescribed sources and the
+reciprocal energy/force calculation are timed; no backbone is included.
+
+Across longest/shortest axis ratios of 1, 4 and 16, quadrupole evaluation
+takes 209.1, 207.6 and 208.5 ms. Dipole timings are 71.3, 70.6 and 71.0 ms.
+Peak allocation is approximately 1.09 GiB for quadrupoles in all three cases.
+The cubic-grid oversampling penalty is removed for these shapes. Vendor FFT
+factorization and skewness can still affect cost; this scan does not prove
+identical performance for every possible cell.
+
+### Accuracy when changing grids
+
+Native and reference implementations agree on the same three-axis grid
+through mixed second derivatives. Regridding changes discretization error,
+so the speedup is not a claim of bitwise equivalence to a larger cubic grid.
+In the 65,536-atom random-model comparison, the largest total-force relative
+L2 difference is `4.5e-5`, with maximum absolute difference below `2e-6`.
+For the monopole-only long-range force, the relative L2 difference is
+approximately 0.28%. The randomly initialized multipole sources are small;
+total-force agreement alone cannot certify long-range accuracy for a
+trained potential. Independent continuous structure-factor checks verify
+mesh convergence separately. Select spacing for the required force/stress
+accuracy, retaining sigma and the trained source conventions.
 
 ## Assignment implementation benchmark
 
@@ -119,7 +186,20 @@ Fixed-length screening is checked separately from implementation parity:
   rules. Whole-model energy/force/virial-loss parameter gradients match the
   Torch reference for monopole, dipole and quadrupole heads.
 
-K100 validation covers 12 assignment cases, 14 electrostatics configurations,
+Rectangular-grid validation adds:
+
+- 24 assignment/adjoint cases covering both precisions, layouts, all three
+  assignment orders, periodic/slab boundaries and an empty graph member.
+- 24 full-spectrum FFT comparisons with mixed even/odd axes, triclinic
+  cells, screened/bare and Poisson/learned-Poisson kernels, and all ranks.
+  These include first and mixed second derivatives.
+- Independent structure-factor convergence, finite-difference first/second
+  derivatives, and anisotropic 1×2×3 replication for all three source ranks.
+- Three whole-model energy/force/virial-loss gradient comparisons and
+  checkpoint round trips with nondefault source widths. Batched-cell FX
+  capture, CLI parsing and six export-metadata configurations also pass.
+
+The earlier cubic-grid K100 validation covers 12 assignment cases, 14 electrostatics configurations,
 24 full-spectrum FFT comparisons, three whole-model energy/force/stress-loss
 gradient comparisons, and scalar/multipole checkpoint round trips with
 nondefault source widths and correlation. Tests include FP32/FP64,
@@ -184,8 +264,8 @@ sampled = mesh_gather(
 )
 ```
 
-The default mesh layout is `[B,M,M,M,C]`. `channels_first=True` uses
-`[B,C,M,M,M]`. Fractional coordinates follow the original boundary
+The default mesh layout is `[B,Mx,My,Mz,C]`. `channels_first=True` uses
+`[B,C,Mx,My,Mz]`. Fractional coordinates follow the original boundary
 preparation: `slab` wraps x/y and clamps z mesh indices after vacuum padding.
 
 ## Learned MACE-ICTC model

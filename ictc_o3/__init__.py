@@ -14,7 +14,7 @@ from .operators import (
     direction_harmonics,
     normalized_silu,
 )
-from .electrostatics import MeshElectrostatics, mesh_spread, mesh_gather
+from .electrostatics import MeshElectrostatics, mesh_spread, mesh_gather, mesh_shape_for_cell
 
 __all__ = [
     "EdgeTensorProduct",
@@ -28,4 +28,5 @@ __all__ = [
     "MeshElectrostatics",
     "mesh_spread",
     "mesh_gather",
+    "mesh_shape_for_cell",
 ]

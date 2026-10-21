@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 import torch
 
+from .mesh import normalize_mesh_size
+
 
 DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "dtype": "float64",
@@ -577,7 +579,7 @@ def resolve_model_architecture(
             DEFAULT_MODEL_ARCHITECTURE["long_range_kmax"],
         )
     )
-    resolved["long_range_mesh_size"] = int(
+    resolved["long_range_mesh_size"] = normalize_mesh_size(
         _resolve_value(
             overrides,
             checkpoint,

@@ -37,6 +37,8 @@ _repo_root = os.path.dirname(os.path.dirname(_script_dir))
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
+from mace_ictc.utils.mesh import normalize_mesh_size
+
 from mace_ictc.training.makefx_compile import trace_and_compile_force
 
 # Default species (H, C, N, O) for the synthetic no-checkpoint path only; a real --checkpoint export
@@ -75,7 +77,7 @@ def _long_range_deploy_metadata(
         "reciprocal_source_boundary": "periodic",
         "reciprocal_source_slab_padding_factor": 2,
         "long_range_runtime_backend": str(getattr(model, "long_range_runtime_backend", "mesh_fft")),
-        "long_range_mesh_size": int(getattr(model, "long_range_mesh_size", 16)),
+        "long_range_mesh_size": normalize_mesh_size(getattr(model, "long_range_mesh_size", 16)),
         "long_range_max_multipole_l": int(getattr(model, "long_range_max_multipole_l", 0)),
         "long_range_source_kind": str(getattr(model, "long_range_runtime_source_kind", "latent_multipole")),
         "long_range_source_channels": s_chan,

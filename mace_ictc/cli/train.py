@@ -31,6 +31,7 @@ import random
 
 import h5py
 import numpy as np
+from mace_ictc.utils.mesh import normalize_mesh_size, parse_mesh_size
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
@@ -401,7 +402,7 @@ def build_baseline_model(
     long_range_boundary: str = "periodic",
     long_range_reciprocal_backend: str = "direct_kspace",
     long_range_kmax: int = 2,
-    long_range_mesh_size: int = 16,
+    long_range_mesh_size: int | tuple[int, int, int] = 16,
     long_range_source_channels: int = 1,
     long_range_hidden_dim: int = 64,
     long_range_filter_hidden_dim: int = 64,
@@ -609,8 +610,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="direct_kspace keeps the long-range energy in the exported core; mesh_fft can export latent sources.")
     ap.add_argument("--long-range-kmax", type=int, default=2,
                     help="Integer reciprocal lattice cutoff for direct_kspace.")
-    ap.add_argument("--long-range-mesh-size", type=int, default=16,
-                    help="FFT mesh size for mesh_fft reciprocal backend.")
+    ap.add_argument("--long-range-mesh-size", type=parse_mesh_size, default=16,
+                    help="FFT mesh size M or Mx,My,Mz for mesh_fft reciprocal backend.")
     ap.add_argument("--long-range-source-channels", type=int, default=1,
                     help="Number of learned latent scalar source channels.")
     ap.add_argument("--long-range-hidden-dim", type=int, default=64)
@@ -1052,8 +1053,7 @@ def main(argv=None):
             raise ValueError("--long-range-reciprocal-backend direct_kspace requires --long-range-boundary periodic")
         if args.long_range_kmax < 0:
             raise ValueError("--long-range-kmax must be >= 0")
-        if args.long_range_mesh_size <= 0:
-            raise ValueError("--long-range-mesh-size must be > 0")
+        normalize_mesh_size(args.long_range_mesh_size)
         if args.long_range_source_channels <= 0:
             raise ValueError("--long-range-source-channels must be > 0")
         if args.long_range_max_multipole_l < 0:
@@ -1296,7 +1296,7 @@ def main(argv=None):
         long_range_hidden_dim=int(args.long_range_hidden_dim),
         long_range_filter_hidden_dim=int(args.long_range_filter_hidden_dim),
         long_range_kmax=int(args.long_range_kmax),
-        long_range_mesh_size=int(args.long_range_mesh_size),
+        long_range_mesh_size=normalize_mesh_size(args.long_range_mesh_size),
         long_range_slab_padding_factor=int(args.long_range_slab_padding_factor),
         long_range_include_k0=bool(args.long_range_include_k0),
         long_range_source_channels=int(args.long_range_source_channels),

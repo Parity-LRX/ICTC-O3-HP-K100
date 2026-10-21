@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import o3
 
+from mace_ictc.utils.mesh import normalize_mesh_size
 from mace_ictc.models.ictd_irreps import (
     EdgeWeightedPathPreservingTensorProduct,
     EquivariantChannelLinearSO3,
@@ -3087,7 +3088,7 @@ class PureCartesianICTDFix(nn.Module):
         long_range_neutralize: bool = True,
         long_range_filter_hidden_dim: int = 64,
         long_range_kmax: int = 2,
-        long_range_mesh_size: int = 16,
+        long_range_mesh_size: int | tuple[int, int, int] = 16,
         long_range_slab_padding_factor: int = 2,
         long_range_include_k0: bool = False,
         long_range_source_channels: int = 1,
@@ -3560,7 +3561,7 @@ class PureCartesianICTDFix(nn.Module):
         self.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
         self.long_range_mesh_fft_reciprocal_only = bool(long_range_mesh_fft_reciprocal_only)
         self.long_range_smearing_sigma = long_range_smearing_sigma
-        self.long_range_mesh_size = int(long_range_mesh_size)
+        self.long_range_mesh_size = normalize_mesh_size(long_range_mesh_size)
         self.long_range_slab_padding_factor = int(long_range_slab_padding_factor)
         self.long_range_module = build_long_range_module(
             mode=self.long_range_mode,
@@ -3647,10 +3648,11 @@ class PureCartesianICTDFix(nn.Module):
             if getattr(self.long_range_module, "energy_scale", None) is not None:
                 with torch.no_grad():
                     self.long_range_module.energy_scale.fill_(1.0)
-            # at export the multipole route emits a packed [q|mu|Q] reciprocal_source for the
-            # C++ solver (instead of computing the reciprocal energy in-model).
+            # Legacy cubic Poisson models can emit packed [q|mu|Q] sources for
+            # the C++ solver; other configurations keep reciprocal energy inline.
             self.long_range_exports_reciprocal_source = (
-                str(long_range_green_mode) == "poisson" and long_range_smearing_sigma is None)
+                str(long_range_green_mode) == "poisson" and long_range_smearing_sigma is None
+                and isinstance(self.long_range_mesh_size, int))
             # Deploy metadata read by export_libtorch_core -> .json -> the C++ engine/solver.
             # The packed per-atom source is [q | dipole_xyz | quad_3x3] per channel (channel-major);
             # the C++ reciprocal solver rebuilds q/mu/Q from source_channels + max_multipole_l, and
@@ -3665,7 +3667,7 @@ class PureCartesianICTDFix(nn.Module):
             # screened |S(k)|^2 PME with green_mode/mesh_size/boundary/full_ewald all matched.
             _mp_kernel = self.long_range_module.kernel
             self.long_range_mesh_fft_full_ewald = bool(getattr(_mp_kernel, "full_ewald", bool(long_range_mesh_fft_full_ewald)))
-            self.long_range_mesh_size = int(getattr(_mp_kernel, "mesh_size", 16))
+            self.long_range_mesh_size = normalize_mesh_size(getattr(_mp_kernel, "mesh_size", 16))
             self.long_range_green_mode = str(getattr(_mp_kernel, "green_mode", "poisson"))
             self.long_range_boundary = str(getattr(_mp_kernel, "boundary", "periodic"))
             # multipole_energy always distributes e_graph/n_local uniformly (it ignores the kernel's

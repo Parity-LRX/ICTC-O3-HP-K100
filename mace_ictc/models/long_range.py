@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mace_ictc.utils.mesh import mesh_shape, normalize_mesh_size
 from mace_ictc.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
 )
@@ -223,12 +224,13 @@ def _assignment_window_1d(
 
 
 def _apply_mesh_boundary(idx: torch.Tensor, *, mesh_size: int, boundary: str) -> torch.Tensor:
+    shape = mesh_shape(mesh_size)
     if boundary == "periodic":
-        return torch.remainder(idx, mesh_size)
+        return torch.remainder(idx, idx.new_tensor(shape))
     idx_wrapped = idx.clone()
-    idx_wrapped[..., 0] = torch.remainder(idx_wrapped[..., 0], mesh_size)
-    idx_wrapped[..., 1] = torch.remainder(idx_wrapped[..., 1], mesh_size)
-    idx_wrapped[..., 2] = idx_wrapped[..., 2].clamp(0, mesh_size - 1)
+    idx_wrapped[..., 0] = torch.remainder(idx_wrapped[..., 0], shape[0])
+    idx_wrapped[..., 1] = torch.remainder(idx_wrapped[..., 1], shape[1])
+    idx_wrapped[..., 2] = idx_wrapped[..., 2].clamp(0, shape[2] - 1)
     return idx_wrapped
 
 
@@ -242,16 +244,17 @@ def _spread_source_to_mesh(
     boundary: str,
 ) -> torch.Tensor:
     channels = int(source.size(1))
-    mesh = source.new_zeros((mesh_size, mesh_size, mesh_size, channels))
+    shape = mesh_shape(mesh_size)
+    mesh = source.new_zeros((*shape, channels))
     flat_mesh = mesh.view(-1, channels)
-    scaled = frac * float(mesh_size)
+    scaled = frac * frac.new_tensor(shape)
     base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
     idx = _apply_mesh_boundary(
         base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
         mesh_size=mesh_size,
         boundary=boundary,
     )
-    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    flat_idx = ((idx[..., 0] * shape[1]) + idx[..., 1]) * shape[2] + idx[..., 2]
     flat_mesh.scatter_add_(
         0,
         flat_idx.reshape(-1, 1).expand(-1, channels),
@@ -272,16 +275,17 @@ def _spread_source_to_mesh_batched(
     boundary: str,
 ) -> torch.Tensor:
     channels = int(source.size(1))
-    mesh_points = mesh_size * mesh_size * mesh_size
+    shape = mesh_shape(mesh_size)
+    mesh_points = math.prod(shape)
     flat_mesh = source.new_zeros((num_graphs * mesh_points, channels))
-    scaled = frac * float(mesh_size)
+    scaled = frac * frac.new_tensor(shape)
     base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
     idx = _apply_mesh_boundary(
         base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
         mesh_size=mesh_size,
         boundary=boundary,
     )
-    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    flat_idx = ((idx[..., 0] * shape[1]) + idx[..., 1]) * shape[2] + idx[..., 2]
     graph_offset = batch.to(dtype=flat_idx.dtype).unsqueeze(-1) * mesh_points
     flat_idx = flat_idx + graph_offset
     flat_mesh.scatter_add_(
@@ -289,7 +293,7 @@ def _spread_source_to_mesh_batched(
         flat_idx.reshape(-1, 1).expand(-1, channels),
         (source.unsqueeze(1) * stencil_weights.unsqueeze(-1)).reshape(-1, channels),
     )
-    return flat_mesh.view(num_graphs, mesh_size, mesh_size, mesh_size, channels)
+    return flat_mesh.view(num_graphs, *shape, channels)
 
 
 def _gather_source_from_mesh(
@@ -302,15 +306,16 @@ def _gather_source_from_mesh(
     boundary: str,
 ) -> torch.Tensor:
     channels = int(mesh.size(-1))
+    shape = mesh_shape(mesh_size)
     flat_mesh = mesh.view(-1, channels)
-    scaled = frac * float(mesh_size)
+    scaled = frac * frac.new_tensor(shape)
     base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
     idx = _apply_mesh_boundary(
         base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
         mesh_size=mesh_size,
         boundary=boundary,
     )
-    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    flat_idx = ((idx[..., 0] * shape[1]) + idx[..., 1]) * shape[2] + idx[..., 2]
     gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), _assignment_stencil_size(assignment) ** 3, channels)
     return (gathered * stencil_weights.unsqueeze(-1)).sum(dim=1)
 
@@ -326,16 +331,17 @@ def _gather_source_from_mesh_batched(
     boundary: str,
 ) -> torch.Tensor:
     channels = int(mesh.size(-1))
-    mesh_points = mesh_size * mesh_size * mesh_size
+    shape = mesh_shape(mesh_size)
+    mesh_points = math.prod(shape)
     flat_mesh = mesh.reshape(-1, channels)
-    scaled = frac * float(mesh_size)
+    scaled = frac * frac.new_tensor(shape)
     base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
     idx = _apply_mesh_boundary(
         base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
         mesh_size=mesh_size,
         boundary=boundary,
     )
-    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    flat_idx = ((idx[..., 0] * shape[1]) + idx[..., 1]) * shape[2] + idx[..., 2]
     graph_offset = batch.to(dtype=flat_idx.dtype).unsqueeze(-1) * mesh_points
     flat_idx = flat_idx + graph_offset
     gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), _assignment_stencil_size(assignment) ** 3, channels)
@@ -1071,7 +1077,7 @@ class MeshLongRangeKernel3D(nn.Module):
     def __init__(
         self,
         *,
-        mesh_size: int = 16,
+        mesh_size: int | tuple[int, int, int] = 16,
         filter_hidden_dim: int = 64,
         boundary: str = "periodic",
         slab_padding_factor: int = 2,
@@ -1093,9 +1099,7 @@ class MeshLongRangeKernel3D(nn.Module):
             raise ValueError(f"Unsupported reciprocal energy partition: {energy_partition!r}")
         if assignment not in {"cic", "tsc", "pcs"}:
             raise ValueError(f"Unsupported mesh assignment: {assignment!r}")
-        self.mesh_size = int(mesh_size)
-        if self.mesh_size < 1:
-            raise ValueError("mesh_size must be positive")
+        self.mesh_size = normalize_mesh_size(mesh_size)
         if mesh_backend not in {"auto", "hip", "reference"}:
             raise ValueError("mesh_backend must be auto, hip or reference")
         self.mesh_backend = mesh_backend
@@ -1137,8 +1141,12 @@ class MeshLongRangeKernel3D(nn.Module):
         self.register_buffer("_assignment_window_cache", torch.empty(0), persistent=False)
 
     @property
+    def mesh_shape(self) -> tuple[int, int, int]:
+        return mesh_shape(self.mesh_size)
+
+    @property
     def num_k(self) -> int:
-        total = self.mesh_size * self.mesh_size * self.mesh_size
+        total = math.prod(self.mesh_shape)
         return total if self.include_k0 else max(total - 1, 0)
 
     def _periodic_axes(self) -> tuple[bool, bool, bool]:
@@ -1169,16 +1177,12 @@ class MeshLongRangeKernel3D(nn.Module):
 
     def _build_assignment_window(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         cached = self._assignment_window_cache
-        expected_numel = self.mesh_size * self.mesh_size * self.mesh_size
-        if cached.numel() == expected_numel and cached.device == device and cached.dtype == dtype:
+        if tuple(cached.shape) == self.mesh_shape and cached.device == device and cached.dtype == dtype:
             return cached
-        window_1d = _assignment_window_1d(
-            mesh_size=self.mesh_size,
-            assignment=self.assignment,
-            device=device,
-            dtype=dtype,
-        )
-        wx, wy, wz = torch.meshgrid(window_1d, window_1d, window_1d, indexing="ij")
+        windows = [_assignment_window_1d(mesh_size=size, assignment=self.assignment,
+                                         device=device, dtype=dtype)
+                   for size in self.mesh_shape]
+        wx, wy, wz = torch.meshgrid(*windows, indexing="ij")
         window = wx * wy * wz
         self._assignment_window_cache = window
         return window
@@ -1190,13 +1194,14 @@ class MeshLongRangeKernel3D(nn.Module):
             slab_padding_factor=self.slab_padding_factor,
             dtype=dtype,
         )
-        freq = _fft_integer_frequencies(self.mesh_size, device=cell.device, dtype=dtype)
-        kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
+        frequencies = [_fft_integer_frequencies(size, device=cell.device, dtype=dtype)
+                       for size in self.mesh_shape]
+        kx, ky, kz = torch.meshgrid(*frequencies, indexing="ij")
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
         inv_cell = _inverse_3x3(effective_cell)
         k_cart = 2.0 * math.pi * torch.einsum("kd,bdh->bkh", integer_k, inv_cell.transpose(-1, -2))
         k_norms = _safe_vector_norm(k_cart, dim=-1, floor=self.k_norm_floor).reshape(
-            cell.size(0), self.mesh_size, self.mesh_size, self.mesh_size
+            cell.size(0), *self.mesh_shape
         )
         volume = torch.abs(_det_3x3(effective_cell)).clamp_min(self.k_norm_floor)
         return k_norms, volume
@@ -1210,8 +1215,9 @@ class MeshLongRangeKernel3D(nn.Module):
         effective_cell = _effective_cell_for_boundary(
             cell, boundary=self.boundary, slab_padding_factor=self.slab_padding_factor, dtype=dtype
         )
-        freq = _fft_integer_frequencies(self.mesh_size, device=cell.device, dtype=dtype)
-        kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
+        frequencies = [_fft_integer_frequencies(size, device=cell.device, dtype=dtype)
+                       for size in self.mesh_shape]
+        kx, ky, kz = torch.meshgrid(*frequencies, indexing="ij")
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
         inv_cell = _inverse_3x3(effective_cell)
         k_cart = 2.0 * math.pi * torch.einsum("kd,bdh->bkh", integer_k, inv_cell.transpose(-1, -2))
@@ -1361,10 +1367,10 @@ class MeshLongRangeKernel3D(nn.Module):
                 torch.zeros_like(spectral_weights),
             )
         filtered = torch.fft.ifftn(mesh_complex * spectral_weights.unsqueeze(-1), dim=(1, 2, 3))
-        # Compensate torch.fft.ifftn's 1/N normalization (N = mesh_size**3). The forward FFT of
+        # Compensate torch.fft.ifftn's 1/N normalization (N = Mx*My*Mz). The forward FFT of
         # the spread charges already yields the structure factor S(k), so the iFFT's 1/N factor
         # is spurious here.
-        filtered = filtered * (float(self.mesh_size) ** 3)
+        filtered = filtered * float(math.prod(self.mesh_shape))
         return filtered.real, alpha, volume, real_cutoff
 
     def _compute_real_space_potential_batched(
@@ -1453,7 +1459,7 @@ class LatentReciprocalLongRange(nn.Module):
         boundary: str = "periodic",
         neutralize: bool = True,
         kmax: int = 2,
-        mesh_size: int = 16,
+        mesh_size: int | tuple[int, int, int] = 16,
         filter_hidden_dim: int = 64,
         slab_padding_factor: int = 2,
         include_k0: bool = False,
@@ -1476,7 +1482,7 @@ class LatentReciprocalLongRange(nn.Module):
         self.boundary = str(boundary)
         self.neutralize = bool(neutralize)
         self.kmax = int(kmax)
-        self.mesh_size = int(mesh_size)
+        self.mesh_size = normalize_mesh_size(mesh_size)
         self.slab_padding_factor = max(int(slab_padding_factor), 1)
         self.include_k0 = bool(include_k0)
         self.reciprocal_backend = str(reciprocal_backend)
@@ -1508,9 +1514,9 @@ class LatentReciprocalLongRange(nn.Module):
             )
             # The external reciprocal-only solver cannot reproduce a learned
             # Green filter or optional real/self/background Ewald corrections.
-            # Fixed-sigma models keep their energy inline until the external
-            # C++ solver supports the same physical screening length.
-            self.exports_reciprocal_source = self.green_mode == "poisson" and smearing_sigma is None and (
+            # Fixed-sigma and three-axis-grid models keep their energy inline
+            # until the external C++ solver supports the same functional/grid.
+            self.exports_reciprocal_source = self.green_mode == "poisson" and smearing_sigma is None and isinstance(self.mesh_size, int) and (
                 not self.mesh_fft_full_ewald or self.mesh_fft_reciprocal_only)
             self.runtime_backend = "mesh_fft" if self.exports_reciprocal_source else "none"
             self.energy_scale = nn.Parameter(torch.tensor(0.0))
@@ -1636,7 +1642,7 @@ def build_long_range_module(
     neutralize: bool = True,
     filter_hidden_dim: int = 64,
     kmax: int = 2,
-    mesh_size: int = 16,
+    mesh_size: int | tuple[int, int, int] = 16,
     slab_padding_factor: int = 2,
     include_k0: bool = False,
     source_channels: int = 1,
@@ -1700,7 +1706,7 @@ def configure_long_range_modules(
     long_range_neutralize: bool = True,
     long_range_filter_hidden_dim: int = 64,
     long_range_kmax: int = 2,
-    long_range_mesh_size: int = 16,
+    long_range_mesh_size: int | tuple[int, int, int] = 16,
     long_range_slab_padding_factor: int = 2,
     long_range_include_k0: bool = False,
     long_range_source_channels: int = 1,
@@ -1741,7 +1747,7 @@ def configure_long_range_modules(
     owner.long_range_neutralize = bool(long_range_neutralize)
     owner.long_range_filter_hidden_dim = int(long_range_filter_hidden_dim)
     owner.long_range_kmax = int(long_range_kmax)
-    owner.long_range_mesh_size = int(long_range_mesh_size)
+    owner.long_range_mesh_size = normalize_mesh_size(long_range_mesh_size)
     owner.long_range_slab_padding_factor = int(long_range_slab_padding_factor)
     owner.long_range_include_k0 = bool(long_range_include_k0)
     owner.long_range_source_channels = int(long_range_source_channels)

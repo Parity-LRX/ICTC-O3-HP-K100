@@ -31,6 +31,7 @@ import os
 from typing import List, Optional, Tuple
 
 import numpy as np
+from mace_ictc.utils.mesh import normalize_mesh_size
 import torch
 import torch.nn as nn
 import torch.utils.dlpack as torch_dlpack
@@ -1261,7 +1262,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         long_range_neutralize = bool(arch_meta.get("long_range_neutralize", True))
         long_range_filter_hidden_dim = int(arch_meta.get("long_range_filter_hidden_dim", 64))
         long_range_kmax = int(arch_meta.get("long_range_kmax", 2))
-        long_range_mesh_size = int(arch_meta.get("long_range_mesh_size", 16))
+        long_range_mesh_size = normalize_mesh_size(arch_meta.get("long_range_mesh_size", 16))
         long_range_slab_padding_factor = int(arch_meta.get("long_range_slab_padding_factor", 2))
         long_range_include_k0 = bool(arch_meta.get("long_range_include_k0", False))
         long_range_source_channels = int(arch_meta.get("long_range_source_channels", 1))
