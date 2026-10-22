@@ -402,24 +402,34 @@ runtime and evaluates the complete reciprocal contribution inside autograd.
 
 Each rank predicts moments only for its owned prefix. Global charge
 neutralization uses the physical atom count and a summed owned charge.
-Local B-spline assignment and real FFTs form reciprocal source amplitudes;
-RCCL sums those amplitudes before the quadratic energy evaluation. Both
-folded Nyquist partners are retained for triclinic or mixed even/odd grids.
-The multipole transport sums two complex source amplitudes per source
-channel, instead of every Cartesian moment grid. Scalar potential-based
-per-atom energy partitioning is retained; multipoles use uniform partitioning.
+Local B-spline assignment forms the mesh contribution from owned sources.
+Multipoles use RCCL reduce-scatter to sum real-space x slabs, local y/z real
+FFTs, an all-to-all transpose into y slabs, and local x FFTs. Each rank then
+evaluates only its spectral slab; a scalar energy reduction completes the
+uniform per-atom partition. Both folded Nyquist partners are retained for
+triclinic or mixed even/odd grids. Uneven slab widths use padded communication
+buffers; the physical FFT dimensions remain unchanged. Scalar potential-based
+per-atom energy partitioning retains the replicated-transform path.
 
-The reverse amplitude/charge reductions and the main interface's reverse
+The reverse slab/charge collectives and the main interface's reverse
 feature exchanges retain both direct electrostatic forces and the response
 of learned moments to geometry. LAMMPS reverses ghost-coordinate forces to
 their owners. Ghost copies never enter the global source sum; the current
 owner map and source values are rebuilt after migration and sorting.
 
 The supported MFF scope is one node, one rank per K100, a single communicator
-and nonempty owned domains, matching the native `main` interface. FFTs and
-spectral geometry remain replicated on each rank. At a fixed global grid,
-that work limits strong scaling even though atom-dependent work is divided
-and amplitude communication replaces atom replication. Full real-space Ewald, dispersion,
+and nonempty owned domains, matching the native `main` interface. Multipole
+FFTs and spectral geometry are partitioned across ranks when the mesh y axis
+has at least as many points as the process group. The default `auto` policy
+also requires at least 1,048,576 real mesh values across all source channels
+and Cartesian components, avoiding extra collectives on tiny transforms.
+Smaller work, smaller y axes and single ranks use the replicated path.
+`ICTC_MFF_MULTIPOLE_FFT=slabs` bypasses the work threshold;
+`ICTC_MFF_MULTIPOLE_FFT=replicated` selects the previous Fourier-amplitude
+reduction implementation for comparison. The slab
+collectives and their adjoints support mixed second derivatives. Local
+assignment still uses a full transient mesh buffer on each rank.
+Full real-space Ewald, dispersion,
 multi-node operation, pressure/NPT and long-trajectory stability are outside
 this qualification; the existing Kokkos virial flag remains unchanged.
 
@@ -436,19 +446,24 @@ rebuilding on every step and all communication. The median of three
 five-step means follows three warmup steps; bars show the range of means.
 Compilation and export are excluded. Execution is eager FP32 with TF32 off.
 The dashed line denotes ideal strong scaling.
+The short-range and scalar series retain the earlier measurements of their
+unchanged paths; the multipole series was remeasured with distributed FFTs.
 
 - Monopoles: 571 → 127 ms/step from one to eight GPUs, 4.51× speedup and
   56.3% parallel efficiency. Eight-GPU throughput is 517,000 atom-steps/s.
-- Adding dipoles: 710 → 261 ms/step, 2.72× speedup and 34.0% efficiency.
-- Adding quadrupoles: 988 → 540 ms/step, 1.83× speedup and 22.9% efficiency.
-  Eight-GPU throughput is 121,000 atom-steps/s. Maximum per-rank PyTorch
-  allocation falls from 12.01 to 3.16 GiB; external runtime buffers are excluded.
+- Adding dipoles: 709 → 146 ms/step, 4.86× speedup and 60.8% efficiency.
+  Eight-GPU throughput is 450,000 atom-steps/s.
+- Adding quadrupoles: 984 → 207 ms/step, 4.76× speedup and 59.5% efficiency.
+  Eight-GPU throughput is 317,000 atom-steps/s. Maximum per-rank PyTorch
+  allocation falls from 12.01 to 2.43 GiB; external runtime buffers are excluded.
 - The matched short-range backbone takes 552 → 112 ms/step, 4.91× speedup.
 
-The diminishing multipole speedup is consistent with the replicated FFT and
-spectral work. Communication avoids gathering global atom/source arrays,
-but the full FFT does not shrink with the owned atom count. Distributed
-FFTs are required to remove that scaling limit.
+In a same-job eight-GPU control, the previous replicated quadrupole path
+takes 540.14 ms/step versus 206.74 ms/step with slab FFTs, a 2.61× improvement.
+The earlier eight-GPU efficiency was 22.9%; dividing the FFT and spectral
+work raises it to 59.5%. Peak PyTorch allocation also drops from 3.16 to
+2.43 GiB/GPU. These results cover the fixed global grid above; they do not
+imply ideal scaling for arbitrary mesh aspect ratios or source counts.
 
 Validation uses separate C8/lmax=2/two-interaction/correlation=1 models,
 two source channels and a 16×20×24 mesh in a triclinic periodic cell.
@@ -459,10 +474,16 @@ absolute error. Two eight-GPU mixed isolated/connected-domain cases also
 pass. The long-range force change is of the same order as the total force
 in these checks, so zero-initialized heads cannot hide a missing contribution.
 
-An independent 28-case source/partition/rank/constant-domain check matches
-FP64 reference forces and mixed second derivatives. Deliberately detaching
+An independent 44-case source/partition/mesh/rank/constant-domain check matches
+FP64 reference forces and mixed second derivatives, including slab boundaries,
+odd dimensions, uneven slabs and the small-axis fallback. Nine direct
+distributed-FFT checks additionally verify spectra, adjoints and mixed
+Hessians with multiple batches/channels and axes shorter than the rank count.
+Deliberately detaching
 geometry-dependent moments produces large force errors, confirming that
-source response is exercised. The public `mff-lammps` bootstrap additionally
-completes an eight-GPU six-step run. These checks establish implementation
+source response is exercised. The default automatic policy is checked on
+both the small qualification grid and the large performance grid. The public
+`mff-lammps` bootstrap additionally completes an eight-GPU run on 65,536 atoms
+using the distributed path. These checks establish implementation
 consistency on the selected grids; they do not establish trained-potential
 accuracy or long-trajectory stability.

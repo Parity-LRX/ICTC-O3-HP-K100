@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Owned-source reciprocal electrostatics for the native MFF/RCCL runtime.
 
-FFTs are replicated, while atoms, learned moments and their coordinate
-derivatives remain partitioned. Only summed Fourier amplitudes travel between
-GPUs. The reverse collective retains the learned-source force contribution.
+Supports slab-distributed multipole FFTs alongside the replicated baseline.
+Atoms, learned moments and their coordinate derivatives stay partitioned.
+Differentiable collectives retain the learned-source force contribution.
 """
+import os
 import torch
 import torch.distributed as dist
 
@@ -32,11 +33,18 @@ class NativeReciprocal:
             raise ValueError('Native MFF requires reciprocal-only electrostatics; exact real-space Ewald is unsupported')
         self.module = module
         self.calls = 0
+        self.fft_policy = os.environ.get('ICTC_MFF_MULTIPOLE_FFT', 'auto')
+        if self.fft_policy not in ('auto', 'replicated', 'slabs'):
+            raise ValueError('ICTC_MFF_MULTIPOLE_FFT must be auto, replicated or slabs')
         self.description = dict(backend='native-hip-reciprocal',
             mesh_size=module.kernel.mesh_size, assignment=module.kernel.assignment,
             smearing_sigma=module.kernel.smearing_sigma, boundary=module.kernel.boundary,
             source_channels=module.source_channels, counting='owned atoms only',
-            transport='RCCL Fourier-amplitude sum and reverse sum', fft='replicated per rank')
+            transport=('RCCL differentiable mesh and spectral collectives'
+                       if self.fft_policy != 'replicated' else 'RCCL Fourier-amplitude sum and reverse sum'),
+            fft=self.fft_policy,
+            fft_min_elements=1 << 20,
+            fft_fallback='single rank, scalar potential, small work in auto, or my < ranks uses replicated transforms')
 
     def __call__(self, pos, batch, cell, q, dipole, quadrupole, *, owned, size):
         from mace_ictc.models.long_range import _prepare_frac_for_boundary_batched
@@ -58,9 +66,22 @@ class NativeReciprocal:
                 total = reduce(total)
             q = q - total / counts[:, None]
         position, graph = pos[:owned], batch[:owned]
+        self.description['fft_selected'] = 'replicated'
         if dipole is not None or quadrupole is not None:
-            energy = multipole_energy(kernel, position, graph, cell, q, dipole, quadrupole,
-                                      reduce_amplitudes=reduce, graph_counts=counts)
+            components = 1 + 3 * (dipole is not None) + 9 * (quadrupole is not None)
+            mx, my, mz = kernel.mesh_shape
+            # Extra collectives dominate very small transforms. The work
+            # estimate includes all source channels and Cartesian components.
+            enough_work = mx * my * mz * q.shape[1] * components >= 1 << 20
+            use_slabs = self.fft_policy == 'slabs' or (self.fft_policy == 'auto' and enough_work)
+            if use_slabs and size > 1 and my >= size:
+                from .mff_reciprocal_slabs import multipole_energy as slab_energy
+                self.description['fft_selected'] = 'slabs'
+                energy = slab_energy(kernel, position, graph, cell, q, dipole, quadrupole,
+                    size=size, rank=dist.get_rank(), counts=counts, reduce_energy=reduce)
+            else:
+                energy = multipole_energy(kernel, position, graph, cell, q, dipole, quadrupole,
+                                          reduce_amplitudes=reduce, graph_counts=counts)
         else:
             frac = _prepare_frac_for_boundary_batched(position, graph, cell,
                 boundary=kernel.boundary, slab_padding_factor=kernel.slab_padding_factor)

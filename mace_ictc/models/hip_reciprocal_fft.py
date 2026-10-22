@@ -9,7 +9,7 @@ import math
 import torch
 
 
-def geometry(kernel, cell, dtype, *, exclude_k0):
+def geometry(kernel, cell, dtype, *, exclude_k0, y_slice=None):
     from .long_range import (_effective_cell_for_boundary, _fft_integer_frequencies,
                              _inverse_3x3, _det_3x3, _safe_vector_norm)
     mx, my, mz = kernel.mesh_shape
@@ -17,6 +17,8 @@ def geometry(kernel, cell, dtype, *, exclude_k0):
                     slab_padding_factor=kernel.slab_padding_factor, dtype=dtype)
     fx = _fft_integer_frequencies(mx, device=cell.device, dtype=dtype)
     fy = _fft_integer_frequencies(my, device=cell.device, dtype=dtype)
+    if y_slice is not None:
+        fy = fy[y_slice]
     z = torch.arange(mz // 2 + 1, device=cell.device, dtype=dtype)
     if mz % 2 == 0:
         z = torch.where(z == mz // 2, -z, z)
@@ -31,6 +33,8 @@ def geometry(kernel, cell, dtype, *, exclude_k0):
     kn = 2. * math.pi * torch.einsum('kd,bdh->bkh', negative, inverse)
     volume = _det_3x3(effective).abs().clamp_min(kernel.k_norm_floor)
     window = kernel._build_assignment_window(device=cell.device, dtype=dtype)[..., :mz//2+1]
+    if y_slice is not None:
+        window = window[:, y_slice, :]
     deconv = window.reshape(1, -1).clamp_min(kernel.assignment_window_floor).square().reciprocal()
     real_cutoff = alpha = None
     if kernel.full_ewald:
@@ -46,7 +50,7 @@ def geometry(kernel, cell, dtype, *, exclude_k0):
         return value
     interior = torch.arange(mz//2+1, device=cell.device)
     interior = (interior > 0) & ((interior < mz//2) if mz % 2 == 0 else torch.ones_like(interior,dtype=torch.bool))
-    interior = interior[None, None, :].expand(mx, my, -1).reshape(1, -1)
+    interior = interior[None, None, :].expand(mx, fy.numel(), -1).reshape(1, -1)
     return kp, kn, spectral(kp), spectral(kn), interior, alpha, volume, real_cutoff
 
 
@@ -81,16 +85,28 @@ def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole,
     # A bounded grid transpose is cheaper than strided plane access per lane.
     mesh = kernel._spread(frac, batch, packed, cell.shape[0]).permute(0,4,1,2,3).contiguous()
     transformed = torch.fft.rfftn(mesh, dim=(-3,-2,-1)).flatten(2).transpose(1,2)
-    kp, kn, sp, sn, interior, _, _, _ = geometry(kernel, cell, pos.dtype, exclude_k0=True)
+    graph_energy = multipole_spectral_energy(kernel, transformed, cell, channels,
+        has_dipole=dipole is not None, has_quadrupole=quadrupole is not None,
+        reduce_amplitudes=reduce_amplitudes)
+    counts = kernel._graph_counts(batch, cell, dtype=source.dtype) if graph_counts is None else graph_counts
+    return (graph_energy.index_select(0,batch)/counts.index_select(0,batch))[:,None]
+
+
+def multipole_spectral_energy(kernel, transformed, cell, channels, *,
+                             has_dipole, has_quadrupole,
+                             reduce_amplitudes=None, y_slice=None):
+    """Energy of a complete spectrum or a disjoint slab along its y axis."""
+    kp, kn, sp, sn, interior, _, _, _ = geometry(kernel, cell,
+        transformed.real.dtype, exclude_k0=True, y_slice=y_slice)
     def amplitude(spectrum, k):
         scalar = spectrum[:, :, :channels]
         real, imag = scalar.real, scalar.imag
-        if dipole is not None:
+        if has_dipole:
             mu = spectrum[:, :, channels:4*channels].reshape(cell.shape[0],-1,channels,3)
             value = torch.einsum('bkx,bksx->bks',k.to(mu.dtype),mu)
             real, imag = real - value.imag, imag + value.real
-        if quadrupole is not None:
-            offset = channels * (4 if dipole is not None else 1)
+        if has_quadrupole:
+            offset = channels * (4 if has_dipole else 1)
             quad = spectrum[:, :, offset:offset+9*channels].reshape(cell.shape[0],-1,channels,3,3)
             kc = k.to(quad.dtype)
             value = torch.einsum('bkx,bksxy,bky->bks',kc,quad,kc)
@@ -108,6 +124,4 @@ def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole,
         negative = negative.square().sum(-1)
     density = sp[:, :, None] * positive
     density = density + (sn * interior)[:, :, None] * negative
-    graph_energy = .5 * density.sum(dim=(1,2))
-    counts = kernel._graph_counts(batch, cell, dtype=source.dtype) if graph_counts is None else graph_counts
-    return (graph_energy.index_select(0,batch)/counts.index_select(0,batch))[:,None]
+    return .5 * density.sum(dim=(1,2))
