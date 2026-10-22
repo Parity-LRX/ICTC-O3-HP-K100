@@ -170,6 +170,17 @@ def _load(checkpoint, metadata, device):
         inference_message_layout="degree", gate_cache_bytes=0, inference_gate_adjoint_rows=16384,
         inference_gemm_policy="dtk2604", inference_message_adjoint_edges=32768,
         inference_basis_fusion=True, species_linear_schedule="grouped", electrostatics_backend="hip")
+    if metadata["inference_mode"] == "capacity":
+        # Frozen radial prefixes can recompute their SiLU activations during
+        # coordinate backpropagation instead of retaining every edge/hidden
+        # activation for every interaction. Keep this local to native MFF;
+        # no feature or reciprocal collective is replayed by the checkpoint.
+        for module in model.modules():
+            if hasattr(module, "_radial_checkpoint"):
+                module._radial_checkpoint = True
+                module._radial_chunk_rows = 32768
+        plan["radial_checkpoint"] = True
+        plan["radial_chunk_rows"] = 32768
     if e0_keys is None:
         e0_keys = potential.wrapper.atomic_energy_keys.tolist()
         e0_values = potential.wrapper.atomic_energy_values.tolist()
@@ -197,8 +208,22 @@ class _Runtime:
         self.calls = 0
         self.exchanges = 0
         self.graph = {}
+        self.capacity_reclaim = False
 
     def energy(self, pos, atomic, batch, src, dst, shifts, cell, vectors, owned, owners, rank, size):
+        if not self.foundation and self.metadata["inference_mode"] == "capacity":
+            total = torch.cuda.get_device_properties(pos.device).total_memory
+            self.capacity_reclaim |= torch.cuda.max_memory_allocated(pos.device) > .75 * total
+            if self.capacity_reclaim:
+                # Neighbor counts change between steps. Reclaim completed
+                # Python wrappers and idle allocator blocks before another
+                # large force graph, rather than carrying incompatible cached
+                # block sizes into its peak. Live tensors are unaffected.
+                import gc
+                torch.cuda.synchronize(pos.device)
+                gc.collect()
+                torch.cuda.empty_cache()
+            self.plan["capacity_reclaim_active"] = self.capacity_reclaim
         if not self.sorted_checked:
             if not bool(torch.all(dst[1:] >= dst[:-1])):
                 raise ValueError("Native MFF requires destination-sorted edges")

@@ -47,6 +47,39 @@ class _Transpose(torch.autograd.Function):
         return _Transpose.apply(gradient)
 
 
+class _PackY(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, size):
+        batch, channels, nx, my, hz = value.shape
+        ctx.my = my
+        width = (my + size - 1) // size
+        out = value.new_zeros((size,batch,channels,nx,width,hz))
+        for rank in range(size):
+            begin, end = rank * my // size, (rank + 1) * my // size
+            out[rank,:,:,:,:end-begin,:].copy_(value[...,begin:end,:])
+        return out
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return _UnpackY.apply(gradient,ctx.my), None
+
+
+class _UnpackY(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, my):
+        size,batch,channels,nx,_,hz = value.shape
+        ctx.size = size
+        out = value.new_empty((batch,channels,nx,my,hz))
+        for rank in range(size):
+            begin, end = rank * my // size, (rank + 1) * my // size
+            out[...,begin:end,:].copy_(value[rank,:,:,:,:end-begin,:])
+        return out
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return _PackY.apply(gradient,ctx.size), None
+
+
 def transform(mesh, *, size, rank):
     """Return [B,C,mx,local_y,mz//2+1] and the global y slice.
 
@@ -61,6 +94,14 @@ def transform(mesh, *, size, rank):
     pieces = xpad.reshape(batch, channels, size, nx, my, mz)
     pieces = pieces.permute(2, 0, 1, 3, 4, 5).reshape(size * batch, channels, nx, my, mz)
     local = _ReduceScatter.apply(pieces)
+    return transform_local(local, mesh_shape=(mx,my,mz), size=size, rank=rank)
+
+
+def transform_local(local, *, mesh_shape, size, rank):
+    """Transform an already summed x slab without a global real mesh."""
+    batch, channels, nx, my, mz = local.shape
+    mx = mesh_shape[0]
+    ny = (my + size - 1) // size
     yz = torch.fft.rfftn(local, dim=(-2, -1))
     if my % size == 0:
         pieces = yz.reshape(batch, channels, nx, size, ny, mz // 2 + 1)
@@ -68,14 +109,29 @@ def transform(mesh, *, size, rank):
     else:
         # Balanced intervals keep every slab nonempty even when ceil(my/P)
         # would leave trailing ranks beyond the physical grid.
-        intervals = [(r * my // size, (r + 1) * my // size) for r in range(size)]
-        pieces = torch.stack([functional.pad(yz[..., begin:end, :],
-            (0, 0, 0, ny - (end - begin))) for begin, end in intervals])
+        pieces = _PackY.apply(yz,size)
     received = torch.view_as_complex(_Transpose.apply(torch.view_as_real(pieces)))
     local = received.permute(1, 2, 0, 3, 4, 5).reshape(batch, channels, nx * size, ny, mz // 2 + 1)
     start, stop = rank * my // size, (rank + 1) * my // size
     local = local[:, :, :mx, :stop-start, :]
     return torch.fft.fft(local, dim=2), slice(start, stop)
+
+
+def inverse_local(spectrum, *, mesh_shape, size, rank):
+    """Invert a local y-frequency slab into its real-space x slab."""
+    mx, my, mz = mesh_shape
+    batch, channels = spectrum.shape[:2]
+    nx, ny = (mx + size - 1) // size, (my + size - 1) // size
+    width = (rank + 1) * my // size - rank * my // size
+    local = torch.fft.ifft(spectrum, dim=2)
+    local = functional.pad(local, (0, 0, 0, ny-width, 0, nx*size-mx))
+    pieces = local.reshape(batch,channels,size,nx,ny,mz//2+1).permute(2,0,1,3,4,5).contiguous()
+    received = torch.view_as_complex(_Transpose.apply(torch.view_as_real(pieces)))
+    if my % size == 0:
+        yz = received.permute(1,2,3,0,4,5).reshape(batch,channels,nx,my,mz//2+1)
+    else:
+        yz = _UnpackY.apply(received,my)
+    return torch.fft.irfftn(yz, s=(my,mz),dim=(-2,-1))
 
 
 def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole,

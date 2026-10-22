@@ -32,9 +32,14 @@ def geometry(kernel, cell, dtype, *, exclude_k0, y_slice=None):
     kp = 2. * math.pi * torch.einsum('kd,bdh->bkh', positive, inverse)
     kn = 2. * math.pi * torch.einsum('kd,bdh->bkh', negative, inverse)
     volume = _det_3x3(effective).abs().clamp_min(kernel.k_norm_floor)
-    window = kernel._build_assignment_window(device=cell.device, dtype=dtype)[..., :mz//2+1]
-    if y_slice is not None:
-        window = window[:, y_slice, :]
+    if y_slice is None:
+        window = kernel._build_assignment_window(device=cell.device, dtype=dtype)[..., :mz//2+1]
+    else:
+        from .long_range import _assignment_window_1d
+        windows = [_assignment_window_1d(mesh_size=size, assignment=kernel.assignment,
+            device=cell.device, dtype=dtype) for size in (mx, my, mz)]
+        window = (windows[0][:, None, None] * windows[1][y_slice][None, :, None]
+                  * windows[2][:mz//2+1][None, None, :])
     deconv = window.reshape(1, -1).clamp_min(kernel.assignment_window_floor).square().reciprocal()
     real_cutoff = alpha = None
     if kernel.full_ewald:
@@ -69,32 +74,44 @@ def scalar_potential(kernel, mesh, cell, *, reduce_spectrum=None):
     return (filtered * float(mx*my*mz)).permute(0,2,3,4,1), alpha, volume, cutoff
 
 
-def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole,
-                     *, reduce_amplitudes=None, graph_counts=None):
-    from .long_range import _prepare_frac_for_boundary_batched
-    frac = _prepare_frac_for_boundary_batched(pos, batch, cell,
-                boundary=kernel.boundary, slab_padding_factor=kernel.slab_padding_factor)
+def pack_moments(source, dipole, quadrupole, *, compact_quadrupole=False):
+    """Pack Cartesian fields, optionally using the six exact Q combinations."""
     n, channels = source.shape
     fields = [source]
     if dipole is not None:
         fields.append(dipole.reshape(n, channels * 3))
     if quadrupole is not None:
-        fields.append(quadrupole.reshape(n, channels * 9))
-    packed = torch.cat(fields, dim=1) if len(fields)>1 else source
+        if compact_quadrupole:
+            q = quadrupole
+            compact = torch.stack((q[...,0,0],q[...,1,1],q[...,2,2],
+                q[...,0,1]+q[...,1,0],q[...,0,2]+q[...,2,0],q[...,1,2]+q[...,2,1]),dim=-1)
+            fields.append(compact.reshape(n, channels * 6))
+        else:
+            fields.append(quadrupole.reshape(n, channels * 9))
+    return torch.cat(fields, dim=1) if len(fields)>1 else source
+
+
+def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole,
+                     *, reduce_amplitudes=None, graph_counts=None, compact_quadrupole=False):
+    from .long_range import _prepare_frac_for_boundary_batched
+    frac = _prepare_frac_for_boundary_batched(pos, batch, cell,
+                boundary=kernel.boundary, slab_padding_factor=kernel.slab_padding_factor)
+    channels = source.shape[1]
+    packed = pack_moments(source,dipole,quadrupole,compact_quadrupole=compact_quadrupole)
     # Assignment and its coordinate/mixed adjoints coalesce source channels.
     # A bounded grid transpose is cheaper than strided plane access per lane.
     mesh = kernel._spread(frac, batch, packed, cell.shape[0]).permute(0,4,1,2,3).contiguous()
     transformed = torch.fft.rfftn(mesh, dim=(-3,-2,-1)).flatten(2).transpose(1,2)
     graph_energy = multipole_spectral_energy(kernel, transformed, cell, channels,
         has_dipole=dipole is not None, has_quadrupole=quadrupole is not None,
-        reduce_amplitudes=reduce_amplitudes)
+        reduce_amplitudes=reduce_amplitudes,compact_quadrupole=compact_quadrupole)
     counts = kernel._graph_counts(batch, cell, dtype=source.dtype) if graph_counts is None else graph_counts
     return (graph_energy.index_select(0,batch)/counts.index_select(0,batch))[:,None]
 
 
 def multipole_spectral_energy(kernel, transformed, cell, channels, *,
                              has_dipole, has_quadrupole,
-                             reduce_amplitudes=None, y_slice=None):
+                             reduce_amplitudes=None, y_slice=None, compact_quadrupole=False):
     """Energy of a complete spectrum or a disjoint slab along its y axis."""
     kp, kn, sp, sn, interior, _, _, _ = geometry(kernel, cell,
         transformed.real.dtype, exclude_k0=True, y_slice=y_slice)
@@ -107,9 +124,15 @@ def multipole_spectral_energy(kernel, transformed, cell, channels, *,
             real, imag = real - value.imag, imag + value.real
         if has_quadrupole:
             offset = channels * (4 if has_dipole else 1)
-            quad = spectrum[:, :, offset:offset+9*channels].reshape(cell.shape[0],-1,channels,3,3)
-            kc = k.to(quad.dtype)
-            value = torch.einsum('bkx,bksxy,bky->bks',kc,quad,kc)
+            if compact_quadrupole:
+                quad = spectrum[:, :, offset:offset+6*channels].reshape(cell.shape[0],-1,channels,6)
+                x, y, z = k.unbind(-1)
+                weights = torch.stack((x*x,y*y,z*z,x*y,x*z,y*z),dim=-1)
+                value = torch.einsum('bkx,bksx->bks',weights.to(quad.dtype),quad)
+            else:
+                quad = spectrum[:, :, offset:offset+9*channels].reshape(cell.shape[0],-1,channels,3,3)
+                kc = k.to(quad.dtype)
+                value = torch.einsum('bkx,bksxy,bky->bks',kc,quad,kc)
             real, imag = real - .5 * value.real, imag - .5 * value.imag
         if reduce_amplitudes is not None:
             return torch.stack((real, imag), dim=-1)

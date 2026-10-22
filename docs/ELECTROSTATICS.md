@@ -402,14 +402,21 @@ runtime and evaluates the complete reciprocal contribution inside autograd.
 
 Each rank predicts moments only for its owned prefix. Global charge
 neutralization uses the physical atom count and a summed owned charge.
-Local B-spline assignment forms the mesh contribution from owned sources.
-Multipoles use RCCL reduce-scatter to sum real-space x slabs, local y/z real
-FFTs, an all-to-all transpose into y slabs, and local x FFTs. Each rank then
-evaluates only its spectral slab; a scalar energy reduction completes the
-uniform per-atom partition. Both folded Nyquist partners are retained for
-triclinic or mixed even/odd grids. Uneven slab widths use padded communication
-buffers; the physical FFT dimensions remain unchanged. Scalar potential-based
-per-atom energy partitioning retains the replicated-transform path.
+Owned sources and fractional coordinates are routed only to the x slabs touched
+by their B-spline stencil. Native HIP assignment writes directly into the local
+slab, retaining the global mesh spacing and derivatives. Local y/z real FFTs,
+an all-to-all transpose into y slabs, and local x FFTs distribute the spectral
+work. Multipoles sum local spectral energies. Scalar potentials additionally
+use distributed inverse FFTs; partial stencil potentials return to their atom
+owners, preserving the original per-atom energy partition.
+
+Quadrupoles use the six exact combinations
+`Qxx, Qyy, Qzz, Qxy+Qyx, Qxz+Qzx, Qyz+Qzy` with coefficients
+`kx², ky², kz², kx*ky, kx*kz, ky*kz`. This removes three FFT fields per source
+channel without assuming symmetry or a zero trace. The single-GPU native MFF
+path uses the same compact representation. Both folded Nyquist partners remain
+explicit for triclinic or mixed even/odd grids. Uneven slabs use padded
+communication buffers; physical FFT dimensions remain unchanged.
 
 The reverse slab/charge collectives and the main interface's reverse
 feature exchanges retain both direct electrostatic forces and the response
@@ -421,14 +428,39 @@ The supported MFF scope is one node, one rank per K100, a single communicator
 and nonempty owned domains, matching the native `main` interface. Multipole
 FFTs and spectral geometry are partitioned across ranks when the mesh y axis
 has at least as many points as the process group. The default `auto` policy
-also requires at least 1,048,576 real mesh values across all source channels
-and Cartesian components, avoiding extra collectives on tiny transforms.
-Smaller work, smaller y axes and single ranks use the replicated path.
-`ICTC_MFF_MULTIPOLE_FFT=slabs` bypasses the work threshold;
-`ICTC_MFF_MULTIPOLE_FFT=replicated` selects the previous Fourier-amplitude
-reduction implementation for comparison. The slab
-collectives and their adjoints support mixed second derivatives. Local
-assignment still uses a full transient mesh buffer on each rank.
+requires at least 1,048,576 real mesh values across source channels and packed
+Cartesian components for multipoles. Scalar potentials use a higher threshold
+of 8,388,608 values because they need inverse transforms and a potential return
+exchange. Smaller work, smaller y axes and single ranks use the replicated
+path. `ICTC_MFF_MULTIPOLE_FFT=particles` bypasses the work threshold;
+`slabs` selects the previous full-mesh reduce-scatter implementation, and
+`replicated` selects the original Fourier-amplitude reduction path.
+The communication adjoints support mixed second derivatives. The routed path
+allocates neither a full real-space mesh, a full assignment window nor a global
+atom/source array on any rank.
+
+Native `capacity` mode additionally recomputes frozen radial MLP activations
+during coordinate backpropagation. Forward evaluation and the coordinate VJP
+use chunks of 32,768 edges, bounding temporary hidden activations for arbitrary
+radial widths and depths. The full radial output required by the message
+operator is retained. Only local radial operations are replayed; feature and
+reciprocal collectives execute once in each direction. Parameters, model
+equations and FP32 arithmetic are retained. The `performance` mode keeps
+these activations to avoid the recomputation cost. Trainable radial parameters
+retain the existing autograd/checkpoint path.
+Once the observed PyTorch allocation peak exceeds 75% of device memory,
+capacity mode also synchronizes between force graphs and reclaims completed
+Python wrappers and idle allocator blocks before the next graph. This limits
+the effect of changing neighbor counts on large temporary allocations. Its
+cost is included in the capacity-mode MD timings.
+
+Select this mode when exporting the native core:
+
+```bash
+mff-export-core --checkpoint electrostatic.pth --elements H C O \
+  --inference-mode capacity --out core-capacity.pt
+```
+
 Full real-space Ewald, dispersion,
 multi-node operation, pressure/NPT and long-trajectory stability are outside
 this qualification; the existing Kokkos virial flag remains unchanged.
@@ -446,39 +478,47 @@ rebuilding on every step and all communication. The median of three
 five-step means follows three warmup steps; bars show the range of means.
 Compilation and export are excluded. Execution is eager FP32 with TF32 off.
 The dashed line denotes ideal strong scaling.
-The short-range and scalar series retain the earlier measurements of their
-unchanged paths; the multipole series was remeasured with distributed FFTs.
+Only the unchanged short-range series retains earlier measurements. Scalar
+and multipole paths were remeasured; the single-GPU quadrupole baseline uses
+the same six-component representation as the distributed path.
 
-- Monopoles: 571 → 127 ms/step from one to eight GPUs, 4.51× speedup and
-  56.3% parallel efficiency. Eight-GPU throughput is 517,000 atom-steps/s.
-- Adding dipoles: 709 → 146 ms/step, 4.86× speedup and 60.8% efficiency.
-  Eight-GPU throughput is 450,000 atom-steps/s.
-- Adding quadrupoles: 984 → 207 ms/step, 4.76× speedup and 59.5% efficiency.
-  Eight-GPU throughput is 317,000 atom-steps/s. Maximum per-rank PyTorch
-  allocation falls from 12.01 to 2.43 GiB; external runtime buffers are excluded.
+- Monopoles: 566 → 127 ms/step from one to eight GPUs, 4.46× speedup and
+  55.7% parallel efficiency. Eight-GPU throughput is 516,000 atom-steps/s.
+- Adding dipoles: 707 → 140 ms/step, 5.04× speedup and 63.0% efficiency.
+  Eight-GPU throughput is 467,000 atom-steps/s.
+- Adding quadrupoles: 876 → 168 ms/step, 5.21× speedup and 65.1% efficiency.
+  Eight-GPU throughput is 390,000 atom-steps/s. Maximum per-rank PyTorch
+  allocation falls from 12.01 to 2.41 GiB; external runtime buffers are excluded.
 - The matched short-range backbone takes 552 → 112 ms/step, 4.91× speedup.
 
-In a same-job eight-GPU control, the previous replicated quadrupole path
-takes 540.14 ms/step versus 206.74 ms/step with slab FFTs, a 2.61× improvement.
-The earlier eight-GPU efficiency was 22.9%; dividing the FFT and spectral
-work raises it to 59.5%. Peak PyTorch allocation also drops from 3.16 to
-2.43 GiB/GPU. These results cover the fixed global grid above; they do not
+In a same-job eight-GPU control, full-mesh slab assignment takes 207.25 ms/step
+versus 168.14 ms/step with bounded source routing, a 1.23× improvement. A
+single-GPU control improves from 981.57 to 875.65 ms/step using the compact
+quadrupole representation. The original replicated eight-GPU FFT path took
+540 ms/step. These results cover the fixed global grid above; they do not
 imply ideal scaling for arbitrary mesh aspect ratios or source counts.
 
 Validation uses separate C8/lmax=2/two-interaction/correlation=1 models,
 two source channels and a 16×20×24 mesh in a triclinic periodic cell.
 All three moment orders pass at 1/2/4/8 GPUs before and after motion and
 sorting; every multi-GPU dense case exercises owned-atom migration. Complete force vectors agree with the same-model,
-same-grid Torch reference within `6.4e-6` relative L2 and `9e-7` maximum
-absolute error. Two eight-GPU mixed isolated/connected-domain cases also
+same-grid Torch reference within `6.4e-6` relative L2 and `1e-6` maximum
+absolute error. Eight-GPU mixed isolated/connected-domain cases also
 pass. The long-range force change is of the same order as the total force
 in these checks, so zero-initialized heads cannot hide a missing contribution.
 
-An independent 44-case source/partition/mesh/rank/constant-domain check matches
+An independent 48-case source/partition/mesh/rank/constant-domain check matches
 FP64 reference forces and mixed second derivatives, including slab boundaries,
 odd dimensions, uneven slabs and the small-axis fallback. Nine direct
 distributed-FFT checks additionally verify spectra, adjoints and mixed
 Hessians with multiple batches/channels and axes shorter than the rank count.
+These checks include both forward and inverse distributed transforms. A
+24-case native assignment check verifies bounded x slabs, both channel layouts,
+CIC/TSC/PCS, periodic/slab boundaries and mixed second derivatives. Capacity
+mode also passes 1/2/4/8-GPU whole-model force checks with radial recomputation.
+Eight direct frozen-radial checks cover multiple widths and depths, hidden and
+full outputs, biases, coordinate VJPs and mixed second derivatives; a separate
+trainable-parameter check verifies the fallback path.
 Deliberately detaching
 geometry-dependent moments produces large force errors, confirming that
 source response is exercised. The default automatic policy is checked on
@@ -487,3 +527,36 @@ both the small qualification grid and the large performance grid. The public
 using the distributed path. These checks establish implementation
 consistency on the selected grids; they do not establish trained-potential
 accuracy or long-trajectory stability.
+
+### Eight-GPU capacity
+
+![Measured memory growth and twenty-step capacity of native long-range MFF on eight K100 GPUs.](assets/electrostatics-capacity-k100.svg)
+
+One node with eight K100 GPUs, each with 63.98 GiB of physical memory.
+The model uses C64/lmax=2/two interactions/correlation=3, H/C/O,
+a 4.5 Å cutoff, PCS, sigma=1 Å and one source channel with monopoles,
+dipoles and quadrupoles. Density stays at 0.125 atoms/Å³ and mesh spacing
+at 0.5 Å as the box grows. The measured neighbor count is about 51 per atom.
+Execution is eager FP32 with TF32 off; sorting and neighbor rebuilding occur
+every step. The models have random weights and nonzero long-range heads.
+
+- Performance mode: 2,885,794 atoms pass 20 MD steps, averaging 5.547 s/step
+  and 520,207 atom-steps/s. Maximum per-rank PyTorch allocation is 57.00 GiB.
+  The next tested size, 2,963,088 atoms, runs out of memory.
+- Capacity mode: 5,030,912 atoms pass 20 MD steps, averaging 15.833 s/step
+  and 317,753 atom-steps/s. Maximum per-rank PyTorch allocation is 52.66 GiB.
+  The next tested size, 5,142,706 atoms, runs out of memory.
+
+The confirmed meshes are 452×452×904 and 544×544×1088, respectively.
+An independent exact-three-million-atom case, using a 400×400×1200 mesh,
+also passes 20 MD steps at 7.775 s/step. Chunking its radial prefix reduces
+the measured PyTorch peak from 38.49 to 31.71 GiB/GPU.
+
+These are the highest confirmed points in the `(k,k,2k)` lattice family;
+box geometry, FFT workspaces, neighbor counts and allocator pressure affect
+practical limits. Capacity timings are one twenty-step mean after the initial
+energy-and-force evaluation. The memory curves include shorter successful
+scans below each confirmed limit; the bars require twenty steps. Memory values
+cover initialization and every evaluated force graph, taking the largest
+PyTorch allocation across ranks. Kokkos, RCCL, driver and vendor allocations
+are excluded, so the observed OOM outcomes define the capacity bracket.

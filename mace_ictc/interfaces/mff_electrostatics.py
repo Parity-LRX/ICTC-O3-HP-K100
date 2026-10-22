@@ -34,8 +34,8 @@ class NativeReciprocal:
         self.module = module
         self.calls = 0
         self.fft_policy = os.environ.get('ICTC_MFF_MULTIPOLE_FFT', 'auto')
-        if self.fft_policy not in ('auto', 'replicated', 'slabs'):
-            raise ValueError('ICTC_MFF_MULTIPOLE_FFT must be auto, replicated or slabs')
+        if self.fft_policy not in ('auto', 'replicated', 'slabs', 'particles'):
+            raise ValueError('ICTC_MFF_MULTIPOLE_FFT must be auto, replicated, slabs or particles')
         self.description = dict(backend='native-hip-reciprocal',
             mesh_size=module.kernel.mesh_size, assignment=module.kernel.assignment,
             smearing_sigma=module.kernel.smearing_sigma, boundary=module.kernel.boundary,
@@ -44,7 +44,8 @@ class NativeReciprocal:
                        if self.fft_policy != 'replicated' else 'RCCL Fourier-amplitude sum and reverse sum'),
             fft=self.fft_policy,
             fft_min_elements=1 << 20,
-            fft_fallback='single rank, scalar potential, small work in auto, or my < ranks uses replicated transforms')
+            scalar_fft_min_elements=1 << 23,
+            fft_fallback='single rank, small work in auto, or my < ranks uses replicated transforms')
 
     def __call__(self, pos, batch, cell, q, dipole, quadrupole, *, owned, size):
         from mace_ictc.models.long_range import _prepare_frac_for_boundary_batched
@@ -67,21 +68,28 @@ class NativeReciprocal:
             q = q - total / counts[:, None]
         position, graph = pos[:owned], batch[:owned]
         self.description['fft_selected'] = 'replicated'
-        if dipole is not None or quadrupole is not None:
-            components = 1 + 3 * (dipole is not None) + 9 * (quadrupole is not None)
-            mx, my, mz = kernel.mesh_shape
-            # Extra collectives dominate very small transforms. The work
-            # estimate includes all source channels and Cartesian components.
-            enough_work = mx * my * mz * q.shape[1] * components >= 1 << 20
-            use_slabs = self.fft_policy == 'slabs' or (self.fft_policy == 'auto' and enough_work)
-            if use_slabs and size > 1 and my >= size:
+        components = 1 + 3 * (dipole is not None) + 6 * (quadrupole is not None)
+        mx, my, mz = kernel.mesh_shape
+        # A scalar potential requires an inverse FFT and a second particle
+        # exchange; use a higher threshold for that latency-sensitive path.
+        threshold = (1 << 23) if components == 1 else (1 << 20)
+        enough_work = mx * my * mz * q.shape[1] * components >= threshold
+        use_particles = self.fft_policy == 'particles' or (self.fft_policy == 'auto' and enough_work)
+        if use_particles and size > 1 and my >= size:
+            from .mff_reciprocal_particles import energy as particle_energy
+            self.description['fft_selected'] = 'particle-slabs'
+            energy = particle_energy(kernel,position,graph,cell,q,dipole,quadrupole,
+                size=size,rank=dist.get_rank(),counts=counts,reduce_energy=reduce)
+        elif dipole is not None or quadrupole is not None:
+            if self.fft_policy == 'slabs' and size > 1 and my >= size:
                 from .mff_reciprocal_slabs import multipole_energy as slab_energy
                 self.description['fft_selected'] = 'slabs'
                 energy = slab_energy(kernel, position, graph, cell, q, dipole, quadrupole,
                     size=size, rank=dist.get_rank(), counts=counts, reduce_energy=reduce)
             else:
                 energy = multipole_energy(kernel, position, graph, cell, q, dipole, quadrupole,
-                                          reduce_amplitudes=reduce, graph_counts=counts)
+                    reduce_amplitudes=reduce,graph_counts=counts,
+                    compact_quadrupole=self.fft_policy in ('auto','particles'))
         else:
             frac = _prepare_frac_for_boundary_batched(position, graph, cell,
                 boundary=kernel.boundary, slab_padding_factor=kernel.slab_padding_factor)

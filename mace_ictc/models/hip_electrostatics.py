@@ -34,7 +34,7 @@ def _extension():
         cpp_sources=r'''
 #include <torch/extension.h>
 void run(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,
-         torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,
+         torch::Tensor,torch::Tensor,torch::Tensor,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,
          bool,bool,bool,bool,bool);
 ''',
         cuda_sources=r'''
@@ -69,7 +69,8 @@ __device__ inline int64_t wrap_index(int64_t i,int64_t m) {i%=m;return i<0?i+m:i
 // spatially adjacent writes instead of one strided plane per lane.
 template<typename T,int O> __global__ void spread_stencil(
  const T* frac,const int64_t* batch,const T* source,T* output,
- int64_t n,int64_t c,int64_t mx,int64_t my,int64_t mz,int64_t b,bool slab,bool channel_first) {
+ int64_t n,int64_t c,int64_t mx,int64_t my,int64_t mz,int64_t b,
+ int64_t x_start,int64_t x_count,bool slab,bool channel_first) {
  const int64_t t=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
  constexpr int stencil=O*O*O;
  if(t>=n*stencil)return;
@@ -86,7 +87,8 @@ template<typename T,int O> __global__ void spread_stencil(
   weight*=w[u[a]];const int64_t value=base+u[a];
   index[a]=(slab&&a==2)?(value<0?0:(value>=m?m-1:value)):wrap_index(value,m);
  }
- const int64_t points=mx*my*mz,spatial=(index[0]*my+index[1])*mz+index[2];
+ if(index[0]<x_start||index[0]>=x_start+x_count)return;
+ const int64_t points=x_count*my*mz,spatial=((index[0]-x_start)*my+index[1])*mz+index[2];
  for(int64_t ch=0;ch<c;++ch) {
   const int64_t out=channel_first?((graph*c+ch)*points+spatial):((graph*points+spatial)*c+ch);
   atomicAdd(output+out,source[atom*c+ch]*weight);
@@ -97,7 +99,7 @@ template<typename T,int O> __global__ void spread_stencil(
 template<typename T,int O,int Mode> __global__ void assignment(
  const T* frac,const int64_t* batch,const T* source,const T* mesh,const T* direction,
  T* out_source,T* out_mesh,T* out_frac,int64_t n,int64_t c,int64_t mx,int64_t my,int64_t mz,int64_t b,
- bool slab,bool channel_first,bool need_frac,bool need_source,bool need_mesh) {
+ int64_t x_start,int64_t x_count,bool slab,bool channel_first,bool need_frac,bool need_source,bool need_mesh) {
  const int64_t t=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
  if(t>=n*c)return;
  const int64_t atom=t/c,ch=t%c,graph=batch[atom];
@@ -118,10 +120,13 @@ template<typename T,int O,int Mode> __global__ void assignment(
  const T s=(Mode==0||Mode==2||Mode==3)?source[t]:T(0);
  T gathered=0,grad[3]={0,0,0},dir[3]={0,0,0};
  if constexpr(Mode==3) {for(int a=0;a<3;++a)dir[a]=direction[3*atom+a];}
- for(int i=0;i<O;++i)for(int j=0;j<O;++j)for(int k=0;k<O;++k) {
+ for(int i=0;i<O;++i) {
+  const int64_t x=neighbor[0][i];
+  if(x<x_start||x>=x_start+x_count)continue;
+  for(int j=0;j<O;++j)for(int k=0;k<O;++k) {
   const int u[3]={i,j,k};
-  const int64_t x=neighbor[0][i],y=neighbor[1][j],z=neighbor[2][k];
-  const int64_t spatial=(x*my+y)*mz+z,points=mx*my*mz;
+  const int64_t y=neighbor[1][j],z=neighbor[2][k];
+  const int64_t spatial=((x-x_start)*my+y)*mz+z,points=x_count*my*mz;
   const int64_t index=channel_first?((graph*c+ch)*points+spatial):((graph*points+spatial)*c+ch);
   const T weight=w[0][i]*w[1][j]*w[2][k];
   if constexpr(Mode==0) {atomicAdd(out_mesh+index,s*weight);}
@@ -142,7 +147,7 @@ template<typename T,int O,int Mode> __global__ void assignment(
     }
    }
   }
- }
+ }}
  if constexpr(Mode==1)out_source[t]=gathered;
  if constexpr(Mode==2) {for(int a=0;a<3;++a)atomicAdd(out_frac+3*atom+a,grad[a]);}
  if constexpr(Mode==3) {
@@ -152,12 +157,13 @@ template<typename T,int O,int Mode> __global__ void assignment(
 }
 void run(torch::Tensor f,torch::Tensor batch,torch::Tensor s,torch::Tensor mesh,torch::Tensor direction,
  torch::Tensor os,torch::Tensor om,torch::Tensor of,int64_t mx,int64_t my,int64_t mz,int64_t b,int64_t order,int64_t mode,
+ int64_t x_start,int64_t x_count,
  bool slab,bool cf,bool nf,bool ns,bool nm) {
  const c10::cuda::CUDAGuard guard(f.device());
  TORCH_CHECK(f.dim()==2&&f.size(1)==3&&s.dim()==2&&s.size(0)==f.size(0),"Expected frac[N,3], source[N,C]");
  TORCH_CHECK(batch.scalar_type()==at::kLong&&batch.numel()==f.size(0),"Expected int64 batch[N]");
  TORCH_CHECK(mx>0&&my>0&&mz>0&&b>0&&s.size(1)>0&&order>=2&&order<=4&&mode>=0&&mode<=3,"Invalid mesh assignment configuration");
- TORCH_CHECK(mesh.numel()==b*mx*my*mz*s.size(1),"Invalid mesh size");
+ TORCH_CHECK(x_start>=0&&x_count>0&&mesh.numel()==b*x_count*my*mz*s.size(1),"Invalid mesh slab size");
  for(const auto& t:{f,s,mesh,direction,os,om,of})TORCH_CHECK(t.is_cuda()&&t.device()==f.device()&&t.scalar_type()==f.scalar_type()&&t.is_contiguous(),"Mesh tensors must share device/dtype and be contiguous");
  TORCH_CHECK(batch.is_cuda()&&batch.device()==f.device()&&batch.is_contiguous(),"Invalid batch storage");
  const int64_t n=f.size(0),c=s.size(1);if(n==0)return;
@@ -166,8 +172,8 @@ void run(torch::Tensor f,torch::Tensor batch,torch::Tensor s,torch::Tensor mesh,
  if(mode==2||nf)TORCH_CHECK(of.numel()==n*3,"Invalid coordinate output");
  if(mode==3)TORCH_CHECK(direction.numel()==n*3,"Invalid coordinate direction");
  const auto stream=at::cuda::getCurrentCUDAStream();
- #define LAUNCH(O,M) assignment<scalar_t,O,M><<<(n*c+255)/256,256,0,stream>>>(f.data_ptr<scalar_t>(),batch.data_ptr<int64_t>(),s.data_ptr<scalar_t>(),mesh.data_ptr<scalar_t>(),direction.data_ptr<scalar_t>(),os.data_ptr<scalar_t>(),om.data_ptr<scalar_t>(),of.data_ptr<scalar_t>(),n,c,mx,my,mz,b,slab,cf,nf,ns,nm)
- #define SPREAD(O) spread_stencil<scalar_t,O><<<(n*(O*O*O)+255)/256,256,0,stream>>>(f.data_ptr<scalar_t>(),batch.data_ptr<int64_t>(),s.data_ptr<scalar_t>(),om.data_ptr<scalar_t>(),n,c,mx,my,mz,b,slab,cf)
+ #define LAUNCH(O,M) assignment<scalar_t,O,M><<<(n*c+255)/256,256,0,stream>>>(f.data_ptr<scalar_t>(),batch.data_ptr<int64_t>(),s.data_ptr<scalar_t>(),mesh.data_ptr<scalar_t>(),direction.data_ptr<scalar_t>(),os.data_ptr<scalar_t>(),om.data_ptr<scalar_t>(),of.data_ptr<scalar_t>(),n,c,mx,my,mz,b,x_start,x_count,slab,cf,nf,ns,nm)
+ #define SPREAD(O) spread_stencil<scalar_t,O><<<(n*(O*O*O)+255)/256,256,0,stream>>>(f.data_ptr<scalar_t>(),batch.data_ptr<int64_t>(),s.data_ptr<scalar_t>(),om.data_ptr<scalar_t>(),n,c,mx,my,mz,b,x_start,x_count,slab,cf)
  #define MODES(O) if(mode==0){if(cf){SPREAD(O);}else{LAUNCH(O,0);}}else if(mode==1){LAUNCH(O,1);}else if(mode==2){LAUNCH(O,2);}else{LAUNCH(O,3);}
  AT_DISPATCH_FLOATING_TYPES(f.scalar_type(),"ictc_mesh_assignment",[&]{
   if(order==2){MODES(2);}else if(order==3){MODES(3);}else{MODES(4);}
@@ -181,18 +187,19 @@ void run(torch::Tensor f,torch::Tensor batch,torch::Tensor s,torch::Tensor mesh,
 
 
 def _shape(config, channels):
-    m, b, _, _, cf = config
-    return (b, channels, *m) if cf else (b, *m, channels)
+    m, b, _, _, _, nx, cf = config
+    shape = (nx, m[1], m[2])
+    return (b, channels, *shape) if cf else (b, *shape, channels)
 
 
 def _run(frac, batch, source, mesh, config, mode, direction=None, needed=(True, True, True)):
-    m, b, order, slab, cf = config
+    m, b, order, slab, x_start, x_count, cf = config
     empty = frac.new_empty(0)
     out_source = torch.empty_like(source) if mode == 1 or (mode == 3 and needed[1]) else empty
     out_mesh = mesh.zero_() if mode == 0 else (torch.zeros_like(mesh) if mode == 3 and needed[2] else empty)
     out_frac = torch.zeros_like(frac) if mode == 2 or (mode == 3 and needed[0]) else empty
     _extension().run(frac, batch, source, mesh, empty if direction is None else direction.contiguous(),
-                     out_source, out_mesh, out_frac, *m, b, order, mode, slab, cf,
+                     out_source, out_mesh, out_frac, *m, b, order, mode, x_start, x_count, slab, cf,
                      *(needed if mode == 3 else (False, False, False)))
     return out_frac, out_source, out_mesh
 
@@ -248,7 +255,8 @@ class _CoordinateVJP(torch.autograd.Function):
         return df if ctx.needs_input_grad[0] else None, None, ds if ctx.needs_input_grad[2] else None, dm if ctx.needs_input_grad[3] else None, None
 
 
-def _config(frac, batch, mesh_size, num_graphs, assignment, boundary, channels_first):
+def _config(frac, batch, mesh_size, num_graphs, assignment, boundary, channels_first,
+            x_start=0, x_count=None):
     if torch.are_deterministic_algorithms_enabled():
         raise ValueError('Native mesh assignment uses atomic reductions; select the reference backend for deterministic execution')
     if not supported(frac):
@@ -260,13 +268,18 @@ def _config(frac, batch, mesh_size, num_graphs, assignment, boundary, channels_f
     if assignment not in ('cic', 'tsc', 'pcs') or boundary not in ('periodic', 'slab'):
         raise ValueError('Expected cic/tsc/pcs assignment and periodic/slab boundary')
     shape = mesh_shape(mesh_size)
+    if x_count is None:
+        x_count = shape[0]
+    if not isinstance(x_start, int) or not isinstance(x_count, int) or x_start < 0 or x_count < 1:
+        raise ValueError('Expected a nonnegative x_start and positive x_count')
     if not isinstance(num_graphs, int) or isinstance(num_graphs, bool) or num_graphs < 1:
         raise ValueError('num_graphs must be a positive integer')
-    return shape, num_graphs, {'cic': 2, 'tsc': 3, 'pcs': 4}[assignment], boundary == 'slab', bool(channels_first)
+    return shape, num_graphs, {'cic': 2, 'tsc': 3, 'pcs': 4}[assignment], boundary == 'slab', x_start, x_count, bool(channels_first)
 
 
-def spread(frac, batch, source, *, mesh_size, num_graphs, assignment='pcs', boundary='periodic', channels_first=False):
-    config = _config(frac, batch, mesh_size, num_graphs, assignment, boundary, channels_first)
+def spread(frac, batch, source, *, mesh_size, num_graphs, assignment='pcs', boundary='periodic', channels_first=False,
+           x_start=0, x_count=None):
+    config = _config(frac, batch, mesh_size, num_graphs, assignment, boundary, channels_first, x_start, x_count)
     if source.ndim != 2 or source.shape[0] != frac.shape[0] or source.shape[1] < 1:
         raise ValueError('Expected source [N,C] with C > 0')
     if source.device != frac.device or source.dtype != frac.dtype:
@@ -274,8 +287,9 @@ def spread(frac, batch, source, *, mesh_size, num_graphs, assignment='pcs', boun
     return _Spread.apply(frac.contiguous(), batch.contiguous(), source.contiguous(), config)
 
 
-def gather(frac, batch, mesh, *, mesh_size, num_graphs, assignment='pcs', boundary='periodic', channels_first=False):
-    config = _config(frac, batch, mesh_size, num_graphs, assignment, boundary, channels_first)
+def gather(frac, batch, mesh, *, mesh_size, num_graphs, assignment='pcs', boundary='periodic', channels_first=False,
+           x_start=0, x_count=None):
+    config = _config(frac, batch, mesh_size, num_graphs, assignment, boundary, channels_first, x_start, x_count)
     if mesh.ndim != 5:
         raise ValueError('Expected a five-dimensional mesh')
     channels = mesh.shape[1] if channels_first and mesh.ndim == 5 else mesh.shape[-1]

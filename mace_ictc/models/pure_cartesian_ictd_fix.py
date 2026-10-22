@@ -2773,7 +2773,8 @@ class ICTDResidualInteractionBlock(nn.Module):
         if fused_message_blocks is None:
             from .radial_checkpoint import radial_apply
             gates = radial_apply(self.fc,edge_feats,checkpoint=getattr(self.tp,'_radial_checkpoint',False),
-                gemm_policy=getattr(self.tp,'_training_gate_gemm_policy','torch'))
+                gemm_policy=getattr(self.tp,'_training_gate_gemm_policy','torch'),
+                chunk_rows=getattr(self.tp,'_radial_chunk_rows',0))
         else:
             gates = None
         if (getattr(self, "_edge_fusion", "reference") in ("triton", "cuda", "cuda_projection", "triton_projection", "triton_csr", "triton_remat")
