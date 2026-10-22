@@ -15,8 +15,10 @@ Original third-party copyright notices and license terms are retained:
   `mace_ictc/models/_mace_cg.py` and `_mace_symmetric_contraction.py`:
   [MIT](LICENSES/MACE-MIT.txt), with the original author notices retained.
 - e3nn: [MIT](LICENSES/e3nn-MIT.txt).
-- `mace_ictc/models/_cueq_cg_tools.py`: copyright (c) 2024 NVIDIA CORPORATION
-  & AFFILIATES, [Apache License 2.0](LICENSES/Apache-2.0.txt).
+
+The optional cuEquivariance reduced-CG compatibility route loads its weight
+projection from the installed upstream MACE package. That implementation is
+not bundled with ICTC-O3-HP-K100 and retains its upstream license.
 
 Dependencies retain their upstream licenses. LAMMPS itself remains under GPLv2;
 its license applies to LAMMPS and distributions that include it. See the

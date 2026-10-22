@@ -1386,12 +1386,13 @@ class CueqMaceSymmetricContractionSO3(nn.Module):
         weight_projection_fn = None
         if self.use_reduced_cg:
             try:
-                from mace_ictc.models._cueq_cg_tools import symmetric_contraction_proj as weight_projection_fn
-            except Exception as exc:  # pragma: no cover - optional conversion dependency
+                from mace.tools.cg_cueq_tools import symmetric_contraction_proj as weight_projection_fn
+            except ImportError as exc:  # pragma: no cover - optional conversion dependency
                 raise RuntimeError(
                     "ictd_fix_product_backend='cueq' with reduced CG requires "
-                    "mace_ictc.models._cueq_cg_tools.symmetric_contraction_proj to convert "
-                    "MACE/e3nn symmetric-contraction weights into cueq weight space"
+                    "mace.tools.cg_cueq_tools.symmetric_contraction_proj from a compatible "
+                    "upstream mace-torch installation. Install or upgrade the 'conversion' "
+                    "extra to provide the MACE-to-cuEq weight projection."
                 ) from exc
         for out_idx, (_mul, ir) in enumerate(self.target_irreps):
             out_l = int(ir.l)

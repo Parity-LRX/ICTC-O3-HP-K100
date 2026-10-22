@@ -10,9 +10,6 @@ Third-party notices:
   LICENSES/MACE-MIT.txt.
 - Earlier MACE-ICTC code retains the MIT notice in LICENSES/MACE-ICTC-MIT.txt.
 - The e3nn copyright and MIT terms are reproduced in LICENSES/e3nn-MIT.txt.
-- mace_ictc/models/_cueq_cg_tools.py retains the NVIDIA CORPORATION & AFFILIATES
-  copyright notice and Apache-2.0 identifier. The Apache License 2.0 text is
-  reproduced in LICENSES/Apache-2.0.txt.
 
 See LICENSE_SCOPE.md for scope. Dependencies, pretrained model weights, and
 training datasets retain their upstream licenses.

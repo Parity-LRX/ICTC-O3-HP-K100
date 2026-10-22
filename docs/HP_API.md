@@ -304,6 +304,16 @@ rather than enabling cuEquivariance (cuEq) basis generation. The process default
 preserved. The factory builds e3nn submodules through FX and restores the
 previous e3nn optimization defaults afterwards.
 
+The legacy combination `ictd_fix_product_backend="cueq"` and
+`ictd_fix_use_reduced_cg=True` is an optional compatibility route. It loads
+`mace.tools.cg_cueq_tools.symmetric_contraction_proj` from an installed,
+compatible upstream `mace-torch` release only when selected. Install the
+`conversion` extra and compatible cuEquivariance packages to use this route.
+The projection implementation is not bundled with this library. A missing
+projection API raises an explicit error; the checkpoint's CG basis and weight
+parameterization are never changed automatically. This route remains outside
+the standalone HP factory and generated-plan coverage.
+
 Interaction depth and angular degree are not fixed to two layers/L<=3.
 Structural support remains subject to native model basis construction and
 device resources. Unvalidated high-degree/wide combinations are not validated
