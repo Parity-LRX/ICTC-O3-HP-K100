@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 import torch
 
+from .mesh import normalize_mesh_size
+
 
 DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "dtype": "float64",
@@ -54,6 +56,8 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "long_range_green_mode": "poisson",
     "long_range_assignment": "pcs",
     "long_range_mesh_fft_full_ewald": False,
+    "long_range_mesh_fft_reciprocal_only": False,
+    "long_range_smearing_sigma": None,
     "long_range_max_multipole_l": 0,
     "long_range_dispersion_mode": "none",
     "long_range_dispersion": False,
@@ -575,7 +579,7 @@ def resolve_model_architecture(
             DEFAULT_MODEL_ARCHITECTURE["long_range_kmax"],
         )
     )
-    resolved["long_range_mesh_size"] = int(
+    resolved["long_range_mesh_size"] = normalize_mesh_size(
         _resolve_value(
             overrides,
             checkpoint,
@@ -674,6 +678,12 @@ def resolve_model_architecture(
             DEFAULT_MODEL_ARCHITECTURE["long_range_max_multipole_l"],
         )
     )
+    resolved["long_range_mesh_fft_reciprocal_only"] = bool(
+        _resolve_value(overrides, checkpoint, arch_meta, "long_range_mesh_fft_reciprocal_only",
+                       DEFAULT_MODEL_ARCHITECTURE["long_range_mesh_fft_reciprocal_only"])
+    )
+    sigma = _resolve_value(overrides, checkpoint, arch_meta, "long_range_smearing_sigma", None)
+    resolved["long_range_smearing_sigma"] = None if sigma is None else float(sigma)
     resolved["long_range_dispersion_mode"] = str(
         _resolve_value(
             overrides,

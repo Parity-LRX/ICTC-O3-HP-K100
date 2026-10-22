@@ -27,6 +27,8 @@ _repo_root = os.path.dirname(os.path.dirname(_script_dir))
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
+from mace_ictc.utils.mesh import normalize_mesh_size
+
 
 def _pick_device(req: str) -> str:
     if req == "cuda" and not torch.cuda.is_available():
@@ -925,7 +927,7 @@ def _export_single_core(
         "long_range_source_slab_padding_factor": runtime_source_slab_padding_factor,
         "long_range_boundary": str(getattr(metadata_model, "long_range_boundary", "nonperiodic")),
         "long_range_backend": str(getattr(metadata_model, "long_range_backend", "dense_pairwise")),
-        "long_range_mesh_size": int(getattr(metadata_model, "long_range_mesh_size", 16)),
+        "long_range_mesh_size": normalize_mesh_size(getattr(metadata_model, "long_range_mesh_size", 16)),
         # Latent multipole order: 0=monopole only; 1=+dipole; 2=+dipole+quadrupole. The exported
         # reciprocal_source is packed channel-last as [q | dipole_xyz | quad_3x3] per source channel,
         # so the C++ reciprocal solver rebuilds q/mu/Q using this + reciprocal_source_channels.
@@ -943,6 +945,8 @@ def _export_single_core(
         "long_range_green_mode": str(getattr(metadata_model, "long_range_green_mode", "poisson")),
         "long_range_assignment": str(getattr(metadata_model, "long_range_assignment", "pcs")),
         "long_range_mesh_fft_full_ewald": bool(getattr(metadata_model, "long_range_mesh_fft_full_ewald", False)),
+        "long_range_mesh_fft_reciprocal_only": bool(getattr(metadata_model, "long_range_mesh_fft_reciprocal_only", False)),
+        "long_range_smearing_sigma": getattr(metadata_model, "long_range_smearing_sigma", None),
         "long_range_dispersion_mode": str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
         "long_range_dispersion": bool(getattr(metadata_model, "long_range_dispersion", False)),
         "dispersion_cutoff": float(getattr(metadata_model, "dispersion_cutoff", 0.0)),

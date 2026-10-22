@@ -9,9 +9,11 @@ from .operators import (
     configure_symmetric_contraction, create_symmetric_contraction, direction_harmonics, normalized_silu,
 )
 from .runtime import check_model, configure_model, create_model, energy_and_forces, prepare_for_export
+from .electrostatics import MeshElectrostatics, configure_electrostatics, mesh_spread, mesh_gather, mesh_shape_for_cell
 
 __all__ = [
     "EdgeTensorProduct", "GraphMessage", "PackedGraphMessage", "direction_harmonics",
     "create_symmetric_contraction", "configure_symmetric_contraction", "channel_linear", "normalized_silu",
     "create_model", "check_model", "configure_model", "energy_and_forces", "prepare_for_export",
+    "MeshElectrostatics", "configure_electrostatics", "mesh_spread", "mesh_gather", "mesh_shape_for_cell",
 ]

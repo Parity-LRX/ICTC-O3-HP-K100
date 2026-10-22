@@ -31,6 +31,7 @@ import os
 from typing import List, Optional, Tuple
 
 import numpy as np
+from mace_ictc.utils.mesh import normalize_mesh_size
 import torch
 import torch.nn as nn
 import torch.utils.dlpack as torch_dlpack
@@ -1261,7 +1262,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         long_range_neutralize = bool(arch_meta.get("long_range_neutralize", True))
         long_range_filter_hidden_dim = int(arch_meta.get("long_range_filter_hidden_dim", 64))
         long_range_kmax = int(arch_meta.get("long_range_kmax", 2))
-        long_range_mesh_size = int(arch_meta.get("long_range_mesh_size", 16))
+        long_range_mesh_size = normalize_mesh_size(arch_meta.get("long_range_mesh_size", 16))
         long_range_slab_padding_factor = int(arch_meta.get("long_range_slab_padding_factor", 2))
         long_range_include_k0 = bool(arch_meta.get("long_range_include_k0", False))
         long_range_source_channels = int(arch_meta.get("long_range_source_channels", 1))
@@ -1271,7 +1272,10 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         long_range_green_mode = str(arch_meta.get("long_range_green_mode", "poisson"))
         long_range_assignment = str(arch_meta.get("long_range_assignment", "pcs"))
         long_range_mesh_fft_full_ewald = bool(arch_meta.get("long_range_mesh_fft_full_ewald", False))
+        long_range_mesh_fft_reciprocal_only = bool(arch_meta.get("long_range_mesh_fft_reciprocal_only", False))
+        long_range_smearing_sigma = arch_meta.get("long_range_smearing_sigma", None)
         long_range_max_multipole_l = int(arch_meta.get("long_range_max_multipole_l", 0))
+        long_range_multipole_gate_init = float(arch_meta.get("long_range_multipole_gate_init", 0.1))
         long_range_dispersion_mode = str(
             arch_meta.get(
                 "long_range_dispersion_mode",
@@ -1655,7 +1659,10 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 long_range_green_mode=long_range_green_mode,
                 long_range_assignment=long_range_assignment,
                 long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
+                long_range_mesh_fft_reciprocal_only=long_range_mesh_fft_reciprocal_only,
+                long_range_smearing_sigma=long_range_smearing_sigma,
                 long_range_max_multipole_l=long_range_max_multipole_l,
+                long_range_multipole_gate_init=long_range_multipole_gate_init,
                 long_range_dispersion_mode=long_range_dispersion_mode,
                 dispersion_cutoff=dispersion_cutoff,
                 dispersion_max_num_neighbors=dispersion_max_num_neighbors,

@@ -315,6 +315,12 @@ to `OFF`. The plain pair style has a separate virial path. A working force
 calculation does not establish pressure, per-atom stress or NPT accuracy.
 Validate those quantities for the model, periodic cell and decomposition.
 
+Native learned monopole/dipole/quadrupole reciprocal models use the same
+native export and `mff/torch/kk` commands, with configuration restored from
+the checkpoint. Their owned-source transport, force-response validation and
+1/2/4/8-GPU results are described in the
+[electrostatics guide](../../docs/ELECTROSTATICS.md#native-lammps-mfftorchkk).
+
 The source also includes signature-dependent options:
 
 | Option | Model requirement |

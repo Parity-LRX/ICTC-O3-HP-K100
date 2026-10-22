@@ -110,7 +110,7 @@ class _StreamedGate(torch.autograd.Function):
                 cached[start]=g;remaining-=bytes_used
             if csr is not None:
                 from .generated_csr_forward import forward
-                forward(xc,sh[start:end],w,g,src[start:end],_edge_slice(mask,start,end),out,p,projection,csr,start)
+                forward(xc,sh[start:end],w,g,src[start:end],_edge_slice(mask,start,end),out,p,projection,csr,start,dst[start:end])
                 del g
                 continue
             if p.get("generated_forward",False):
@@ -301,7 +301,8 @@ def streamed_gate_message(tp,x1,edge_attrs,edge_feats,fc,src,dst,mask,*,output_n
     x=torch.cat([x1[l].reshape(n,c*(2*l+1)) for l in sorted(x1)],-1).contiguous()
     sh=torch.cat([edge_attrs[l].squeeze(-2) for l in projection["keys"]],-1).contiguous()
     from .radial_checkpoint import radial_apply
-    hidden=radial_apply(fc,edge_feats,hidden=True,checkpoint=getattr(tp,'_radial_checkpoint',False))
+    hidden=radial_apply(fc,edge_feats,hidden=True,checkpoint=getattr(tp,'_radial_checkpoint',False),
+        chunk_rows=getattr(tp,'_radial_chunk_rows',0))
     bias=sample.new_empty(0) if last.bias is None else last.bias
     mask=sample.new_empty(0) if mask is None else mask.to(sample).reshape(e).contiguous()
     if (getattr(tp,"_sort_gate_edges",False) or plan["segmented_forward"]) and e:

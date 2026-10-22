@@ -6,12 +6,15 @@ import torch
 def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
                  correlation=3, use_reduced_cg=False,
                  atomic_numbers=(1, 6, 8), cutoff=5.0, avg_num_neighbors=50.0,
-                 device="cuda", dtype=torch.float32):
+                 device="cuda", dtype=torch.float32, electrostatics=None):
     """Create a parameterized Cartesian bridge-U model, without a runtime plan.
 
     New TP base coefficients are fixed by construction; radial/linear/SC weights
     are trainable. This factory creates initialized weights, not a trained
     potential. Existing checkpoints should be loaded through from_checkpoint.
+    electrostatics optionally configures the original learned long-range head;
+    its new-factory default is reciprocal-only mesh electrostatics with a
+    fixed Gaussian length smearing_sigma=1.0 in coordinate units.
     """
     if not isinstance(num_interactions, int) or isinstance(num_interactions, bool) or num_interactions < 1:
         raise ValueError("num_interactions must be a positive integer")
@@ -29,6 +32,27 @@ def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
     _degree(edge_lmax, "edge_lmax")
     if edge_lmax < lmax:
         raise ValueError("edge_lmax must be at least lmax")
+    from collections.abc import Mapping
+    long_range_options = {}
+    if electrostatics is not None:
+        if not isinstance(electrostatics, Mapping):
+            raise TypeError("electrostatics must be a configuration mapping or None")
+        allowed = {'mode', 'boundary', 'reciprocal_backend', 'kmax', 'mesh_size',
+                   'source_channels', 'hidden_dim', 'filter_hidden_dim', 'neutralize',
+                   'include_k0', 'energy_partition', 'green_mode', 'assignment',
+                   'slab_padding_factor', 'mesh_fft_full_ewald', 'mesh_fft_reciprocal_only',
+                   'max_multipole_l', 'multipole_gate_init', 'smearing_sigma'}
+        unknown = set(electrostatics) - allowed
+        if unknown:
+            raise ValueError(f"Unknown electrostatics options: {sorted(unknown)}")
+        options = dict(mode='reciprocal-spectral-v1', boundary='periodic',
+                       reciprocal_backend='mesh_fft', mesh_size=32, assignment='pcs',
+                       mesh_fft_full_ewald=True, mesh_fft_reciprocal_only=True)
+        options.update(electrostatics)
+        if 'smearing_sigma' not in options:
+            options['smearing_sigma'] = (1.0 if options['reciprocal_backend'] == 'mesh_fft'
+                                        and options['mesh_fft_full_ewald'] else None)
+        long_range_options = {'long_range_' + key: value for key, value in options.items()}
     from mace_ictc.cli.train import build_baseline_model
     from mace_ictc.utils.config import ModelConfig
     import e3nn
@@ -48,6 +72,7 @@ def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
             edge_lmax=edge_lmax, attn_heads=0, atomic_numbers=list(atomic_numbers),
             ictd_save_tp_mode="fully-connected", invariant_channels=32,
             device=torch.device(device), dtype=config.dtype,
+            **long_range_options,
         )
     finally:
         torch.set_default_dtype(previous_dtype)
@@ -112,7 +137,8 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
                     radial_checkpoint=False,inference_message_layout="native",
                     inference_adjoint_channel_tile="auto",inference_gate_adjoint_rows=0,
                     inference_gemm_policy="torch",inference_message_adjoint_edges=0,
-                    inference_basis_fusion=False,species_linear_schedule="auto") -> dict:
+                    inference_basis_fusion=False,species_linear_schedule="auto",
+                    electrostatics_backend="auto") -> dict:
     """Configure every interaction for eager training or full-force inference.
 
     auto selects qualified independent HP operators or reports why the existing
@@ -176,8 +202,14 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
     a validated GPU plan exists; device retains conventional device buffers.
     Parameter devices/dtypes stay unchanged. Parallel wrappers/groups keep
     device buffers, and reference/export paths restore them before use.
+    electrostatics_backend selects auto, hip or reference mesh operations
+    independently of backbone planning, without changing the functional.
     """
     from mace_ictc.models.fp32_policy import strict_fp32
+    if electrostatics_backend not in ('auto','hip','reference'):
+        raise ValueError('electrostatics_backend must be auto, hip or reference')
+    if capture and electrostatics_backend == 'hip':
+        raise ValueError('Native HIP electrostatics currently requires eager execution')
     strict_fp32()
     _layout(layout)
     if message_schedule=='compact':
@@ -402,6 +434,9 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
                     +(['direction_harmonics'] if core._fused_direction_harmonics else []),
                 'torch_helpers':['csr_topology']+(['normalized_silu'] if capture else [])
                     +([] if core._fused_direction_harmonics else ['direction_harmonics'])}
+    from .electrostatics import configure_electrostatics
+    info['electrostatics'] = configure_electrostatics(
+        model, backend='reference' if policy == 'reference' or capture else electrostatics_backend)
     return {**info, "layout": layout if info["selected"] == "generated" else None}
 
 
@@ -428,5 +463,7 @@ def prepare_for_export(model: torch.nn.Module, *, policy="auto", layout=None, dy
                     "e3nn.set_optimization_defaults(jit_script_fx=False) before rebuilding/loading the model. "
                     f"Scripted modules remain: {scripted[:3]}. Use dynamic=False only for an intentionally static-N package.")
     from mace_ictc.interfaces.deployment_triton import configure_mace_deployment_plan
+    from .electrostatics import configure_electrostatics
+    configure_electrostatics(model, backend='reference')
     return configure_mace_deployment_plan(model, policy=policy, generated_layout=layout,
                                          reference_buffer_policy=reference_buffer_policy)

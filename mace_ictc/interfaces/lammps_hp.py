@@ -144,13 +144,16 @@ def _load(checkpoint, metadata, device):
     model = potential.wrapper.model.to(device=device, dtype=torch.float32).eval().requires_grad_(False)
     from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
     if not isinstance(model, PureCartesianICTDFix):
-        raise ValueError("Native MFF requires a short-range PureCartesianICTDFix model")
-    if (model.long_range_module is not None or model.dispersion is not None
+        raise ValueError("Native MFF requires a PureCartesianICTDFix model")
+    if (model.dispersion is not None
             or model.ictd_fix_interaction_attn_heads != 0
             or getattr(model, "physical_tensor_heads", None)
             or getattr(model, "external_tensor_rank", None) is not None
             or getattr(model, "num_fidelity_levels", 0)):
-        raise ValueError("Native MFF supports short-range scalar energy models without extra input/output heads")
+        raise ValueError("Native MFF supports scalar energy models without dispersion or extra input/output heads")
+    if model.long_range_module is not None:
+        from .mff_electrostatics import NativeReciprocal
+        NativeReciprocal(model.long_range_module)
     for module in model.modules():
         if hasattr(module, "internal_compute_dtype"):
             module.internal_compute_dtype = torch.float32
@@ -166,7 +169,18 @@ def _load(checkpoint, metadata, device):
         csr_slice_search=True, geometry_schedule="streamed", message_chunk_edges=chunk,
         inference_message_layout="degree", gate_cache_bytes=0, inference_gate_adjoint_rows=16384,
         inference_gemm_policy="dtk2604", inference_message_adjoint_edges=32768,
-        inference_basis_fusion=True, species_linear_schedule="grouped")
+        inference_basis_fusion=True, species_linear_schedule="grouped", electrostatics_backend="hip")
+    if metadata["inference_mode"] == "capacity":
+        # Frozen radial prefixes can recompute their SiLU activations during
+        # coordinate backpropagation instead of retaining every edge/hidden
+        # activation for every interaction. Keep this local to native MFF;
+        # no feature or reciprocal collective is replayed by the checkpoint.
+        for module in model.modules():
+            if hasattr(module, "_radial_checkpoint"):
+                module._radial_checkpoint = True
+                module._radial_chunk_rows = 32768
+        plan["radial_checkpoint"] = True
+        plan["radial_chunk_rows"] = 32768
     if e0_keys is None:
         e0_keys = potential.wrapper.atomic_energy_keys.tolist()
         e0_values = potential.wrapper.atomic_energy_values.tolist()
@@ -178,6 +192,11 @@ class _Runtime:
     def __init__(self, checkpoint, metadata, device):
         self.model, e0, self.plan = _load(checkpoint, metadata, device)
         self.foundation = e0 is None
+        from .mff_electrostatics import NativeReciprocal
+        module = getattr(self.model, "long_range_module", None)
+        self.reciprocal = NativeReciprocal(module) if module is not None else None
+        if self.reciprocal is not None:
+            self.plan["electrostatics"] = self.reciprocal.description
         numbers = self.model.native.atomic_numbers.tolist() if self.foundation else self.model.atomic_numbers
         self.numbers = torch.tensor(numbers, dtype=torch.int64, device=device)
         self.e0 = torch.tensor([0. if e0 is None else e0.get(z, 0.) for z in numbers],
@@ -189,8 +208,22 @@ class _Runtime:
         self.calls = 0
         self.exchanges = 0
         self.graph = {}
+        self.capacity_reclaim = False
 
     def energy(self, pos, atomic, batch, src, dst, shifts, cell, vectors, owned, owners, rank, size):
+        if not self.foundation and self.metadata["inference_mode"] == "capacity":
+            total = torch.cuda.get_device_properties(pos.device).total_memory
+            self.capacity_reclaim |= torch.cuda.max_memory_allocated(pos.device) > .75 * total
+            if self.capacity_reclaim:
+                # Neighbor counts change between steps. Reclaim completed
+                # Python wrappers and idle allocator blocks before another
+                # large force graph, rather than carrying incompatible cached
+                # block sizes into its peak. Live tensors are unaffected.
+                import gc
+                torch.cuda.synchronize(pos.device)
+                gc.collect()
+                torch.cuda.empty_cache()
+            self.plan["capacity_reclaim_active"] = self.capacity_reclaim
         if not self.sorted_checked:
             if not bool(torch.all(dst[1:] >= dst[:-1])):
                 raise ValueError("Native MFF requires destination-sorted edges")
@@ -232,6 +265,13 @@ class _Runtime:
         else:
             options = {} if plan is None else dict(distributed_atom_count=owned,
                 layer_state_callback=exchange, compact_local_projection=True, compact_local_messages=True)
+            if self.reciprocal is not None:
+                def reciprocal(position, graph, box, q, dipole, quadrupole):
+                    # Order reverse spectral reductions before reverse feature
+                    # exchange even on domains whose learned sources are constant.
+                    return self.reciprocal(position, graph, box, q + communication_anchor,
+                                           dipole, quadrupole, owned=owned, size=size)
+                options["long_range_energy_callback"] = reciprocal
             value = self.model(pos, atomic, batch, src, dst, shifts, cell,
                                precomputed_edge_vec=vectors, **options)
             result = (value[0] if isinstance(value, tuple) else value).reshape(-1) + self.e0[species]
@@ -355,7 +395,9 @@ def export_native(*, checkpoint, elements, out_pt, inference_mode="performance",
         cfg.load_atomic_energies_from_file(e0_csv)
         metadata.update(e0_keys=cfg.atomic_energy_keys.tolist(), e0_values=cfg.atomic_energy_values.tolist())
     # Validate reconstruction and native operator coverage before publishing the archive.
-    _Runtime(copied, metadata, torch.device("cuda", torch.cuda.current_device()))
+    checked = _Runtime(copied, metadata, torch.device("cuda", torch.cuda.current_device()))
+    if checked.reciprocal is not None:
+        metadata["electrostatics"] = checked.reciprocal.description
     torch.jit.save(torch.jit.script(NativeCore(metadata["model_id"])), str(target))
     Path(str(target) + ".json").write_text(json.dumps(metadata, indent=2) + "\n")
     Path(str(target) + ".meta").write_text(

@@ -31,6 +31,7 @@ import random
 
 import h5py
 import numpy as np
+from mace_ictc.utils.mesh import normalize_mesh_size, parse_mesh_size
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
@@ -401,7 +402,7 @@ def build_baseline_model(
     long_range_boundary: str = "periodic",
     long_range_reciprocal_backend: str = "direct_kspace",
     long_range_kmax: int = 2,
-    long_range_mesh_size: int = 16,
+    long_range_mesh_size: int | tuple[int, int, int] = 16,
     long_range_source_channels: int = 1,
     long_range_hidden_dim: int = 64,
     long_range_filter_hidden_dim: int = 64,
@@ -412,6 +413,8 @@ def build_baseline_model(
     long_range_assignment: str = "pcs",
     long_range_slab_padding_factor: int = 2,
     long_range_mesh_fft_full_ewald: bool = False,
+    long_range_mesh_fft_reciprocal_only: bool = False,
+    long_range_smearing_sigma: float | None = None,
     long_range_max_multipole_l: int = 0,
     long_range_multipole_gate_init: float = 0.1,
     long_range_dispersion_mode: str = "none",
@@ -493,6 +496,8 @@ def build_baseline_model(
         long_range_assignment=long_range_assignment,
         long_range_slab_padding_factor=long_range_slab_padding_factor,
         long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
+        long_range_mesh_fft_reciprocal_only=long_range_mesh_fft_reciprocal_only,
+        long_range_smearing_sigma=long_range_smearing_sigma,
         long_range_max_multipole_l=long_range_max_multipole_l,
         long_range_multipole_gate_init=long_range_multipole_gate_init,
         long_range_dispersion_mode=long_range_dispersion_mode,
@@ -605,8 +610,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="direct_kspace keeps the long-range energy in the exported core; mesh_fft can export latent sources.")
     ap.add_argument("--long-range-kmax", type=int, default=2,
                     help="Integer reciprocal lattice cutoff for direct_kspace.")
-    ap.add_argument("--long-range-mesh-size", type=int, default=16,
-                    help="FFT mesh size for mesh_fft reciprocal backend.")
+    ap.add_argument("--long-range-mesh-size", type=parse_mesh_size, default=16,
+                    help="FFT mesh size M or Mx,My,Mz for mesh_fft reciprocal backend.")
     ap.add_argument("--long-range-source-channels", type=int, default=1,
                     help="Number of learned latent scalar source channels.")
     ap.add_argument("--long-range-hidden-dim", type=int, default=64)
@@ -623,6 +628,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--long-range-slab-padding-factor", type=int, default=2)
     ap.add_argument("--long-range-mesh-fft-full-ewald", action="store_true",
                     help="Use full-Ewald-style mesh FFT correction terms for mesh_fft.")
+    ap.add_argument("--long-range-mesh-fft-reciprocal-only", action="store_true",
+                    help="Retain only the screened reciprocal functional; omit real/self/background terms.")
+    ap.add_argument("--long-range-smearing-sigma", type=float, default=None,
+                    help="Fixed Gaussian length in coordinate units: exp(-sigma^2*k^2/2). "
+                         "Requires mesh_fft and --long-range-mesh-fft-full-ewald. "
+                         "Omission preserves legacy box-dependent screening.")
+    ap.add_argument("--electrostatics-backend", default="auto", choices=["auto", "hip", "reference"],
+                    help="Mesh execution backend; hip requires eager K100 FP32/FP64.")
     ap.add_argument("--long-range-max-multipole-l", type=int, default=0,
                     help="Maximum learned multipole rank emitted for mesh_fft reciprocal long-range export.")
     ap.add_argument("--long-range-multipole-gate-init", type=float, default=0.1,
@@ -1040,8 +1053,7 @@ def main(argv=None):
             raise ValueError("--long-range-reciprocal-backend direct_kspace requires --long-range-boundary periodic")
         if args.long_range_kmax < 0:
             raise ValueError("--long-range-kmax must be >= 0")
-        if args.long_range_mesh_size <= 0:
-            raise ValueError("--long-range-mesh-size must be > 0")
+        normalize_mesh_size(args.long_range_mesh_size)
         if args.long_range_source_channels <= 0:
             raise ValueError("--long-range-source-channels must be > 0")
         if args.long_range_max_multipole_l < 0:
@@ -1152,6 +1164,8 @@ def main(argv=None):
         long_range_assignment=args.long_range_assignment,
         long_range_slab_padding_factor=args.long_range_slab_padding_factor,
         long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
+        long_range_mesh_fft_reciprocal_only=args.long_range_mesh_fft_reciprocal_only,
+        long_range_smearing_sigma=args.long_range_smearing_sigma,
         long_range_max_multipole_l=args.long_range_max_multipole_l,
         long_range_multipole_gate_init=args.long_range_multipole_gate_init,
         long_range_dispersion_mode=args.long_range_dispersion_mode,
@@ -1282,7 +1296,7 @@ def main(argv=None):
         long_range_hidden_dim=int(args.long_range_hidden_dim),
         long_range_filter_hidden_dim=int(args.long_range_filter_hidden_dim),
         long_range_kmax=int(args.long_range_kmax),
-        long_range_mesh_size=int(args.long_range_mesh_size),
+        long_range_mesh_size=normalize_mesh_size(args.long_range_mesh_size),
         long_range_slab_padding_factor=int(args.long_range_slab_padding_factor),
         long_range_include_k0=bool(args.long_range_include_k0),
         long_range_source_channels=int(args.long_range_source_channels),
@@ -1291,6 +1305,8 @@ def main(argv=None):
         long_range_green_mode=args.long_range_green_mode,
         long_range_assignment=args.long_range_assignment,
         long_range_mesh_fft_full_ewald=bool(args.long_range_mesh_fft_full_ewald),
+        long_range_mesh_fft_reciprocal_only=bool(args.long_range_mesh_fft_reciprocal_only),
+        long_range_smearing_sigma=args.long_range_smearing_sigma,
         long_range_max_multipole_l=int(args.long_range_max_multipole_l),
         long_range_multipole_gate_init=float(args.long_range_multipole_gate_init),
         long_range_dispersion_mode=args.long_range_dispersion_mode,
@@ -1344,6 +1360,7 @@ def main(argv=None):
         operator_plan=args.operator_plan,
         generated_layout=args.generated_layout,
         training_message_linear_layout=args.training_message_linear_layout,
+        electrostatics_backend=args.electrostatics_backend,
         backward_targets=args.backward_targets,
         require_train_makefx_compile=bool(args.train_makefx_compile and args.product_backend == "cueq"),
         makefx_max_slots=args.makefx_max_slots,

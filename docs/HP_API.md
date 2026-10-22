@@ -1,5 +1,8 @@
 # ICTC-O3-HP-K100 API
 
+Native monopole, dipole and quadrupole mesh operations and model integration
+are described in the [electrostatics guide](ELECTROSTATICS.md).
+
 This guide targets Hygon K100 (`gfx926`) with the vendor HIP/DTK stack.
 The supported performance workflow is eager FP32 with native HIP kernels.
 AOTInductor `.pt2`, `torch.compile` and graph replay are outside the supported

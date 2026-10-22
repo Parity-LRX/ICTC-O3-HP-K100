@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mace_ictc.utils.mesh import mesh_shape, normalize_mesh_size
 from mace_ictc.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
 )
@@ -120,6 +121,9 @@ def _prepare_frac_for_boundary_batched(
     boundary: str,
     slab_padding_factor: int,
 ) -> torch.Tensor:
+    if cell.shape[0] == 1:
+        return _prepare_frac_for_boundary(
+            pos, cell[0], boundary=boundary, slab_padding_factor=slab_padding_factor)
     inv_cell = _inverse_3x3(cell)
     atom_inv_cell = inv_cell.index_select(0, batch)
     frac = torch.einsum("ni,nij->nj", pos, atom_inv_cell)
@@ -203,7 +207,7 @@ def _assignment_weights_from_scaled(scaled: torch.Tensor, assignment: str) -> tu
         weight_components[0][:, :, None, None]
         * weight_components[1][:, None, :, None]
         * weight_components[2][:, None, None, :]
-    ).reshape(scaled.size(0), -1)
+    ).reshape(scaled.size(0), _assignment_stencil_size(assignment) ** 3)
     return base, weights
 
 
@@ -220,12 +224,13 @@ def _assignment_window_1d(
 
 
 def _apply_mesh_boundary(idx: torch.Tensor, *, mesh_size: int, boundary: str) -> torch.Tensor:
+    shape = mesh_shape(mesh_size)
     if boundary == "periodic":
-        return torch.remainder(idx, mesh_size)
+        return torch.remainder(idx, idx.new_tensor(shape))
     idx_wrapped = idx.clone()
-    idx_wrapped[..., 0] = torch.remainder(idx_wrapped[..., 0], mesh_size)
-    idx_wrapped[..., 1] = torch.remainder(idx_wrapped[..., 1], mesh_size)
-    idx_wrapped[..., 2] = idx_wrapped[..., 2].clamp(0, mesh_size - 1)
+    idx_wrapped[..., 0] = torch.remainder(idx_wrapped[..., 0], shape[0])
+    idx_wrapped[..., 1] = torch.remainder(idx_wrapped[..., 1], shape[1])
+    idx_wrapped[..., 2] = idx_wrapped[..., 2].clamp(0, shape[2] - 1)
     return idx_wrapped
 
 
@@ -239,16 +244,17 @@ def _spread_source_to_mesh(
     boundary: str,
 ) -> torch.Tensor:
     channels = int(source.size(1))
-    mesh = source.new_zeros((mesh_size, mesh_size, mesh_size, channels))
+    shape = mesh_shape(mesh_size)
+    mesh = source.new_zeros((*shape, channels))
     flat_mesh = mesh.view(-1, channels)
-    scaled = frac * float(mesh_size)
+    scaled = frac * frac.new_tensor(shape)
     base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
     idx = _apply_mesh_boundary(
         base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
         mesh_size=mesh_size,
         boundary=boundary,
     )
-    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    flat_idx = ((idx[..., 0] * shape[1]) + idx[..., 1]) * shape[2] + idx[..., 2]
     flat_mesh.scatter_add_(
         0,
         flat_idx.reshape(-1, 1).expand(-1, channels),
@@ -269,16 +275,17 @@ def _spread_source_to_mesh_batched(
     boundary: str,
 ) -> torch.Tensor:
     channels = int(source.size(1))
-    mesh_points = mesh_size * mesh_size * mesh_size
+    shape = mesh_shape(mesh_size)
+    mesh_points = math.prod(shape)
     flat_mesh = source.new_zeros((num_graphs * mesh_points, channels))
-    scaled = frac * float(mesh_size)
+    scaled = frac * frac.new_tensor(shape)
     base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
     idx = _apply_mesh_boundary(
         base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
         mesh_size=mesh_size,
         boundary=boundary,
     )
-    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    flat_idx = ((idx[..., 0] * shape[1]) + idx[..., 1]) * shape[2] + idx[..., 2]
     graph_offset = batch.to(dtype=flat_idx.dtype).unsqueeze(-1) * mesh_points
     flat_idx = flat_idx + graph_offset
     flat_mesh.scatter_add_(
@@ -286,7 +293,7 @@ def _spread_source_to_mesh_batched(
         flat_idx.reshape(-1, 1).expand(-1, channels),
         (source.unsqueeze(1) * stencil_weights.unsqueeze(-1)).reshape(-1, channels),
     )
-    return flat_mesh.view(num_graphs, mesh_size, mesh_size, mesh_size, channels)
+    return flat_mesh.view(num_graphs, *shape, channels)
 
 
 def _gather_source_from_mesh(
@@ -299,16 +306,17 @@ def _gather_source_from_mesh(
     boundary: str,
 ) -> torch.Tensor:
     channels = int(mesh.size(-1))
+    shape = mesh_shape(mesh_size)
     flat_mesh = mesh.view(-1, channels)
-    scaled = frac * float(mesh_size)
+    scaled = frac * frac.new_tensor(shape)
     base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
     idx = _apply_mesh_boundary(
         base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
         mesh_size=mesh_size,
         boundary=boundary,
     )
-    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
-    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), -1, channels)
+    flat_idx = ((idx[..., 0] * shape[1]) + idx[..., 1]) * shape[2] + idx[..., 2]
+    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), _assignment_stencil_size(assignment) ** 3, channels)
     return (gathered * stencil_weights.unsqueeze(-1)).sum(dim=1)
 
 
@@ -323,19 +331,20 @@ def _gather_source_from_mesh_batched(
     boundary: str,
 ) -> torch.Tensor:
     channels = int(mesh.size(-1))
-    mesh_points = mesh_size * mesh_size * mesh_size
+    shape = mesh_shape(mesh_size)
+    mesh_points = math.prod(shape)
     flat_mesh = mesh.reshape(-1, channels)
-    scaled = frac * float(mesh_size)
+    scaled = frac * frac.new_tensor(shape)
     base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
     idx = _apply_mesh_boundary(
         base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
         mesh_size=mesh_size,
         boundary=boundary,
     )
-    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    flat_idx = ((idx[..., 0] * shape[1]) + idx[..., 1]) * shape[2] + idx[..., 2]
     graph_offset = batch.to(dtype=flat_idx.dtype).unsqueeze(-1) * mesh_points
     flat_idx = flat_idx + graph_offset
-    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), -1, channels)
+    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), _assignment_stencil_size(assignment) ** 3, channels)
     return (gathered * stencil_weights.unsqueeze(-1)).sum(dim=1)
 
 
@@ -1068,7 +1077,7 @@ class MeshLongRangeKernel3D(nn.Module):
     def __init__(
         self,
         *,
-        mesh_size: int = 16,
+        mesh_size: int | tuple[int, int, int] = 16,
         filter_hidden_dim: int = 64,
         boundary: str = "periodic",
         slab_padding_factor: int = 2,
@@ -1079,6 +1088,9 @@ class MeshLongRangeKernel3D(nn.Module):
         full_ewald: bool = False,
         reciprocal_only: bool = False,
         k_norm_floor: float = 1.0e-6,
+        mesh_backend: str = "auto",
+        fuse_multipole_fft: bool = True,
+        smearing_sigma: float | None = None,
     ):
         super().__init__()
         if boundary not in {"periodic", "slab"}:
@@ -1087,7 +1099,11 @@ class MeshLongRangeKernel3D(nn.Module):
             raise ValueError(f"Unsupported reciprocal energy partition: {energy_partition!r}")
         if assignment not in {"cic", "tsc", "pcs"}:
             raise ValueError(f"Unsupported mesh assignment: {assignment!r}")
-        self.mesh_size = int(mesh_size)
+        self.mesh_size = normalize_mesh_size(mesh_size)
+        if mesh_backend not in {"auto", "hip", "reference"}:
+            raise ValueError("mesh_backend must be auto, hip or reference")
+        self.mesh_backend = mesh_backend
+        self.fuse_multipole_fft = bool(fuse_multipole_fft)
         self.boundary = str(boundary)
         self.slab_padding_factor = max(int(slab_padding_factor), 1)
         self.include_k0 = bool(include_k0)
@@ -1095,9 +1111,16 @@ class MeshLongRangeKernel3D(nn.Module):
         self.green_mode = str(green_mode)
         self.assignment = str(assignment)
         self.full_ewald = bool(full_ewald)
-        # Latent-Ewald / LES-style: keep the (screened) reciprocal but SKIP the real-space erfc +
-        # self + background -- the network absorbs the real-space part. Much cheaper (no O(N^2) erfc
-        # loop), and a learnable long-range feature rather than an exact Coulomb sum.
+        if smearing_sigma is not None:
+            smearing_sigma = float(smearing_sigma)
+            if not math.isfinite(smearing_sigma) or smearing_sigma <= 0.0:
+                raise ValueError("smearing_sigma must be finite and positive, or None for legacy box-dependent screening")
+            if not self.full_ewald:
+                raise ValueError("smearing_sigma requires full_ewald=True to enable Gaussian screening")
+        self.smearing_sigma = smearing_sigma
+        # A learned reciprocal correction lets the local model fit complementary
+        # terms. An exact Coulomb sum also needs real-space, self and background
+        # terms; the reciprocal correction alone does not reproduce that sum.
         self.reciprocal_only = bool(reciprocal_only)
         self.k_norm_floor = float(k_norm_floor)
         self.ewald_alpha_prefactor = 5.0
@@ -1118,8 +1141,12 @@ class MeshLongRangeKernel3D(nn.Module):
         self.register_buffer("_assignment_window_cache", torch.empty(0), persistent=False)
 
     @property
+    def mesh_shape(self) -> tuple[int, int, int]:
+        return mesh_shape(self.mesh_size)
+
+    @property
     def num_k(self) -> int:
-        total = self.mesh_size * self.mesh_size * self.mesh_size
+        total = math.prod(self.mesh_shape)
         return total if self.include_k0 else max(total - 1, 0)
 
     def _periodic_axes(self) -> tuple[bool, bool, bool]:
@@ -1133,6 +1160,12 @@ class MeshLongRangeKernel3D(nn.Module):
         return 0.5 * periodic_lengths.min(dim=-1).values.clamp_min(self.k_norm_floor)
 
     def _estimate_ewald_alpha(self, real_cutoff: torch.Tensor) -> torch.Tensor:
+        # exp(-k^2/(4 alpha^2)) = exp(-sigma^2 k^2/2). A fixed
+        # physical sigma makes replication leave the reciprocal functional
+        # unchanged. None preserves existing checkpoint behavior.
+        sigma = getattr(self, "smearing_sigma", None)
+        if sigma is not None:
+            return torch.full_like(real_cutoff, 1.0 / (math.sqrt(2.0) * sigma))
         return real_cutoff.new_tensor(self.ewald_alpha_prefactor) / real_cutoff.clamp_min(self.k_norm_floor)
 
     def _init_real_space_shifts(self) -> torch.Tensor:
@@ -1144,16 +1177,12 @@ class MeshLongRangeKernel3D(nn.Module):
 
     def _build_assignment_window(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         cached = self._assignment_window_cache
-        expected_numel = self.mesh_size * self.mesh_size * self.mesh_size
-        if cached.numel() == expected_numel and cached.device == device and cached.dtype == dtype:
+        if tuple(cached.shape) == self.mesh_shape and cached.device == device and cached.dtype == dtype:
             return cached
-        window_1d = _assignment_window_1d(
-            mesh_size=self.mesh_size,
-            assignment=self.assignment,
-            device=device,
-            dtype=dtype,
-        )
-        wx, wy, wz = torch.meshgrid(window_1d, window_1d, window_1d, indexing="ij")
+        windows = [_assignment_window_1d(mesh_size=size, assignment=self.assignment,
+                                         device=device, dtype=dtype)
+                   for size in self.mesh_shape]
+        wx, wy, wz = torch.meshgrid(*windows, indexing="ij")
         window = wx * wy * wz
         self._assignment_window_cache = window
         return window
@@ -1165,13 +1194,14 @@ class MeshLongRangeKernel3D(nn.Module):
             slab_padding_factor=self.slab_padding_factor,
             dtype=dtype,
         )
-        freq = _fft_integer_frequencies(self.mesh_size, device=cell.device, dtype=dtype)
-        kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
+        frequencies = [_fft_integer_frequencies(size, device=cell.device, dtype=dtype)
+                       for size in self.mesh_shape]
+        kx, ky, kz = torch.meshgrid(*frequencies, indexing="ij")
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
         inv_cell = _inverse_3x3(effective_cell)
         k_cart = 2.0 * math.pi * torch.einsum("kd,bdh->bkh", integer_k, inv_cell.transpose(-1, -2))
         k_norms = _safe_vector_norm(k_cart, dim=-1, floor=self.k_norm_floor).reshape(
-            cell.size(0), self.mesh_size, self.mesh_size, self.mesh_size
+            cell.size(0), *self.mesh_shape
         )
         volume = torch.abs(_det_3x3(effective_cell)).clamp_min(self.k_norm_floor)
         return k_norms, volume
@@ -1185,8 +1215,9 @@ class MeshLongRangeKernel3D(nn.Module):
         effective_cell = _effective_cell_for_boundary(
             cell, boundary=self.boundary, slab_padding_factor=self.slab_padding_factor, dtype=dtype
         )
-        freq = _fft_integer_frequencies(self.mesh_size, device=cell.device, dtype=dtype)
-        kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
+        frequencies = [_fft_integer_frequencies(size, device=cell.device, dtype=dtype)
+                       for size in self.mesh_shape]
+        kx, ky, kz = torch.meshgrid(*frequencies, indexing="ij")
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
         inv_cell = _inverse_3x3(effective_cell)
         k_cart = 2.0 * math.pi * torch.einsum("kd,bdh->bkh", integer_k, inv_cell.transpose(-1, -2))
@@ -1195,9 +1226,43 @@ class MeshLongRangeKernel3D(nn.Module):
         return k_cart, k_norms, volume
 
     def _graph_counts(self, batch: torch.Tensor, cell: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
-        graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
-        graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=dtype)
-        return graph_mask.sum(dim=0).clamp_min(1.0)
+        if cell.shape[0] == 1:
+            return torch.full((1,), max(batch.shape[0], 1), device=batch.device, dtype=dtype)
+        return torch.zeros(cell.size(0), device=batch.device, dtype=dtype).index_add(
+            0, batch, torch.ones(batch.shape[0], device=batch.device, dtype=dtype)
+        ).clamp_min(1.0)
+
+    def _native_mesh(self, value: torch.Tensor) -> bool:
+        backend = getattr(self, "mesh_backend", "auto")
+        if backend == "reference":
+            return False
+        from .hip_electrostatics import supported
+        enabled = supported(value)
+        if backend == "hip" and not enabled:
+            raise ValueError("HIP electrostatics requires K100 gfx926 FP32 or FP64")
+        return enabled
+
+    def _spread(self, frac, batch, source, num_graphs, *, channels_first=False):
+        if self._native_mesh(source):
+            from .hip_electrostatics import spread
+            return spread(frac, batch, source, mesh_size=self.mesh_size,
+                          num_graphs=num_graphs, assignment=self.assignment,
+                          boundary=self.boundary, channels_first=channels_first)
+        mesh = _spread_source_to_mesh_batched(
+            frac, batch, source, num_graphs=num_graphs, mesh_size=self.mesh_size,
+            assignment=self.assignment, assignment_offsets=self.assignment_offsets,
+            boundary=self.boundary)
+        return mesh.permute(0, 4, 1, 2, 3).contiguous() if channels_first else mesh
+
+    def _gather(self, frac, batch, mesh):
+        if self._native_mesh(mesh):
+            from .hip_electrostatics import gather
+            return gather(frac, batch, mesh, mesh_size=self.mesh_size,
+                          num_graphs=mesh.shape[0], assignment=self.assignment,
+                          boundary=self.boundary)
+        return _gather_source_from_mesh_batched(
+            frac, batch, mesh, mesh_size=self.mesh_size, assignment=self.assignment,
+            assignment_offsets=self.assignment_offsets, boundary=self.boundary)
 
     def multipole_energy(
         self,
@@ -1228,6 +1293,9 @@ class MeshLongRangeKernel3D(nn.Module):
         dipole: torch.Tensor | None,
         quadrupole: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self._native_mesh(source) and getattr(self, "fuse_multipole_fft", True):
+            from .hip_reciprocal_fft import multipole_energy
+            return multipole_energy(self, pos, batch, cell, source, dipole, quadrupole)
         src_c = source.size(1)
         frac = _prepare_frac_for_boundary_batched(
             pos,
@@ -1248,16 +1316,7 @@ class MeshLongRangeKernel3D(nn.Module):
         spectral = torch.where(k_norms_flat > self.k_norm_floor, spectral, torch.zeros_like(spectral))
 
         def _spread_fft(field: torch.Tensor) -> torch.Tensor:
-            mesh = _spread_source_to_mesh_batched(
-                frac,
-                batch,
-                field,
-                num_graphs=cell.size(0),
-                mesh_size=self.mesh_size,
-                assignment=self.assignment,
-                assignment_offsets=self.assignment_offsets,
-                boundary=self.boundary,
-            )
+            mesh = self._spread(frac, batch, field, cell.size(0))
             return torch.fft.fftn(mesh, dim=(1, 2, 3)).reshape(cell.size(0), -1, field.size(1)).contiguous()
 
         S = _spread_fft(source).reshape(cell.size(0), -1, src_c)
@@ -1283,6 +1342,9 @@ class MeshLongRangeKernel3D(nn.Module):
         mesh: torch.Tensor,
         cell: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        if self._native_mesh(mesh):
+            from .hip_reciprocal_fft import scalar_potential
+            return scalar_potential(self, mesh, cell)
         mesh_dtype = mesh.dtype
         mesh_complex = torch.fft.fftn(mesh, dim=(1, 2, 3))
         k_norms, volume = self.build_k_norms_batched(cell, dtype=mesh_dtype)
@@ -1305,10 +1367,10 @@ class MeshLongRangeKernel3D(nn.Module):
                 torch.zeros_like(spectral_weights),
             )
         filtered = torch.fft.ifftn(mesh_complex * spectral_weights.unsqueeze(-1), dim=(1, 2, 3))
-        # Compensate torch.fft.ifftn's 1/N normalization (N = mesh_size**3). The forward FFT of
+        # Compensate torch.fft.ifftn's 1/N normalization (N = Mx*My*Mz). The forward FFT of
         # the spread charges already yields the structure factor S(k), so the iFFT's 1/N factor
         # is spurious here.
-        filtered = filtered * (float(self.mesh_size) ** 3)
+        filtered = filtered * float(math.prod(self.mesh_shape))
         return filtered.real, alpha, volume, real_cutoff
 
     def _compute_real_space_potential_batched(
@@ -1349,26 +1411,9 @@ class MeshLongRangeKernel3D(nn.Module):
             boundary=self.boundary,
             slab_padding_factor=self.slab_padding_factor,
         )
-        mesh = _spread_source_to_mesh_batched(
-            frac,
-            batch,
-            source,
-            num_graphs=cell.size(0),
-            mesh_size=self.mesh_size,
-            assignment=self.assignment,
-            assignment_offsets=self.assignment_offsets,
-            boundary=self.boundary,
-        )
+        mesh = self._spread(frac, batch, source, cell.size(0))
         potential_mesh, alpha, effective_volume, real_cutoff = self.apply_green_kernel_batched(mesh, cell)
-        reciprocal_potential = _gather_source_from_mesh_batched(
-            frac,
-            batch,
-            potential_mesh,
-            mesh_size=self.mesh_size,
-            assignment=self.assignment,
-            assignment_offsets=self.assignment_offsets,
-            boundary=self.boundary,
-        )
+        reciprocal_potential = self._gather(frac, batch, potential_mesh)
         total_potential = reciprocal_potential
         if self.full_ewald and not self.reciprocal_only:
             assert alpha is not None and real_cutoff is not None
@@ -1414,7 +1459,7 @@ class LatentReciprocalLongRange(nn.Module):
         boundary: str = "periodic",
         neutralize: bool = True,
         kmax: int = 2,
-        mesh_size: int = 16,
+        mesh_size: int | tuple[int, int, int] = 16,
         filter_hidden_dim: int = 64,
         slab_padding_factor: int = 2,
         include_k0: bool = False,
@@ -1424,6 +1469,7 @@ class LatentReciprocalLongRange(nn.Module):
         assignment: str = "pcs",
         mesh_fft_full_ewald: bool = False,
         mesh_fft_reciprocal_only: bool = False,
+        smearing_sigma: float | None = None,
     ):
         super().__init__()
         if reciprocal_backend not in {"direct_kspace", "mesh_fft"}:
@@ -1436,7 +1482,7 @@ class LatentReciprocalLongRange(nn.Module):
         self.boundary = str(boundary)
         self.neutralize = bool(neutralize)
         self.kmax = int(kmax)
-        self.mesh_size = int(mesh_size)
+        self.mesh_size = normalize_mesh_size(mesh_size)
         self.slab_padding_factor = max(int(slab_padding_factor), 1)
         self.include_k0 = bool(include_k0)
         self.reciprocal_backend = str(reciprocal_backend)
@@ -1445,6 +1491,9 @@ class LatentReciprocalLongRange(nn.Module):
         self.assignment = str(assignment)
         self.mesh_fft_full_ewald = bool(mesh_fft_full_ewald)
         self.mesh_fft_reciprocal_only = bool(mesh_fft_reciprocal_only)
+        self.smearing_sigma = smearing_sigma
+        if smearing_sigma is not None and reciprocal_backend != "mesh_fft":
+            raise ValueError("Fixed smearing_sigma currently requires reciprocal_backend='mesh_fft'")
         self.source_kind = "latent_charge"
         self.source_layout = "channels_last"
         self.runtime_backend = "mesh_fft" if reciprocal_backend == "mesh_fft" else "none"
@@ -1461,8 +1510,15 @@ class LatentReciprocalLongRange(nn.Module):
                 assignment=self.assignment,
                 full_ewald=self.mesh_fft_full_ewald,
                 reciprocal_only=self.mesh_fft_reciprocal_only,
+                smearing_sigma=smearing_sigma,
             )
-            self.exports_reciprocal_source = True
+            # The external reciprocal-only solver cannot reproduce a learned
+            # Green filter or optional real/self/background Ewald corrections.
+            # Fixed-sigma and three-axis-grid models keep their energy inline
+            # until the external C++ solver supports the same functional/grid.
+            self.exports_reciprocal_source = self.green_mode == "poisson" and smearing_sigma is None and isinstance(self.mesh_size, int) and (
+                not self.mesh_fft_full_ewald or self.mesh_fft_reciprocal_only)
+            self.runtime_backend = "mesh_fft" if self.exports_reciprocal_source else "none"
             self.energy_scale = nn.Parameter(torch.tensor(0.0))
         else:
             self.kernel = ReciprocalSpectralKernel3D(
@@ -1484,10 +1540,10 @@ class LatentReciprocalLongRange(nn.Module):
     def _neutralize_source(self, source: torch.Tensor, batch: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
         if not self.neutralize:
             return source
-        graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
-        graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=source.dtype)
-        counts = graph_mask.sum(dim=0).clamp_min(1.0).unsqueeze(-1)
-        graph_mean = torch.einsum("nb,nc->bc", graph_mask, source) / counts
+        if cell.shape[0] == 1:
+            return source - source.sum(dim=0, keepdim=True) / max(source.shape[0], 1)
+        counts = source.new_zeros(cell.size(0)).index_add(0, batch, source.new_ones(source.shape[0])).clamp_min(1).unsqueeze(-1)
+        graph_mean = source.new_zeros((cell.size(0), source.shape[1])).index_add(0, batch, source) / counts
         return source - graph_mean.index_select(0, batch)
 
     def forward(
@@ -1586,7 +1642,7 @@ def build_long_range_module(
     neutralize: bool = True,
     filter_hidden_dim: int = 64,
     kmax: int = 2,
-    mesh_size: int = 16,
+    mesh_size: int | tuple[int, int, int] = 16,
     slab_padding_factor: int = 2,
     include_k0: bool = False,
     source_channels: int = 1,
@@ -1597,6 +1653,7 @@ def build_long_range_module(
     assignment: str = "pcs",
     mesh_fft_full_ewald: bool = False,
     mesh_fft_reciprocal_only: bool = False,
+    smearing_sigma: float | None = None,
     theta: float = 0.5,
     leaf_size: int = 32,
     multipole_order: int = 0,
@@ -1633,6 +1690,7 @@ def build_long_range_module(
             assignment=assignment,
             mesh_fft_full_ewald=mesh_fft_full_ewald,
             mesh_fft_reciprocal_only=mesh_fft_reciprocal_only,
+            smearing_sigma=smearing_sigma,
         )
     raise ValueError(f"Unsupported long_range_mode: {mode!r}")
 
@@ -1648,7 +1706,7 @@ def configure_long_range_modules(
     long_range_neutralize: bool = True,
     long_range_filter_hidden_dim: int = 64,
     long_range_kmax: int = 2,
-    long_range_mesh_size: int = 16,
+    long_range_mesh_size: int | tuple[int, int, int] = 16,
     long_range_slab_padding_factor: int = 2,
     long_range_include_k0: bool = False,
     long_range_source_channels: int = 1,
@@ -1659,6 +1717,7 @@ def configure_long_range_modules(
     long_range_assignment: str = "pcs",
     long_range_mesh_fft_full_ewald: bool = False,
     long_range_mesh_fft_reciprocal_only: bool = False,
+    long_range_smearing_sigma: float | None = None,
     long_range_theta: float = 0.5,
     long_range_leaf_size: int = 32,
     long_range_multipole_order: int = 0,
@@ -1688,7 +1747,7 @@ def configure_long_range_modules(
     owner.long_range_neutralize = bool(long_range_neutralize)
     owner.long_range_filter_hidden_dim = int(long_range_filter_hidden_dim)
     owner.long_range_kmax = int(long_range_kmax)
-    owner.long_range_mesh_size = int(long_range_mesh_size)
+    owner.long_range_mesh_size = normalize_mesh_size(long_range_mesh_size)
     owner.long_range_slab_padding_factor = int(long_range_slab_padding_factor)
     owner.long_range_include_k0 = bool(long_range_include_k0)
     owner.long_range_source_channels = int(long_range_source_channels)
@@ -1699,6 +1758,7 @@ def configure_long_range_modules(
     owner.long_range_assignment = str(long_range_assignment)
     owner.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
     owner.long_range_mesh_fft_reciprocal_only = bool(long_range_mesh_fft_reciprocal_only)
+    owner.long_range_smearing_sigma = long_range_smearing_sigma
     owner.long_range_theta = float(long_range_theta)
     owner.long_range_leaf_size = int(long_range_leaf_size)
     owner.long_range_multipole_order = int(long_range_multipole_order)
@@ -1743,6 +1803,7 @@ def configure_long_range_modules(
         assignment=owner.long_range_assignment,
         mesh_fft_full_ewald=owner.long_range_mesh_fft_full_ewald,
         mesh_fft_reciprocal_only=owner.long_range_mesh_fft_reciprocal_only,
+        smearing_sigma=owner.long_range_smearing_sigma,
         theta=owner.long_range_theta,
         leaf_size=owner.long_range_leaf_size,
         multipole_order=owner.long_range_multipole_order,
