@@ -1321,7 +1321,10 @@ class ForceTrainer:
                 grad_targets = [pos_leaf, strain]
             else:
                 pos_in, cell_in, grad_targets = pos_leaf, cell, [pos_leaf]
-            out = self.model(
+            # Epoch validation runs on rank zero. Bypass DDP forward hooks,
+            # including bucket rebuilds that require every rank to participate.
+            forward_model = self.model if training else self._raw_model
+            out = forward_model(
                 pos_in,
                 A,
                 batch_idx,
@@ -1619,7 +1622,7 @@ class ForceTrainer:
                           f"Fmae={_va['force_mae']:.6g} Emae={_va['energy_mae_avg']:.6g}"
                           f"{_stress_metrics}", flush=True)
                     self._append_loss_csv(epoch, self.global_step, "mid", _va)
-                    self._save_rolling_checkpoint(epoch)
+                self._save_rolling_checkpoint(epoch)
                 if self._dist_ready():
                     dist.barrier()
                 self.model.train()
@@ -1843,6 +1846,11 @@ class ForceTrainer:
         """Validate one model state and make it eligible for global best selection."""
         va = self._val_pass()
         cur = self._broadcast_float(va["total_loss"])
+        improved = cur < self.best_validation_loss
+        if improved:
+            self.best_validation_loss = cur
+            if self.checkpoint_path is not None:
+                self._sync_dispersion_graph_observation()
         if self.main_process:
             log.info(
                 "epoch %d step %d %s-VAL loss=%.6g Frmse=%.6g Ermse=%.6g Fmae=%.6g Emae=%.6g",
@@ -1850,12 +1858,10 @@ class ForceTrainer:
                 va["energy_rmse_avg"], va["force_mae"], va["energy_mae_avg"],
             )
             self._append_loss_csv(epoch, self.global_step, label, va)
-            if cur < self.best_validation_loss:
-                self.best_validation_loss = cur
+            if improved:
                 if self.checkpoint_path is not None:
-                    self._sync_dispersion_graph_observation()
                     self.save_checkpoint(self.checkpoint_path, epoch=epoch)
-            self._save_rolling_checkpoint(epoch)
+        self._save_rolling_checkpoint(epoch)
         self.best_validation_loss = self._broadcast_float(self.best_validation_loss)
         return va
 
@@ -2094,9 +2100,12 @@ class ForceTrainer:
         independent of the best-on-improvement save to ``checkpoint_path`` (which remains the
         canonical resume/deploy target). Each rolling file is ``<stem>.e<E>s<STEP><ext>``.
         No-op when ``keep_checkpoints <= 0`` (default), so existing runs are unaffected."""
-        if self.keep_checkpoints <= 0 or self.checkpoint_path is None or not self.main_process:
+        if self.keep_checkpoints <= 0 or self.checkpoint_path is None:
             return
+        # The observation reduction is collective; writing is rank-zero only.
         self._sync_dispersion_graph_observation()
+        if not self.main_process:
+            return
         stem, ext = os.path.splitext(self.checkpoint_path)
         path = f"{stem}.e{epoch}s{self.global_step}{ext or '.pth'}"
         self.save_checkpoint(path, epoch=epoch)
