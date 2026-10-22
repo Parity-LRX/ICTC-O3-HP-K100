@@ -632,6 +632,14 @@ the original `atol=rtol=2e-5` and relative L2 `<1e-5` limits are retained.
 
 ### Current default interface qualification
 
+The standalone model API also enables compact six-component quadrupole
+assignment by default. Its K100 qualification passes 24 independent
+full-spectrum energy/first/mixed-second derivative cases, 14 electrostatic
+configurations, finite-difference gradient and second-gradient checks, and
+three whole-model energy/force/cell-loss parameter-gradient comparisons
+with actual AdamW updates. The native MFF interface already used this
+representation in the scaling measurements below.
+
 The [README scaling results](../README.md#multi-gpu-results) use the merged
 `main` defaults on 1/2/4/8 K100 GPUs, with separate short-range, monopole,
 dipole and quadrupole series. Every moment order passes 512-atom energy/force

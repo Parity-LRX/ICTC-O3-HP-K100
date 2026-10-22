@@ -1295,7 +1295,8 @@ class MeshLongRangeKernel3D(nn.Module):
     ) -> torch.Tensor:
         if self._native_mesh(source) and getattr(self, "fuse_multipole_fft", True):
             from .hip_reciprocal_fft import multipole_energy
-            return multipole_energy(self, pos, batch, cell, source, dipole, quadrupole)
+            return multipole_energy(self, pos, batch, cell, source, dipole, quadrupole,
+                                    compact_quadrupole=True)
         src_c = source.size(1)
         frac = _prepare_frac_for_boundary_batched(
             pos,
