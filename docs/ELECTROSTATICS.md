@@ -625,10 +625,32 @@ Forty-five direct CSR checks are bitwise identical to the original schedule,
 with separate FP64 tensor-product references. Eight spectral contraction
 checks cover energy, first derivatives and mixed Hessian-vector products in
 FP32/FP64 with multiple batches and source channels. Eight-GPU whole-model
-force checks pass before and after MD at 512 and 4,096 atoms, covering the
+q/μ/Q force checks pass before and after MD at 512 and 4,096 atoms, covering the
 replicated and distributed reciprocal paths. The force oracle evaluates the
 same checkpoint in FP64 using the interface's FP32 periodic-image geometry;
 the original `atol=rtol=2e-5` and relative L2 `<1e-5` limits are retained.
+
+### Current default interface qualification
+
+The [README scaling results](../README.md#multi-gpu-results) use the merged
+`main` defaults on 1/2/4/8 K100 GPUs, with separate short-range, monopole,
+dipole and quadrupole series. Every moment order passes 512-atom energy/force
+checks before and after MD at each GPU count. MACE-MH-1 retains the original
+pretrained heads and passes separate original-MACE checks with migration and
+sorting; no electrostatic head is added to that model.
+
+An additional 4,096-atom dipole-only audit exposes a pre-existing FP32 error
+level of about `1.09e-5` relative L2 against the FP64 same-checkpoint oracle.
+Both the old native implementation and both optimized versions exceed the
+extra `1e-5` relative audit threshold on this fixture. This is retained as a
+qualification limitation, rather than reported as a passing FP64 audit.
+At identical coordinates from the initial and after-MD geometries, the full
+optimized force vectors differ from the old native result by at most
+`4.2e-7` relative L2 and `7.2e-7` maximum absolute error. The separate
+incremental-error check passes `atol=rtol=2e-5` and relative L2 `<1e-6`.
+After-MD states are replayed at identical coordinates for this comparison;
+force vectors from independently integrated trajectories are not compared
+as though their positions were identical.
 
 ### Confirmed capacity with the README model
 

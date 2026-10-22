@@ -21,6 +21,7 @@ from ictc_o3 import (
     EdgeTensorProduct, GraphMessage, PackedGraphMessage,
     direction_harmonics, create_symmetric_contraction,
     configure_symmetric_contraction, channel_linear, normalized_silu,
+    MeshElectrostatics, mesh_shape_for_cell,
 )
 from mace_ictc.hp import create_model, configure_model, energy_and_forces
 from mace_ictc.training import ForceTrainer
@@ -74,6 +75,7 @@ examples are in the [K100 MFF-Torch guide](lammps_user_mfftorch/README.md).
 - Streamed inference gates, chunked backward kernels and grouped element-conditioned linear maps.
 - Nonlinear MACE-MH-1 conversion with all original readout heads retained.
 - Standard MACE conversion preserves radial MLP hidden widths and depth.
+- Native K100 monopole, dipole and quadrupole reciprocal electrostatics.
 - LAMMPS interfaces and model export utilities.
 
 ```python
@@ -93,132 +95,240 @@ See the [API guide](docs/HP_API.md) for training, inference and conversion.
 The current MH-1 foundation adapter supports frozen-weight force inference;
 full MH-1 fine-tuning requires a training adapter.
 
+## Native long-range electrostatics
+
+Standalone electrostatics operators are exposed through `ictc_o3`, and learned
+source heads integrate with MACE-ICTC energy-and-force training and native
+`mff/torch/kk` inference. The implementation supports monopoles `q`, dipoles
+`μ` and quadrupoles `Q`, arbitrary source-channel counts, cell gradients and
+mixed second derivatives. Its physical scope is a Gaussian-screened reciprocal
+correction with periodic or padded-slab boundaries. Full real-space Ewald is
+outside this implementation.
+
+```python
+from ictc_o3 import MeshElectrostatics, mesh_shape_for_cell
+
+mesh = mesh_shape_for_cell(cell, spacing=0.5)  # Choose once during setup.
+solver = MeshElectrostatics(
+    mesh_size=mesh, smearing_sigma=1.0, backend="hip",
+).to(device=positions.device, dtype=positions.dtype)
+atom_energy = solver(positions, batch, cell, q, mu, Q)
+```
+
+Native multi-GPU deployment partitions physical source atoms and FFT slabs
+across ranks. Differentiable RCCL exchanges retain both direct electrostatic
+forces and the response of learned moments. The optimized message schedule,
+real-component multipole contractions and automatic distributed-FFT selection
+are enabled by default. `mff-export-core` continues to default to native
+performance inference; capacity mode additionally bounds large temporary
+allocations through chunking and radial rematerialization.
+
+See the [electrostatics API and physical conventions](docs/ELECTROSTATICS.md)
+for model configuration, tensor shapes, derivatives and validation.
+
 ## Multi-GPU results
 
-Measured on a single node with 64 GiB Hygon K100 GPUs, FP32 arithmetic and
-TensorFloat-32 (TF32) disabled. The figures show complete MD step throughput,
-including integration, neighbor rebuilding, energy, forces and communication.
-Throughput is `global physical atoms / seconds per step`, reported as
-atom-steps/s; ghost copies are excluded from the atom count. `k` means thousand.
-
-These measurements use the eager LAMMPS
-[ML-IAP](https://docs.lammps.org/pair_mliap.html) interface with FP32 RCCL feature
-exchange through dedicated adapters, separate from the generic Python callback.
-The public MFF native default packages the same native HP execution and
-layerwise transport strategy. The existing figures retain their original
-ML-IAP measurement provenance. `.pt2` deployment is unsupported on K100. See the
-[LAMMPS guide](lammps_user_mfftorch/docs/BUILD_AND_RUN.md).
-
-The packaged MFF native default is also verified on 1/2/4/8 GPUs. Its 8-GPU
-strong/weak efficiencies are 89.21%/90.50% for C64 and
-97.96%/98.00% for MH-1. Weak-scaling throughput reaches 882k and 75.3k
-atom-steps/s, respectively. See the [MFF measurements and protocol](lammps_user_mfftorch/docs/BUILD_AND_RUN.md#packaged-mff-default-complete-md-steps).
+Remeasured on 2026-10-22 with the current default native `mff/torch/kk` interface,
+one MPI rank and two CPU threads per active Hygon K100 GPU. Execution uses eager
+FP32 with TF32 disabled. Each strong- or weak-scaling series runs on one exclusive
+eight-GPU node, using 1/2/4/8 active GPUs. The measured complete MD step includes
+integration, neighbor rebuilding, energy, forces, communication and runtime cache
+handoff. Physical atoms determine throughput; ghost copies are excluded.
 
 ### C64 scaling
 
-![C64 on 1, 2, 4 and 8 K100 GPUs: strong scaling reaches 7.07 times speedup; weak scaling reaches 894 thousand atom-steps per second with 90.03 percent efficiency.](docs/assets/c64-scaling.svg)
+![Native C64 strong scaling and weak-scaling throughput on 1, 2, 4 and 8 K100 GPUs.](docs/assets/c64-scaling.svg)
 
-C64, hidden/edge `lmax=2`, 2 interactions, full Clebsch–Gordan (CG)
-`correlation=3`; randomly initialized H/C/O weights, cutoff 4.5 Å and about
-50 neighbors/atom. Grouped element-conditioned linear maps and forward/backward
-edge chunks of 1,048,576/32,768. Strong scaling fixes 262,144 atoms; weak
-scaling uses 131,072 atoms/GPU with unchanged domain size per GPU.
+The original C64/lmax=2/two-interaction/full-CG correlation=3 H/C/O checkpoint
+retains its 64-channel hidden readout, cutoff polynomial parameter `p=6`, radial
+MLP widths `[64,64,64]` and 4.5 Å cutoff. Density is 0.125 atoms/Å³; the initial
+neighbor count is about 50. Strong scaling fixes 262,144 atoms; weak scaling
+fixes 131,072 atoms/GPU. The public performance defaults are used throughout.
+
+At eight GPUs, strong scaling reaches 7.07× speedup and 88.4% efficiency. Weak-scaling efficiency is 90.2%, with 878k atom-steps/s.
 
 <details>
-<summary>Exact step times, throughput and scaling data</summary>
+<summary>Exact latency, throughput and scaling measurements</summary>
 
-Strong scaling: fixed total atom count; speedup is the one-GPU time divided by the multi-GPU time.
+Strong scaling:
 
-| GPUs | Global atoms | ms/step | Throughput (atom-steps/s) | Speedup | Efficiency |
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 262,144 | 2,128.899 | 123,136 | 1.000× | 100.00% |
-| 2 | 262,144 | 1,125.568 | 232,899 | 1.891× | 94.57% |
-| 4 | 262,144 | 566.008 | 463,146 | 3.761× | 94.03% |
-| 8 | 262,144 | 301.215 | 870,288 | 7.068× | 88.35% |
+| 1 | 262,144 | 2,185.003 | 119,974 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,148.517 | 228,246 | 1.902× | 95.12% |
+| 4 | 262,144 | 580.648 | 451,468 | 3.763× | 94.08% |
+| 8 | 262,144 | 309.072 | 848,164 | 7.070× | 88.37% |
 
-Weak scaling: fixed atoms per GPU; speedup is total throughput divided by the one-GPU throughput.
+Weak scaling:
 
-| GPUs | Global atoms | ms/step | Throughput (atom-steps/s) | Speedup | Efficiency |
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 131,072 | 1,055.564 | 124,173 | 1.000× | 100.00% |
-| 2 | 262,144 | 1,114.135 | 235,289 | 1.895× | 94.74% |
-| 4 | 524,288 | 1,132.590 | 462,911 | 3.728× | 93.20% |
-| 8 | 1,048,576 | 1,172.413 | 894,374 | 7.203× | 90.03% |
+| 1 | 131,072 | 1,077.001 | 121,701 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,137.249 | 230,507 | 1.894× | 94.70% |
+| 4 | 524,288 | 1,158.413 | 452,591 | 3.719× | 92.97% |
+| 8 | 1,048,576 | 1,194.410 | 877,903 | 7.214× | 90.17% |
+
+</details>
+
+### Long-range scaling
+
+![Native C64 short-range and monopole, dipole and quadrupole complete-step throughput under strong and weak scaling.](docs/assets/electrostatics-scaling-k100.svg)
+
+The long-range extensions preserve every short-range checkpoint tensor and add
+nonzero initialized source heads. All use one source channel, PCS assignment,
+Gaussian width 1 Å and 0.5 Å mesh spacing. The mesh grows with physical volume
+in weak scaling. These heads are benchmark extensions, not electrostatically
+refitted pretrained potentials. Automatic owner-partitioned source routing and
+distributed FFTs use the public defaults, with all communication timed.
+
+| Moments | 8-GPU strong throughput (atom-steps/s) | Strong efficiency | 8-GPU weak throughput (atom-steps/s) | Weak efficiency |
+| --- | ---: | ---: | ---: | ---: |
+| q | 783,388 | 84.6% | 829,758 | 88.3% |
+| q + μ | 745,088 | 84.7% | 756,139 | 84.6% |
+| q + μ + Q | 648,038 | 86.8% | 621,525 | 79.8% |
+
+<details>
+<summary>Long-range latency and throughput at every GPU count</summary>
+
+#### q
+
+Strong scaling:
+
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 262,144 | 2,265.622 | 115,705 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,199.669 | 218,514 | 1.889× | 94.43% |
+| 4 | 262,144 | 607.071 | 431,818 | 3.732× | 93.30% |
+| 8 | 262,144 | 334.629 | 783,388 | 6.771× | 84.63% |
+
+Weak scaling:
+
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 131,072 | 1,116.359 | 117,410 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,194.765 | 219,411 | 1.869× | 93.44% |
+| 4 | 524,288 | 1,208.869 | 433,701 | 3.694× | 92.35% |
+| 8 | 1,048,576 | 1,263.713 | 829,758 | 7.067× | 88.34% |
+
+#### q + μ
+
+Strong scaling:
+
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 262,144 | 2,384.727 | 109,926 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,350.536 | 194,104 | 1.766× | 88.29% |
+| 4 | 262,144 | 659.780 | 397,320 | 3.614× | 90.36% |
+| 8 | 262,144 | 351.830 | 745,088 | 6.778× | 84.73% |
+
+Weak scaling:
+
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 131,072 | 1,172.882 | 111,752 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,312.768 | 199,688 | 1.787× | 89.34% |
+| 4 | 524,288 | 1,330.853 | 393,949 | 3.525× | 88.13% |
+| 8 | 1,048,576 | 1,386.750 | 756,139 | 6.766× | 84.58% |
+
+#### q + μ + Q
+
+Strong scaling:
+
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 262,144 | 2,810.581 | 93,270 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,599.829 | 163,858 | 1.757× | 87.84% |
+| 4 | 262,144 | 759.810 | 345,013 | 3.699× | 92.48% |
+| 8 | 262,144 | 404.520 | 648,038 | 6.948× | 86.85% |
+
+Weak scaling:
+
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 131,072 | 1,346.530 | 97,341 | 1.000× | 100.00% |
+| 2 | 262,144 | 1,572.071 | 166,751 | 1.713× | 85.65% |
+| 4 | 524,288 | 1,601.734 | 327,325 | 3.363× | 84.07% |
+| 8 | 1,048,576 | 1,687.103 | 621,525 | 6.385× | 79.81% |
 
 </details>
 
 ### MACE-MH-1 scaling
 
-![Pretrained MACE-MH-1 on 1, 2, 4 and 8 K100 GPUs: strong scaling reaches 7.56 times speedup; weak scaling reaches 74.0 thousand atom-steps per second with 97.00 percent efficiency.](docs/assets/mh1-scaling.svg)
+![Native pretrained MACE-MH-1 strong scaling and weak-scaling throughput on 1, 2, 4 and 8 K100 GPUs.](docs/assets/mh1-scaling.svg)
 
-Pretrained `omat_pbe` head, with all six original heads retained. Periodic
-face-centered cubic (FCC) Cu, lattice constant 3.615 Å, cutoff 6 Å and
-78 neighbors/atom. Projected-feature FP32 RCCL exchange; forward, backward and
-radial edge chunks 262,144/32,768/32,768. Strong scaling fixes 65,536 atoms;
-weak scaling uses 32,768 atoms/GPU with unchanged domain size per GPU.
-Every GPU count passed 256-atom original-MACE energy/force checks and
-per-rank ghost-feature and reverse-gradient communication checks.
+The pretrained `omat_pbe` head is selected while all six original heads remain
+in the converted model. No electrostatic head is added. The material is periodic
+FCC Cu with lattice constant 3.615 Å, a 6 Å cutoff and about 78 neighbors/atom.
+Strong scaling fixes 65,536 atoms; weak scaling fixes 32,768 atoms/GPU.
+Every GPU count passes original-MACE energy/force checks before and after
+motion with atom migration and sorting, plus ghost-feature and reverse-gradient
+communication checks.
+
+At eight GPUs, strong scaling reaches 7.90× speedup and 98.8% efficiency. Weak-scaling efficiency is 98.3%, with 75k atom-steps/s.
 
 <details>
-<summary>Exact step times, throughput and scaling data</summary>
+<summary>Exact latency, throughput and scaling measurements</summary>
 
-Strong scaling: fixed total atom count; speedup is the one-GPU time divided by the multi-GPU time.
+Strong scaling:
 
-| GPUs | Global atoms | ms/step | Throughput (atom-steps/s) | Speedup | Efficiency |
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 65,536 | 6,907.408 | 9,488 | 1.000× | 100.00% |
-| 2 | 65,536 | 3,505.261 | 18,696 | 1.971× | 98.53% |
-| 4 | 65,536 | 1,774.945 | 36,923 | 3.892× | 97.29% |
-| 8 | 65,536 | 913.766 | 71,721 | 7.559× | 94.49% |
+| 1 | 65,536 | 7,008.708 | 9,351 | 1.000× | 100.00% |
+| 2 | 65,536 | 3,491.023 | 18,773 | 2.008× | 100.38% |
+| 4 | 65,536 | 1,744.131 | 37,575 | 4.018× | 100.46% |
+| 8 | 65,536 | 886.747 | 73,906 | 7.904× | 98.80% |
 
-Weak scaling: fixed atoms per GPU; speedup is total throughput divided by the one-GPU throughput.
+Weak scaling:
 
-| GPUs | Global atoms | ms/step | Throughput (atom-steps/s) | Speedup | Efficiency |
+| GPUs | Global atoms | ms/step | Atom-steps/s | Speedup | Efficiency |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 32,768 | 3,437.113 | 9,534 | 1.000× | 100.00% |
-| 2 | 65,536 | 3,506.372 | 18,691 | 1.960× | 98.02% |
-| 4 | 131,072 | 3,524.422 | 37,190 | 3.901× | 97.52% |
-| 8 | 262,144 | 3,543.252 | 73,984 | 7.760× | 97.00% |
+| 1 | 32,768 | 3,433.767 | 9,543 | 1.000× | 100.00% |
+| 2 | 65,536 | 3,464.649 | 18,916 | 1.982× | 99.11% |
+| 4 | 131,072 | 3,476.302 | 37,704 | 3.951× | 98.78% |
+| 8 | 262,144 | 3,491.520 | 75,080 | 7.868× | 98.35% |
 
 </details>
 
 #### MD timing protocol
 
-Scaling was measured with version 0.1.0 on 2026-10-21: one MPI rank and two CPU
-threads per GPU, 3 warmup steps and three consecutive 20-step windows. Each
-step uses synchronized wall time and the maximum across MPI ranks; the reported
-time is the median of the three window means. Startup and JIT compilation are
-excluded. Neighbor rebuilding/sorting and release of unused PyTorch allocator
-cache are included; the neighbor list is rebuilt every step in these workloads.
-The three consecutive windows do not provide a confidence interval from
-independent runs.
+Scaling timings use three warmup steps followed by three consecutive 20-step
+windows. Each step is synchronized and uses the maximum wall time across MPI
+ranks; the reported result is the median of the window means. Startup, export
+and native kernel JIT are excluded. Timed runs disable atom sorting, rebuild
+neighbors every step with a 0.5 Å skin, and start with 300 K Gaussian velocities
+(seed 271828) at a 0.25 fs timestep. The allocator uses
+`max_split_size_mb:1024`. Consecutive windows are not independent runs.
 
-Strong efficiency is `T₁(N)/(p×Tₚ(N))`; weak efficiency is `T₁(n)/Tₚ(p×n)`, where
-`p` is the GPU count, `N` the global atom count, `n` the atoms per GPU and `Tₚ`
-the measured step time. C64 means 64 channels per irrep degree; correlation and
-interaction depth are separate settings. See the
-[API terminology](docs/HP_API.md#terminology-and-notation).
+Strong efficiency is `T₁(N)/(p×Tₚ(N))`; weak efficiency is `T₁(n)/Tₚ(p×n)`.
+Throughput is `global physical atoms / seconds per step`.
 
-### Eight-GPU capacity
+The 512-atom C64 force checks pass at every GPU count for all moment orders.
+An additional 4,096-atom dipole audit gives about `1.09e-5` relative force error
+against FP64 in both the old and optimized FP32 implementations. The optimized
+version differs from the old native force vectors by at most `4.18e-07` relative L2;
+the stricter `1e-6` incremental-error gate passes. The FP64 audit limitation is
+retained explicitly; see the [validation details](docs/ELECTROSTATICS.md).
 
-![Demonstrated eight-K100 capacity: C64 runs 3,241,792 atoms at 3.694 seconds per step, and pretrained MACE-MH-1 runs 1,146,880 atoms at 16.083 seconds per step.](docs/assets/eight-gpu-capacity.svg)
+### Large-system runs on eight GPUs
 
-ML-IAP with FP32 RCCL feature exchange; 50 timed microcanonical (NVE) steps
-after warmup, 0.25 fs timestep. Times are per-step medians; capacity throughput
-is derived from the reported, rounded step times. These are short runs near
-the memory limit. Capacity depends on the model, density and neighbor count,
-and does not establish long-trajectory stability. The two cases use the model
-and material configurations shown above.
+![Fresh native large-system demonstrations and measured throughput for C64 short range, C64 with multipoles and pretrained MACE-MH-1 on eight K100 GPUs.](docs/assets/eight-gpu-capacity.svg)
 
-<details>
-<summary>Capacity measurements</summary>
+Each point completes one warmup and 50 timed NVE steps at 0.25 fs; the reported
+latency is the median step time. These are demonstrated sizes, not an exhaustive
+maximum-capacity scan. Device usage is sampled every 10–20 ms and includes
+runtime allocations outside PyTorch. The allocated PyTorch peak is reported
+separately.
 
-| Model | Global atoms | Mean neighbors | s/step | Throughput (atom-steps/s) |
-| --- | ---: | ---: | ---: | ---: |
-| C64 | 3,241,792 | 49.73 | 3.694 | ~877,583 |
-| MACE-MH-1 | 1,146,880 | 78 | 16.083 | ~71,310 |
+| Model | Mode | Global atoms | s/step | Atom-steps/s | PyTorch peak (GiB/GPU) | Sampled device usage (GiB/GPU) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| C64 short range | capacity | 3,241,792 | 4.148 | 781,570 | 33.52 | 59.71 |
+| C64 q + μ + Q | capacity | 3,241,792 | 5.213 | 621,882 | 33.53 | 60.43 |
+| MACE-MH-1 | performance | 1,146,880 | 15.971 | 71,809 | 58.54 | 63.98 |
 
-</details>
+The C64 long-range run uses a 592³ reciprocal grid,
+initial neighbor count about 49.74 and fixed 0.5 Å mesh spacing. The MH-1 point
+uses the unchanged pretrained model and FCC Cu setup above. Short timing runs
+do not establish fitted-potential accuracy or long-trajectory stability.
 
 ## Training and inference
 

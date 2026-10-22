@@ -375,35 +375,26 @@ on the same periodic geometry, at `atol=rtol=2e-5`.
   styles on 1/2/4/8 ranks. It also checks that an archive exported on one GPU
   can run on another GPU without retaining a fixed tracing device.
 
-The original README ML-IAP/RCCL scripts were rerun separately: C64 8-GPU
-strong/weak efficiency was 88.35%/90.08%; MH-1 was 94.20%/96.58%. These numbers
-identify the original measurement path. MFF uses its own C++ graph and force
-handling, so its performance is measured separately.
-
 ### Packaged MFF default: complete MD steps
 
-The public native default was also timed on 1/2/4/8 K100 GPUs. Strong scaling
-uses 262,144 physical atoms for C64 and 65,536 for MH-1:
+The current defaults were remeasured on 1/2/4/8 K100 GPUs on 2026-10-22.
+See the [README measurements](../../README.md#multi-gpu-results) for current
+latency, throughput, strong/weak scaling and large-system demonstrations.
+The measurements include the original C64 short-range checkpoint, its
+monopole/dipole/quadrupole extensions and pretrained MACE-MH-1 without an
+added long-range head. Strong scaling uses 262,144 physical atoms for C64
+and 65,536 for MH-1; weak scaling uses 131,072 and 32,768 atoms/GPU.
 
-| GPUs | C64, ms/step | MH-1, ms/step |
-| ---: | ---: | ---: |
-| 1 | 2187.849 | 6891.125 |
-| 2 | 1150.679 | 3471.875 |
-| 4 | 581.739 | 1747.780 |
-| 8 | 306.573 | 879.326 |
+The native export and C++ MFF/Kokkos pair style run in eager FP32 with TF32
+off and two CPU threads per rank. Three warmup steps precede three consecutive
+20-step windows; the median window mean is reported. Neighbor rebuilding,
+NVE integration, energy, forces, communication and allocator handoff are
+included. Each strong- or weak-scaling series uses one exclusive eight-K100
+node across all GPU counts. Consecutive windows are not independent runs.
+Physical atoms determine throughput; ghost copies are excluded.
 
-Eight-GPU strong-scaling efficiency is 89.21% for C64 and 97.96% for MH-1.
-With weak scaling, C64 reaches 882,196 atom-steps/s at 1,048,576 atoms
-(90.50% efficiency); MH-1 reaches 75,316 atom-steps/s at 262,144 atoms
-(98.00% efficiency). Ghost copies are excluded from the physical atom count.
-
-These measurements use the public native export and C++ MFF/Kokkos pair style,
-FP32, two CPU threads per rank, three warmup steps and the median of three
-consecutive 20-step means. Neighbor rebuilding, NVE integration, energy,
-forces, communication and allocator handoff are included. Each GPU-count
-point has an exclusive eight-K100 node allocation; the four counts ran on
-different nodes. Node variation and the three consecutive windows limit how
-precisely small performance differences can be interpreted.
+For long-range physical conventions and the additional dipole FP64 audit,
+see the [electrostatics qualification](../../docs/ELECTROSTATICS.md#current-default-interface-qualification).
 
 The installed `mff-lammps` command is separately checked on 1 and 8 ranks
 with Kokkos and plain graph preparation. Eight-rank Kokkos execution also
