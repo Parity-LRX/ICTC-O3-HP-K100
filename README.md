@@ -441,7 +441,7 @@ energy/force tolerances are retained.
 | Short range | 311.7 | 108.5% | 306.6 | 99.3% |
 | q | 286.0 | 103.1% | 294.7 | 98.9% |
 | q + μ | 267.2 | 100.1% | 284.2 | 99.7% |
-| q + μ + Q | 242.6 | 97.8% | 262.0 | 99.7% |
+| q&nbsp;+&nbsp;μ&nbsp;+&nbsp;Q | 242.6 | 97.8% | 262.0 | 99.7% |
 
 Strong-scaling efficiency is end-to-end speedup divided by GPU count; the
 measured superlinear cases retain values above 100%. The one-GPU baseline
