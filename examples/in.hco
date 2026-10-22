@@ -1,0 +1,17 @@
+# H/C/O example: system.data must define exactly these three atom types.
+units metal
+atom_style atomic
+atom_modify map array
+boundary p p p
+read_data system.data
+mass 1 1.008
+mass 2 12.011
+mass 3 15.999
+neighbor 0.5 bin
+neigh_modify every 1 delay 0 check yes
+pair_style mff/torch/kk 4.5 cuda
+pair_coeff * * models/core.pt H C O
+thermo 1
+thermo_style custom step atoms pe fmax
+dump forces all custom 1 forces.dump id type x y z fx fy fz
+run 0

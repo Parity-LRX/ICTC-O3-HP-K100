@@ -7,6 +7,11 @@ Version **0.1.0**. Distribution: `ictc-o3-hp-k100`.
 Python packages: `ictc_o3` for standalone operators and `mace_ictc` for the
 MACE-ICTC framework.
 
+Start with the [user guide](docs/USAGE.md) for complete training recipes with
+or without long-range electrostatics, MACE checkpoint conversion, Python
+prediction, and LAMMPS compilation and execution. Copyable recipes are in
+[`examples/`](examples/).
+
 ## Python API
 
 The two packages live side by side and are installed together:
