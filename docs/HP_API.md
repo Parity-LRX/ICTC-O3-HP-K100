@@ -430,6 +430,74 @@ It changes an existing checkpoint whose TP coefficients are trainable.
 `train_makefx_compile=False` in `ForceTrainer` and omit `--train-makefx-compile`
 on the CLI for the supported K100 eager training path.
 
+### C64 K100 training preset
+
+The [long-range training measurements](../README.md#long-range-training) use
+the following eager preset for C64, lmax=2, two interactions and correlation=3.
+Apply it to the intended training model with its original parameter flags;
+the call preserves weights, dtype and trainability.
+
+```python
+info = configure_model(
+    model, training=True, policy="generated", layout="fused_pack",
+    message_schedule="roles", species_schedule="indexed",
+    graph_reduction="csr", topology_backend="native",
+    csr_accumulator_limit=24, csr_slice_search=True,
+    geometry_schedule="streamed", message_chunk_edges=32768,
+    training_gate_schedule="materialized", mixed_channel_tile=32,
+    mixed_geometry_schedule="fused", training_adjoint_channel_tile=0,
+    training_gate_gemm_policy="k100_tiled", electrostatics_backend="hip",
+)
+```
+
+`training_message_linear_layout="node_component"` remains the default.
+This measured preset is distinct from the portable API defaults and from
+inference capacity mode. The standalone parameter-training loop above uses
+the preset directly; when using a trainer that configures its own operator
+plan, apply the desired preset after trainer initialization.
+
+### DDP with learned electrostatic heads
+
+DDP gives each rank complete, independent periodic graphs and synchronizes
+parameter gradients through RCCL. It does not split a single cell across
+GPUs. Each local graph retains its own charge neutralization, cell and mesh.
+PyTorch names the HIP/RCCL backend `"nccl"`.
+The CLI keeps ordinary gradient buckets (`gradient_as_bucket_view=False`).
+
+For example, inside an eight-GPU batch allocation:
+
+```bash
+torchrun --standalone --nproc-per-node=8 -m mace_ictc.cli.train \
+  --data-dir /task/data --dtype float32 --device cuda \
+  --channels 64 --lmax 2 --max-ell 2 --num-interaction 2 --correlation 3 \
+  --max-radius 4.5 --readout-hidden-channels 64 --polynomial-cutoff-p 6 \
+  --route baseline --product-backend ictd-bridge-u --angular-basis ictd \
+  --freeze-conv-tp-weight --operator-plan generated --generated-layout fused_pack \
+  --backward-targets parameters --ddp on --ddp-backend nccl \
+  --ddp-find-unused-parameters \
+  --long-range-mode reciprocal-spectral-v1 \
+  --long-range-reciprocal-backend mesh_fft --long-range-max-multipole-l 2 \
+  --long-range-mesh-size 64,64,128 --long-range-assignment pcs \
+  --long-range-smearing-sigma 1.0 --long-range-mesh-fft-full-ewald \
+  --long-range-mesh-fft-reciprocal-only --electrostatics-backend hip
+```
+
+Select mesh dimensions for the actual cells and spatial resolution. Batch
+size is per DDP rank. Set `--long-range-max-multipole-l` to `1` for q + μ,
+`2` for q + μ + Q, or `0` for the scalar charge head. All DDP ranks use the
+same model configuration. Omit the long-range arguments for short-range training.
+`--long-range-mesh-fft-full-ewald` enables Gaussian screening in this example;
+the accompanying `--long-range-mesh-fft-reciprocal-only` retains only the
+screened reciprocal functional.
+
+The 1/2/4/8-GPU checks compare global-batch parameter gradients with serial
+training, check AdamW against its update formula and compare updated-model
+energy and forces. Charge neutralization removes a uniform scalar-source
+bias exactly in real arithmetic. Tiny FP32 atomic-reduction residuals can
+produce different AdamW updates in that physical null direction; the checks
+identify it explicitly and retain the original gradient and energy/force
+tolerances. Source heads remain trainable during these checks and timings.
+
 ## 6. Checkpoint conversion and LAMMPS on K100
 
 ### Convert a supported MACE model

@@ -66,7 +66,13 @@ The training CLI accepts `--long-range-mesh-size 128,128,256`; checkpoint
 and JSON metadata preserve all three sizes. Legacy integer configurations
 retain their original meaning.
 
-## Whole-model overhead with fixed screening
+## Earlier factory-model measurements
+
+The latest canonical-checkpoint training throughput, allocated and device
+memory, OOM scan, and 1/2/4/8-GPU DDP results are in the
+[README training comparison](../README.md#long-range-training). The earlier
+factory-model measurements below use a different model preset and predate
+the current compact multipole path; they are retained as historical context.
 
 ![Whole-model energy-and-force inference and training throughput, with peak allocated memory, for the short-range HP backbone and learned monopole, dipole and quadrupole extensions.](assets/electrostatics-whole-model-k100.svg)
 
@@ -367,6 +373,9 @@ reciprocal energy.
 The standalone API supplies each physical atom once on one device.
 Independent-graph DDP can use a local mesh per rank. Native MFF additionally
 supports a domain-decomposed graph through the global reductions below.
+The [DDP training guide](HP_API.md#ddp-with-learned-electrostatic-heads)
+describes launch arguments, local batch semantics and numerical checks;
+the [README](../README.md#long-range-training) reports measured scaling.
 
 ## Native LAMMPS `mff/torch/kk`
 

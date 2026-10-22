@@ -330,6 +330,167 @@ initial neighbor count about 49.74 and fixed 0.5 Å mesh spacing. The MH-1 point
 uses the unchanged pretrained model and FCC Cu setup above. Short timing runs
 do not establish fitted-potential accuracy or long-trajectory stability.
 
+## Long-range training
+
+Remeasured on 2026-10-22 with the README C64/lmax=2/two-interaction/full-CG
+correlation=3 checkpoint, including its 64-channel readout and cutoff polynomial
+`p=6`. Every learned backbone weight and active electrostatic source head is
+trainable; the architecture's fixed TP path constants remain fixed.
+
+### Head overhead and GPU memory
+
+![Energy-and-force training throughput, peak allocated memory and sampled device memory for short range and monopole, dipole and quadrupole extensions.](docs/assets/electrostatics-training-k100.svg)
+
+Each point uses one K100 GPU. The four variants use identical backbone weights,
+a periodic H/C/O graph with approximately 50 directed neighbors per atom and
+4.5 Å cutoff. Long range uses nonzero initialized source heads, one source channel,
+PCS, fixed sigma 1.0 Å and three-axis grids at 0.5 Å spacing. These are throughput
+fixtures with identical zero energy/force targets, not fitted electrostatic potentials.
+
+One step includes energy, forces with `create_graph=True`, the energy-plus-force
+parameter backward with mixed second derivatives, and AdamW (`lr=1e-4`, no weight
+decay). Optimizer state is included in memory. Execution is eager IEEE FP32 with
+TF32 disabled, without AMP or whole-network compilation. The optimized K100
+training schedules use the default `node_component` message-linear layout.
+
+The exact [C64 K100 preset](docs/HP_API.md#c64-k100-training-preset) is documented
+separately from the portable API defaults. All measurements use
+`PYTORCH_HIP_ALLOC_CONF=max_split_size_mb:1024`.
+
+Eight warmup steps precede three five-step timing windows. Throughput is the
+median of eight independent single-GPU replicas on an exclusive node; shading
+shows their range. Memory is the largest replica peak. Device usage is sampled
+every 10 ms and can miss brief peaks; PyTorch allocation excludes external runtime
+and driver memory. Crosses mark the first measured OOM per variant, not a proven
+hardware capacity limit. Graph construction, loading and transfers are excluded.
+
+At 65,536 atoms, short-range training reaches 35.6 thousand
+atom-steps/s with 57.98 GiB peak allocated memory. Relative to it:
+
+- q: 34.2 thousand atom-steps/s; 3.9% more step time; 58.20 GiB allocated (+0.21 GiB).
+- q + μ: 33.2 thousand atom-steps/s; 7.2% more step time; 58.49 GiB allocated (+0.51 GiB).
+- q + μ + Q: 30.7 thousand atom-steps/s; 16.0% more step time; 58.87 GiB allocated (+0.89 GiB).
+
+<details>
+<summary>Single-GPU training measurements</summary>
+
+| Atoms | Variant | Thousand atom-steps/s | Allocated GiB | Sampled device GiB |
+| ---: | :--- | ---: | ---: | ---: |
+| 4,096 | Short range | 36.33 | 3.70 | 4.99 |
+| 4,096 | q | 32.07 | 3.71 | 5.19 |
+| 4,096 | q + μ | 30.87 | 3.73 | 5.19 |
+| 4,096 | q + μ + Q | 27.41 | 3.76 | 5.24 |
+| 8,192 | Short range | 39.54 | 7.32 | 9.24 |
+| 8,192 | q | 36.21 | 7.35 | 9.48 |
+| 8,192 | q + μ | 34.81 | 7.39 | 9.47 |
+| 8,192 | q + μ + Q | 31.79 | 7.44 | 9.52 |
+| 16,384 | Short range | 39.99 | 14.55 | 17.54 |
+| 16,384 | q | 37.88 | 14.60 | 17.71 |
+| 16,384 | q + μ | 36.56 | 14.68 | 17.79 |
+| 16,384 | q + μ + Q | 33.41 | 14.77 | 17.88 |
+| 32,768 | Short range | 38.38 | 29.03 | 35.13 |
+| 32,768 | q | 36.98 | 29.14 | 35.38 |
+| 32,768 | q + μ | 35.74 | 29.29 | 35.51 |
+| 32,768 | q + μ + Q | 32.89 | 29.48 | 35.69 |
+| 49,152 | Short range | 37.42 | 43.51 | 52.17 |
+| 49,152 | q | 36.19 | 43.67 | 52.55 |
+| 49,152 | q + μ | 35.07 | 43.89 | 52.69 |
+| 49,152 | q + μ + Q | 32.41 | 44.18 | 53.04 |
+| 65,536 | Short range | 35.57 | 57.98 | 62.61 |
+| 65,536 | q | 34.23 | 58.20 | 63.98 |
+| 65,536 | q + μ | 33.19 | 58.49 | 63.98 |
+| 65,536 | q + μ + Q | 30.65 | 58.87 | 63.38 |
+| 98,304 | Short range | OOM | — | — |
+| 98,304 | q | OOM | — | — |
+| 98,304 | q + μ | OOM | — | — |
+| 98,304 | q + μ + Q | OOM | — | — |
+| 131,072 | Short range | OOM | — | — |
+| 131,072 | q | OOM | — | — |
+| 131,072 | q + μ | OOM | — | — |
+| 131,072 | q + μ + Q | OOM | — | — |
+
+</details>
+
+### DDP training scaling
+
+![Strong- and weak-scaling training throughput and parallel efficiency on 1, 2, 4 and 8 K100 GPUs, including RCCL gradient synchronization.](docs/assets/electrostatics-ddp-training-k100.svg)
+
+Each DDP rank owns complete, independent periodic graphs. This is data parallel
+training, not spatial decomposition of one periodic cell. The measured step
+includes RCCL gradient synchronization and AdamW; per-step time is the slowest
+rank, and throughput counts all physical atoms in the global batch.
+
+DDP uses ordinary gradient buckets (`gradient_as_bucket_view=False`),
+matching the training CLI default. Larger 65,536-atom/GPU short-range
+probes reproduce allocator signal failures with both ordinary and view
+buckets on this stack. The published weak-scaling comparison therefore
+uses the same 32,768-atom/GPU batch for all four variants. Signal failures
+are excluded from successful timings and are not labeled as OOM.
+
+Strong scaling fixes 65,536 atoms in 8 graphs of 8,192 atoms.
+Weak scaling fixes 32,768 atoms/GPU (4 graphs/GPU). Each series uses one exclusive node
+for all GPU counts. All four model variants pass global-batch gradient
+comparisons against serial training at every GPU count. Every AdamW update
+is checked against its formula, and updated models pass energy/force
+comparisons. Neutralization removes the constant monopole source bias;
+its tiny FP32 gradient can produce different AdamW bias updates, so parameter
+comparisons identify this physical null direction explicitly. Gradient and
+energy/force tolerances are retained.
+
+| Variant | 8-GPU strong throughput (k atom-steps/s) | Strong efficiency | Weak throughput (k atom-steps/s) | Weak efficiency |
+| :--- | ---: | ---: | ---: | ---: |
+| Short range | 311.7 | 108.5% | 306.6 | 99.3% |
+| q | 286.0 | 103.1% | 294.7 | 98.9% |
+| q + μ | 267.2 | 100.1% | 284.2 | 99.7% |
+| q + μ + Q | 242.6 | 97.8% | 262.0 | 99.7% |
+
+Strong-scaling efficiency is end-to-end speedup divided by GPU count; the
+measured superlinear cases retain values above 100%. The one-GPU baseline
+approaches device capacity and has lower per-atom throughput than the smaller
+batches in the atom-count scan. Batch-dependent kernel and memory behavior is
+a plausible contributor; these timings do not isolate individual causes. Weak
+scaling holds the per-GPU batch fixed and reaches 98.9–99.7% efficiency at eight GPUs.
+
+<details>
+<summary>DDP training measurements and per-GPU memory</summary>
+
+| Scaling | GPUs | Variant | Atoms | ms/step | k atom-steps/s | Allocated GiB/GPU | Sampled device GiB/GPU |
+| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
+| strong | 1 | Short range | 65,536 | 1824.71 | 35.92 | 57.97 | 62.51 |
+| strong | 1 | q | 65,536 | 1888.83 | 34.70 | 58.18 | 63.03 |
+| strong | 1 | q + μ | 65,536 | 1963.48 | 33.38 | 58.48 | 63.21 |
+| strong | 1 | q + μ + Q | 65,536 | 2114.22 | 31.00 | 58.86 | 63.98 |
+| strong | 2 | Short range | 65,536 | 849.10 | 77.18 | 29.02 | 35.29 |
+| strong | 2 | q | 65,536 | 885.01 | 74.05 | 29.13 | 35.60 |
+| strong | 2 | q + μ | 65,536 | 920.55 | 71.19 | 29.28 | 35.71 |
+| strong | 2 | q + μ + Q | 65,536 | 1000.04 | 65.53 | 29.47 | 35.92 |
+| strong | 4 | Short range | 65,536 | 409.41 | 160.07 | 14.55 | 17.78 |
+| strong | 4 | q | 65,536 | 433.33 | 151.24 | 14.60 | 18.01 |
+| strong | 4 | q + μ | 65,536 | 457.44 | 143.27 | 14.68 | 18.09 |
+| strong | 4 | q + μ + Q | 65,536 | 499.97 | 131.08 | 14.77 | 18.16 |
+| strong | 8 | Short range | 65,536 | 210.25 | 311.71 | 7.32 | 9.46 |
+| strong | 8 | q | 65,536 | 229.11 | 286.04 | 7.35 | 9.69 |
+| strong | 8 | q + μ | 65,536 | 245.24 | 267.23 | 7.39 | 9.68 |
+| strong | 8 | q + μ + Q | 65,536 | 270.09 | 242.64 | 7.44 | 9.74 |
+| weak | 1 | Short range | 32,768 | 848.76 | 38.61 | 29.02 | 35.14 |
+| weak | 1 | q | 32,768 | 879.50 | 37.26 | 29.13 | 35.46 |
+| weak | 1 | q + μ | 32,768 | 919.41 | 35.64 | 29.28 | 35.56 |
+| weak | 1 | q + μ + Q | 32,768 | 997.87 | 32.84 | 29.47 | 35.77 |
+| weak | 2 | Short range | 65,536 | 852.00 | 76.92 | 29.02 | 35.28 |
+| weak | 2 | q | 65,536 | 880.56 | 74.43 | 29.13 | 35.60 |
+| weak | 2 | q + μ | 65,536 | 921.87 | 71.09 | 29.28 | 35.71 |
+| weak | 2 | q + μ + Q | 65,536 | 998.75 | 65.62 | 29.47 | 35.92 |
+| weak | 4 | Short range | 131,072 | 852.43 | 153.76 | 29.02 | 35.31 |
+| weak | 4 | q | 131,072 | 886.80 | 147.80 | 29.13 | 35.62 |
+| weak | 4 | q + μ | 131,072 | 922.63 | 142.06 | 29.28 | 35.73 |
+| weak | 4 | q + μ + Q | 131,072 | 999.52 | 131.13 | 29.47 | 35.94 |
+| weak | 8 | Short range | 262,144 | 854.87 | 306.65 | 29.02 | 35.28 |
+| weak | 8 | q | 262,144 | 889.49 | 294.71 | 29.13 | 35.60 |
+| weak | 8 | q + μ | 262,144 | 922.27 | 284.24 | 29.28 | 35.71 |
+| weak | 8 | q + μ + Q | 262,144 | 1000.53 | 262.01 | 29.47 | 35.92 |
+
+</details>
+
 ## Training and inference
 
 HP and FastEq are compared on one Hygon K100 (64 GiB), using complete MACE
@@ -340,6 +501,10 @@ varying by architecture. Each pair starts from equivalent randomly
 initialized MACE models and uses the same fixed neighbor graph. These
 results use two interactions, full CG `correlation=3`, periodic H/C/O,
 cutoff 4.5 Å and approximately 50 directed neighbors/atom.
+
+These random-model presets differ from the canonical-checkpoint long-range
+training preset above. Throughput and memory comparisons apply within each
+measurement series.
 
 ![Single-K100 C64/lmax2 training and energy-and-force inference: throughput and peak allocated GPU memory, with observed OOM brackets.](docs/assets/training-inference.svg)
 
