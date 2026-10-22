@@ -9,6 +9,24 @@ import math
 import torch
 
 
+def _real_weighted_components(weights, values):
+    """Contract short Cartesian axes without tiny complex batched GEMMs.
+
+    Weights are real and values are [graph, frequency, source, component].
+    Component views keep workspace bounded by one source field, independent
+    of the number of Cartesian fields. Ordinary autograd retains coordinate,
+    cell and higher derivative support.
+    """
+    real = weights[..., 0, None] * values[..., 0].real
+    imag = weights[..., 0, None] * values[..., 0].imag
+    for component in range(1, values.shape[-1]):
+        weight = weights[..., component, None]
+        value = values[..., component]
+        real = real + weight * value.real
+        imag = imag + weight * value.imag
+    return real, imag
+
+
 def geometry(kernel, cell, dtype, *, exclude_k0, y_slice=None):
     from .long_range import (_effective_cell_for_boundary, _fft_integer_frequencies,
                              _inverse_3x3, _det_3x3, _safe_vector_norm)
@@ -120,20 +138,21 @@ def multipole_spectral_energy(kernel, transformed, cell, channels, *,
         real, imag = scalar.real, scalar.imag
         if has_dipole:
             mu = spectrum[:, :, channels:4*channels].reshape(cell.shape[0],-1,channels,3)
-            value = torch.einsum('bkx,bksx->bks',k.to(mu.dtype),mu)
-            real, imag = real - value.imag, imag + value.real
+            value_real, value_imag = _real_weighted_components(k, mu)
+            real, imag = real - value_imag, imag + value_real
         if has_quadrupole:
             offset = channels * (4 if has_dipole else 1)
             if compact_quadrupole:
                 quad = spectrum[:, :, offset:offset+6*channels].reshape(cell.shape[0],-1,channels,6)
                 x, y, z = k.unbind(-1)
                 weights = torch.stack((x*x,y*y,z*z,x*y,x*z,y*z),dim=-1)
-                value = torch.einsum('bkx,bksx->bks',weights.to(quad.dtype),quad)
+                value_real, value_imag = _real_weighted_components(weights, quad)
             else:
                 quad = spectrum[:, :, offset:offset+9*channels].reshape(cell.shape[0],-1,channels,3,3)
                 kc = k.to(quad.dtype)
                 value = torch.einsum('bkx,bksxy,bky->bks',kc,quad,kc)
-            real, imag = real - .5 * value.real, imag - .5 * value.imag
+                value_real, value_imag = value.real, value.imag
+            real, imag = real - .5 * value_real, imag - .5 * value_imag
         if reduce_amplitudes is not None:
             return torch.stack((real, imag), dim=-1)
         return real.square()+imag.square()

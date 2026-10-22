@@ -110,7 +110,7 @@ class _StreamedGate(torch.autograd.Function):
                 cached[start]=g;remaining-=bytes_used
             if csr is not None:
                 from .generated_csr_forward import forward
-                forward(xc,sh[start:end],w,g,src[start:end],_edge_slice(mask,start,end),out,p,projection,csr,start)
+                forward(xc,sh[start:end],w,g,src[start:end],_edge_slice(mask,start,end),out,p,projection,csr,start,dst[start:end])
                 del g
                 continue
             if p.get("generated_forward",False):

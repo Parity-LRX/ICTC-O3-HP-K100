@@ -5,6 +5,9 @@ Each warp owns a destination/channel/path slice and sums its neighbors before
 one output update. CSR contains only topology, constructed on device per call;
 radial/geometry arrays retain their original order and no gate permutation is
 materialized. Existing analytic first/mixed adjoints remain the derivative.
+Small edge slices schedule candidate edges instead of every output node. The
+first matching CSR edge owns each destination, including unsorted inputs and
+empty-node gaps, while preserving the original neighbor accumulation order.
 """
 import torch
 from .generated_cartesian_message import _literal,_sum
@@ -62,15 +65,16 @@ def _source(p,projection):
     lines=['#include <torch/extension.h>','#include <ATen/cuda/CUDAContext.h>',
         '#include <c10/cuda/CUDAGuard.h>','#include <c10/cuda/CUDAException.h>','#include <cuda_runtime.h>',
         '__device__ __forceinline__ int64_t edge_lower_bound(const int64_t* order,int64_t begin,int64_t end,int64_t value) { while(begin<end){const int64_t mid=begin+(end-begin)/2;if(order[mid]<value)begin=mid+1;else end=mid;}return begin;}',
-        'template<bool Unit>',
-        '__global__ void csr_kernel(const float* X,const float* SH,const float* W,const float* G,const int64_t* S,const float* MASK,const int64_t* PTR,const int64_t* ORDER,const int64_t* ORDER_HINT,float* O,int64_t N,int64_t E,int64_t offset,int64_t total_edges,bool masked) {',
+        'template<bool Unit,bool EdgeOwned>',
+        '__global__ void csr_kernel(const float* X,const float* SH,const float* W,const float* G,const int64_t* S,const float* MASK,const int64_t* PTR,const int64_t* ORDER,const int64_t* ORDER_HINT,float* O,const int64_t* D,int64_t N,int64_t E,int64_t offset,int64_t total_edges,bool masked) {',
         'const int lane=threadIdx.x%32;',
         ('const int64_t task=blockIdx.x;const int shard=threadIdx.x/32;' if neighbor_warps>1 else
          'const int64_t task=(static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x)/32;'),
-        f'if(task>=N*{tiles*len(groups)})return;',
+        f'if(task>=(EdgeOwned?E:N)*{tiles*len(groups)})return;',
         f'const int channel=(task%{tiles})*32+lane;',
         f'const int group=(task/{tiles})%{len(groups)};',
-        f'const int64_t dst=task/{tiles*len(groups)};',
+        f'const int64_t candidate=task/{tiles*len(groups)};',
+        'const int64_t dst=EdgeOwned?D[candidate]:candidate;',
         '' if neighbor_warps>1 else f'if(channel>={c})return;',
         'int64_t begin=PTR[dst],end=PTR[dst+1];']
     if slice_search:
@@ -78,6 +82,11 @@ def _source(p,projection):
             'const int64_t stop=edge_lower_bound(ORDER,begin,end,offset+E);',
             'begin=edge_lower_bound(ORDER,begin,stop,offset);end=stop;',
             '}', 'if(begin>=end)return;'])
+    lines.extend(['if(EdgeOwned) {',
+        'int64_t first=begin;',
+        'while(first<end&&(ORDER[first]<offset||ORDER[first]>=offset+E))++first;',
+        'if(first==end||ORDER[first]!=offset+candidate)return;',
+        '}'])
     shared=max(sum(row[-1] for row in paths) for paths in groups)
     if neighbor_warps>1:lines.append(f'__shared__ float partial[{neighbor_warps*32*shared}];')
     for group,paths in enumerate(groups):
@@ -123,21 +132,25 @@ def _source(p,projection):
         lines.extend(['}','}'])
     lines.append('}')
     lines.append(f'''
-void csr_forward(torch::Tensor x,torch::Tensor sh,torch::Tensor w,torch::Tensor g,torch::Tensor s,torch::Tensor mask,torch::Tensor ptr,torch::Tensor order,torch::Tensor order_hint,torch::Tensor out,int64_t offset,bool unit) {{
+void csr_forward(torch::Tensor x,torch::Tensor sh,torch::Tensor w,torch::Tensor g,torch::Tensor s,torch::Tensor mask,torch::Tensor ptr,torch::Tensor order,torch::Tensor order_hint,torch::Tensor out,torch::Tensor destinations,int64_t offset,bool unit) {{
     const c10::cuda::CUDAGuard guard(x.device());
     for(const auto& t:{{x,sh,w,g,mask,out}}) TORCH_CHECK(t.is_cuda()&&t.device()==x.device()&&t.scalar_type()==at::kFloat&&t.is_contiguous(),"Invalid CSR FP32 operand");
-    for(const auto& t:{{s,ptr,order,order_hint}}) TORCH_CHECK(t.is_cuda()&&t.device()==x.device()&&t.scalar_type()==at::kLong&&t.is_contiguous(),"Invalid CSR topology");
+    for(const auto& t:{{s,ptr,order,order_hint,destinations}}) TORCH_CHECK(t.is_cuda()&&t.device()==x.device()&&t.scalar_type()==at::kLong&&t.is_contiguous(),"Invalid CSR topology");
     TORCH_CHECK(order_hint.numel()==0||order_hint.numel()==1,"Invalid CSR order hint");
     TORCH_CHECK(x.dim()==2&&x.size(1)=={p['xdim']}&&out.dim()==2&&out.size(1)=={p['odim']},"Invalid CSR node shapes");
     TORCH_CHECK(sh.dim()==2&&sh.size(0)==s.numel()&&sh.size(1)=={hd}&&g.dim()==3&&g.size(0)==s.numel()&&g.size(1)=={p['p']}&&g.size(2)=={c},"Invalid CSR edge shapes");
     TORCH_CHECK(w.dim()==2&&w.size(0)=={p['p']}&&w.size(1)=={c}&&ptr.numel()==out.size(0)+1,"Invalid CSR bank/pointer shape");
     TORCH_CHECK((mask.numel()==0||mask.numel()==s.numel())&&offset>=0&&offset+s.numel()<=order.numel(),"Invalid CSR edge slice");
+    TORCH_CHECK(destinations.numel()==0||destinations.numel()==s.numel(),"Invalid CSR destination slice");
     if(!s.numel()||!out.size(0))return;
-    const int64_t blocks={'out.size(0)*'+str(tiles*len(groups)) if neighbor_warps>1 else '(out.size(0)*'+str(tiles*len(groups))+'+3)/4'};
+    const bool edge_owned=destinations.numel()&&s.numel()*2<out.size(0);
+    const int64_t tasks=edge_owned?s.numel():out.size(0);
+    const int64_t blocks={'tasks*'+str(tiles*len(groups)) if neighbor_warps>1 else '(tasks*'+str(tiles*len(groups))+'+3)/4'};
     TORCH_CHECK(blocks<(1LL<<31),"CSR grid exceeds supported size");
     auto stream=at::cuda::getCurrentCUDAStream();
-    #define CALL(U) csr_kernel<U><<<blocks,128,0,stream>>>(x.data_ptr<float>(),sh.data_ptr<float>(),w.data_ptr<float>(),g.data_ptr<float>(),s.data_ptr<int64_t>(),mask.data_ptr<float>(),ptr.data_ptr<int64_t>(),order.data_ptr<int64_t>(),order_hint.numel()?order_hint.data_ptr<int64_t>():nullptr,out.data_ptr<float>(),out.size(0),s.numel(),offset,order.numel(),mask.numel()!=0)
-    if(unit) {{ CALL(true); }} else {{ CALL(false); }}
+    #define CALL(U,B) csr_kernel<U,B><<<blocks,128,0,stream>>>(x.data_ptr<float>(),sh.data_ptr<float>(),w.data_ptr<float>(),g.data_ptr<float>(),s.data_ptr<int64_t>(),mask.data_ptr<float>(),ptr.data_ptr<int64_t>(),order.data_ptr<int64_t>(),order_hint.numel()?order_hint.data_ptr<int64_t>():nullptr,out.data_ptr<float>(),destinations.data_ptr<int64_t>(),out.size(0),s.numel(),offset,order.numel(),mask.numel()!=0)
+    if(edge_owned) {{ if(unit) {{ CALL(true,true); }} else {{ CALL(false,true); }} }}
+    else {{ if(unit) {{ CALL(true,false); }} else {{ CALL(false,false); }} }}
     #undef CALL
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
@@ -152,25 +165,27 @@ def _extension(p,projection):
         raise ValueError('CSR accumulator limit must be a positive integer')
     key=(p['path_specs'],p['xdim'],p['odim'],p['c'],p.get('generated_layout','packed'),limit)
     neighbor_warps=int(p.get('csr_neighbor_warps',1));key=(*key,neighbor_warps)
-    slice_search=bool(p.get('csr_slice_search',False));key=(*key,slice_search,'abi2')
+    slice_search=bool(p.get('csr_slice_search',False));key=(*key,slice_search,'abi3')
     if p.get('compact_cartesian',False):key=(*key,'compact')
     if p.get('inference_degree_layout',False):key=(*key,'degree')
     if key not in cache:
         from .native_jit import load_inline
-        name=f'mace_ictc_csr_{p["xdim"]}_{p["odim"]}_{p["p"]}_abi2'
+        name=f'mace_ictc_csr_{p["xdim"]}_{p["odim"]}_{p["p"]}_abi3'
         if limit!=48:name+=f'_a{limit}'
         if p.get('generated_layout')=='canonical':name+='_canonical'
         if p.get('compact_cartesian',False):name+='_compact'
         if p.get('inference_degree_layout',False):name+='_degree'
         if neighbor_warps>1:name+=f'_nw{neighbor_warps}'
         if slice_search:name+='_slice'
-        declarations='#include <torch/extension.h>\nvoid csr_forward('+','.join(['torch::Tensor']*10)+',int64_t,bool);\n'
+        declarations='#include <torch/extension.h>\nvoid csr_forward('+','.join(['torch::Tensor']*11)+',int64_t,bool);\n'
         cache[key]=load_inline(name=name,cpp_sources=declarations,cuda_sources=_source(p,projection),
             functions=['csr_forward'],extra_cflags=['-O3'],extra_cuda_cflags=['-O3'] if torch.version.hip else ['-O3','--ptxas-options=-v'],verbose=False)
     return cache[key]
 
 
-def forward(x,sh,w,g,src,mask,out,p,projection,csr,start):
+def forward(x,sh,w,g,src,mask,out,p,projection,csr,start,dst=None):
     ptr,order=csr[:2]
     hint=csr[2] if len(csr)==3 else src.new_zeros(1)
-    _extension(p,projection).csr_forward(x,sh.contiguous(),w,g,src,mask,ptr,order,hint,out,start,bool(p.get('unit_weights',False)))
+    destinations=src.new_empty(0) if dst is None else dst.contiguous()
+    _extension(p,projection).csr_forward(x,sh.contiguous(),w,g,src,mask,ptr,order,hint,out,
+        destinations,start,bool(p.get('unit_weights',False)))

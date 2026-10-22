@@ -448,6 +448,10 @@ reciprocal collectives execute once in each direction. Parameters, model
 equations and FP32 arithmetic are retained. The `performance` mode keeps
 these activations to avoid the recomputation cost. Trainable radial parameters
 retain the existing autograd/checkpoint path.
+Capacity mode also limits message blocks to at most 32,768 edges. Both modes
+apply a memory budget based on tensor-product path width, so wide models can
+use smaller blocks. Performance mode allows larger blocks within that budget.
+This bounds message-expansion temporaries while retaining all neighbors.
 Once the observed PyTorch allocation peak exceeds 75% of device memory,
 capacity mode also synchronizes between force graphs and reclaims completed
 Python wrappers and idle allocator blocks before the next graph. This limits
@@ -466,18 +470,25 @@ multi-node operation, pressure/NPT and long-trajectory stability are outside
 this qualification; the existing Kokkos virial flag remains unchanged.
 
 
-### MFF multi-GPU results
+### Multi-GPU scaling at 65,536 atoms
 
 ![Native mff/torch/kk complete-step throughput, latency, strong scaling and peak PyTorch allocation per GPU.](assets/electrostatics-mff-k100.svg)
 
 One K100 node, one rank per GPU, C64/lmax=2/two interactions/correlation=3,
-65,536 atoms, about 50 neighbors per atom, PCS, sigma=1, one source channel
+factory initialization with a 16-channel hidden readout and cutoff polynomial
+parameter `p=5`, 65,536 atoms, about 50 neighbors per atom, PCS, sigma=1, one source channel
 and a 128×128×256 mesh. Models are randomly initialized with a nonzero
 long-range contribution. Timings include the complete MD step, neighbor
 rebuilding on every step and all communication. The median of three
 five-step means follows three warmup steps; bars show the range of means.
 Compilation and export are excluded. Execution is eager FP32 with TF32 off.
 The dashed line denotes ideal strong scaling.
+This experiment uses its own fixed model and geometry. The capacity results
+below use the original README checkpoint, a 64-channel hidden readout and
+cutoff polynomial parameter `p=6`; their absolute timings should be interpreted
+with that configuration.
+These scaling measurements precede the large-system CSR and spectral
+contraction optimizations described below.
 Only the unchanged short-range series retains earlier measurements. Scalar
 and multipole paths were remeasured; the single-GPU quadrupole baseline uses
 the same six-component representation as the distributed path.
@@ -528,35 +539,116 @@ using the distributed path. These checks establish implementation
 consistency on the selected grids; they do not establish trained-potential
 accuracy or long-trajectory stability.
 
-### Eight-GPU capacity
+### README-controlled baseline on eight GPUs
 
-![Measured memory growth and twenty-step capacity of native long-range MFF on eight K100 GPUs.](assets/electrostatics-capacity-k100.svg)
+This controlled experiment retains every short-range tensor from the original
+README C64/lmax=2/two-interaction/full-CG correlation=3 checkpoint. It uses
+H/C/O, a 4.5 Å cutoff, a 64-channel hidden readout, cutoff polynomial parameter `p=6`
+and radial MLP widths `[64,64,64]`. The baseline and all extensions run through
+the same native `mff/torch/kk` interface on eight K100 GPUs. Long-range cases
+add nonzero initialized heads with one source channel, PCS, sigma=1 Å and
+0.5 Å mesh spacing. These heads are benchmark extensions; they have not been
+fitted to electrostatic data.
 
-One node with eight K100 GPUs, each with 63.98 GiB of physical memory.
-The model uses C64/lmax=2/two interactions/correlation=3, H/C/O,
-a 4.5 Å cutoff, PCS, sigma=1 Å and one source channel with monopoles,
-dipoles and quadrupoles. Density stays at 0.125 atoms/Å³ and mesh spacing
-at 0.5 Å as the box grows. The measured neighbor count is about 51 per atom.
-Execution is eager FP32 with TF32 off; sorting and neighbor rebuilding occur
-every step. The models have random weights and nonzero long-range heads.
+At 262,144 atoms, performance mode takes 316 ms/step for short range,
+339 ms with monopoles, 407 ms when dipoles are included and 512 ms when
+quadrupoles are included. Additional time is 7.3%, 28.7% and 62.0%,
+respectively. Quadrupole throughput is 512,000 atom-steps/s, compared with
+829,000 for short range. In capacity mode, quadrupoles change 372 to
+568 ms/step, retaining 65.6% of short-range throughput.
 
-- Performance mode: 2,885,794 atoms pass 20 MD steps, averaging 5.547 s/step
-  and 520,207 atom-steps/s. Maximum per-rank PyTorch allocation is 57.00 GiB.
-  The next tested size, 2,963,088 atoms, runs out of memory.
-- Capacity mode: 5,030,912 atoms pass 20 MD steps, averaging 15.833 s/step
-  and 317,753 atom-steps/s. Maximum per-rank PyTorch allocation is 52.66 GiB.
-  The next tested size, 5,142,706 atoms, runs out of memory.
+At 3,241,792 atoms, capacity mode completes 50 timed NVE steps. Short range
+takes 6.097 s/step and the full monopole/dipole/quadrupole extension takes
+8.456 s/step: 38.7% additional time and 72.1% throughput retained
+(532,000 to 383,000 atom-steps/s). Performance mode runs out of memory at
+this size for both models, so there is no performance-mode overhead ratio
+at this point.
 
-The confirmed meshes are 452×452×904 and 544×544×1088, respectively.
-An independent exact-three-million-atom case, using a 400×400×1200 mesh,
-also passes 20 MD steps at 7.775 s/step. Chunking its radial prefix reduces
-the measured PyTorch peak from 38.49 to 31.71 GiB/GPU.
+All cases use eager FP32 with TF32 off, density 0.125 atoms/Å³, identical
+initial coordinates and 300 K Gaussian velocities, a 0.25 fs timestep,
+sorting disabled, a 0.5 Å neighbor skin and rebuilding on every step.
+The allocator setting is `max_split_size_mb:1024`. Timings include integration,
+neighbor rebuilding, energy, forces, communication and runtime cache handoff.
+Conversion, startup and JIT are excluded. At 262,144 atoms, three warmup
+steps precede three consecutive 20-step windows; the reported value is the
+median of their means. At 3,241,792 atoms and at capacity confirmations,
+one warmup step precedes 50 timed steps; the median step time is reported.
+These windows are timing observations from one trajectory, not independent
+statistical replicates.
 
-These are the highest confirmed points in the `(k,k,2k)` lattice family;
-box geometry, FFT workspaces, neighbor counts and allocator pressure affect
-practical limits. Capacity timings are one twenty-step mean after the initial
-energy-and-force evaluation. The memory curves include shorter successful
-scans below each confirmed limit; the bars require twenty steps. Memory values
-cover initialization and every evaluated force graph, taking the largest
-PyTorch allocation across ranks. Kokkos, RCCL, driver and vendor allocations
-are excluded, so the observed OOM outcomes define the capacity bracket.
+Every original short-range state tensor is unchanged. All eight combinations
+of source rank and inference mode pass small-system, eight-GPU force checks
+before and after MD. The short-range component matches the original MACE
+model; the complete model matches the same-checkpoint Torch reference at
+the original FP32 tolerances. The source contribution is nonzero.
+
+These baseline timings precede the CSR and spectral contraction optimizations.
+
+### Large-system schedule optimizations
+
+![Complete MD-step latency and throughput before and after the generic CSR and multipole spectral contraction optimizations, on eight K100 GPUs at 3,241,792 atoms.](assets/electrostatics-native-speed-k100.svg)
+
+With the same README checkpoint and 592³ grid at 3,241,792 atoms, the full
+q/μ/Q model improves from 8.456 to 5.201 s/step: 38.5% less time and 1.63×
+throughput, from 383,000 to 623,000 atom-steps/s. Short range improves from
+6.097 to 4.156 s/step. The optimized long-range extension adds 25.1% to the
+complete step time, retaining 79.9% of short-range throughput. The two final
+optimized controls share one eight-GPU allocation; their baselines use the
+same node and protocol in a preceding allocation. Each case has one warmup
+and 50 timed NVE steps. Separate same-allocation ten-step controls also
+confirm the benefit of each optimization.
+
+The long-range PyTorch allocation peak remains 33.53 GiB/GPU. Sampled device
+usage reaches 60.42 GiB/GPU, compared with 60.32 GiB before the changes; this
+is a speed improvement without a measured reduction in total device usage.
+The initial neighbor count is about 49.74; the optimized time-mean is 47.50
+for q/μ/Q and 47.42 for short range. At the benchmark timestep of 0.25 fs,
+5.201 s/step corresponds to about 4.15 ps/day. This large capacity point
+therefore remains slow for long trajectories.
+
+Small message slices no longer schedule every output node. When a slice has
+fewer than half as many edges as output nodes, its edges provide candidate
+destinations. The first matching CSR edge owns each destination; neighbor
+traversal and floating-point accumulation order are preserved. Larger slices
+keep the node-based schedule. The selection supports arbitrary channel counts,
+unsorted input edges, empty-node gaps and CSR lists with nonmonotone edge IDs,
+without an additional workspace or host synchronization.
+
+Dipole and compact-quadrupole spectral contractions use explicit real and
+imaginary component sums. Their three- and six-component dot products avoid
+large batches of tiny complex GEMMs. Source-channel counts are unrestricted,
+and ordinary autograd retains source, coordinate, cell and mixed second
+derivatives. Both folded Nyquist partners are still evaluated. The grid,
+assignment, Gaussian screening and model tensors are unchanged.
+
+Forty-five direct CSR checks are bitwise identical to the original schedule,
+with separate FP64 tensor-product references. Eight spectral contraction
+checks cover energy, first derivatives and mixed Hessian-vector products in
+FP32/FP64 with multiple batches and source channels. Eight-GPU whole-model
+force checks pass before and after MD at 512 and 4,096 atoms, covering the
+replicated and distributed reciprocal paths. The force oracle evaluates the
+same checkpoint in FP64 using the interface's FP32 periodic-image geometry;
+the original `atol=rtol=2e-5` and relative L2 `<1e-5` limits are retained.
+
+### Confirmed capacity with the README model
+
+The controlled cubic-cell scan uses the exact README backbone above, eight
+K100 GPUs with 63.98 GiB each, fixed density and 0.5 Å mesh spacing. Initial
+neighbor counts are about 49.74 per atom. Sorting is disabled and neighbors
+are rebuilt every step. Every capacity confirmation requires 50 timed steps.
+
+Before the latest speed optimizations, the full q/μ/Q model passes 2,985,984
+atoms in performance mode at 5.627 s/step and 3,241,792 atoms in capacity mode
+at 8.456 s/step. A larger 5,451,776-atom capacity probe passes three steps;
+its 50-step confirmation was stopped when the work shifted to throughput.
+It is not a confirmed usable capacity. Earlier factory-model capacity numbers
+use different readout and cutoff settings and do not establish the limit of
+the README model.
+
+At 3,241,792 atoms, maximum PyTorch allocations are 33.52 GiB/GPU for short
+range and 33.53 GiB/GPU for q/μ/Q. Device usage sampled every 20 ms reaches
+59.70 and 60.32 GiB/GPU, respectively. PyTorch allocation alone excludes
+Kokkos, RCCL, driver and vendor buffers and cannot establish free device
+memory. Larger points include both ordinary OOMs and allocator signal
+failures; a signal failure is not classified as an OOM. The scan was stopped
+before a complete new capacity bracket was established.

@@ -180,7 +180,7 @@ class _Message(torch.autograd.Function):
                 continue
             if csr is not None:
                 from .generated_csr_forward import forward
-                forward(xc,sh[start:end],w,g[start:end],src[start:end],_edge_slice(mask,start,end),out,p,projection,csr,start)
+                forward(xc,sh[start:end],w,g[start:end],src[start:end],_edge_slice(mask,start,end),out,p,projection,csr,start,dst[start:end])
                 continue
             if p.get("generated_forward",False):
                 from .generated_cartesian_message import generated_forward
