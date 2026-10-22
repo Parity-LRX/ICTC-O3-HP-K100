@@ -128,12 +128,11 @@ for model configuration, tensor shapes, derivatives and validation.
 
 ## Multi-GPU results
 
-Remeasured on 2026-10-22 with the current default native `mff/torch/kk` interface,
-one MPI rank and two CPU threads per active Hygon K100 GPU. Execution uses eager
-FP32 with TF32 disabled. Each strong- or weak-scaling series runs on one exclusive
-eight-GPU node, using 1/2/4/8 active GPUs. The measured complete MD step includes
-integration, neighbor rebuilding, energy, forces, communication and runtime cache
-handoff. Physical atoms determine throughput; ghost copies are excluded.
+Execution uses eager FP32 with TF32 disabled. Each strong- or weak-scaling
+series runs on one exclusive eight-GPU node, using 1/2/4/8 active GPUs. The
+measured complete MD step includes integration, neighbor rebuilding, energy,
+forces, communication and runtime cache handoff. Physical atoms determine
+throughput; ghost copies are excluded.
 
 ### C64 scaling
 
