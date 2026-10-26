@@ -16,8 +16,6 @@
 
 #include "mff_periodic_table.h"
 #include "mff_reciprocal_solver.h"
-#include "mff_mbd_solver.h"
-#include "mff_tree_fmm_solver.h"
 #include "mff_torch_engine.h"
 
 #include <algorithm>
@@ -198,11 +196,7 @@ PairMFFTorch::PairMFFTorch(LAMMPS *lmp) : Pair(lmp) {
   manybody_flag = 1;
   comm_reverse = 3;
   comm_forward = 2;
-  // rRESPA: this pair splits the cheap short-range core (inner level, every step) from the expensive
-  // many-body-dispersion solve (outer level, every K steps). compute_inner/compute_middle/compute_outer
-  // below implement the multiple-time-stepping; the split is by PHYSICS (SR vs MBD), not by distance,
-  // so we reuse the same full neighbor list in both (no REQ_RESPA inner/outer sub-lists, no cut_respa).
-  respa_enable = 1;
+  respa_enable = 0;
 }
 
 PairMFFTorch::~PairMFFTorch() {
@@ -354,18 +348,7 @@ void PairMFFTorch::settings(int narg, char **arg) {
       continue;
     }
     if (opt == "dispersion") {
-      if (i + 1 >= narg) {
-        error->all(FLERR, "pair_style mff/torch dispersion expects a cutoff");
-      }
-      dispersion_cut_global_ = utils::numeric(FLERR, arg[i + 1], false, lmp);
-      if (dispersion_cut_global_ <= 0.0) {
-        error->all(FLERR, "pair_style mff/torch dispersion cutoff must be > 0");
-      }
-      dispersion_cutsq_global_ = dispersion_cut_global_ * dispersion_cut_global_;
-      request_cut_global_ = std::max(request_cut_global_, dispersion_cut_global_);
-      request_cutsq_global_ = request_cut_global_ * request_cut_global_;
-      i += 1;
-      continue;
+      error->all(FLERR, "Dispersion is not supported by this K100 distribution");
     }
     if (opt == "field") {
       if (i + 3 >= narg) {
@@ -522,8 +505,6 @@ void PairMFFTorch::init_style() {
   try {
     if (!engine_) engine_ = std::make_unique<mfftorch::MFFTorchEngine>();
     if (!reciprocal_solver_) reciprocal_solver_ = std::make_unique<mfftorch::MFFReciprocalSolver>();
-    if (!mbd_solver_) mbd_solver_ = std::make_unique<mfftorch::MFFMBDSolver>();
-    if (!tree_fmm_solver_) tree_fmm_solver_ = std::make_unique<mfftorch::MFFTreeFmmSolver>();
     engine_->load_core(core_pt_path_, device_str_);
     if (reciprocal_solver_) {
       auto cfg = reciprocal_solver_->config();
@@ -547,46 +528,7 @@ void PairMFFTorch::init_style() {
       cfg.assignment = (engine_->long_range_assignment() == "pcs") ? 1 : 0;
       reciprocal_solver_->set_config(cfg);
     }
-    if (mbd_solver_) {
-      mfftorch::MBDConfig mcfg;
-      mcfg.mesh_size = std::max(16, static_cast<int>(engine_->long_range_mesh_size()));
-      mcfg.mesh_max = 32;    // cap the adaptive MBD mesh (power-of-2 -> fast cuFFT) for GPU throughput
-      mcfg.ewald_alpha_prefactor = engine_->long_range_ewald_alpha_prefactor();
-      // Keep the solver's accuracy-oriented defaults (degree/probes) and derive spectral bounds from
-      // the actual omega/coupling operator. A fixed [0.3,3.0] window was not valid for from-scratch
-      // or learned omega ranges and could flip the MBD energy sign.
-      mcfg.cheb_lmin = 0.0;
-      mcfg.cheb_lmax = 0.0;
-      mcfg.real_cutoff = engine_->dispersion_cutoff();
-      mcfg.min_cutoff = engine_->dispersion_min_cutoff();
-      mcfg.switch_width = engine_->dispersion_switch_width();
-      if (engine_->long_range_mbd_source_enabled()) {  // learned damping params from the exported head
-        mcfg.mbd_beta = engine_->long_range_mbd_beta();
-        mcfg.coupling_scale = engine_->long_range_mbd_coupling_scale();
-        mcfg.energy_scale = engine_->long_range_mbd_energy_scale();
-      }
-      if (engine_->long_range_mbd_use_fft()) {  // pme_fft: reciprocal-only PME, match the TRAINED operator
-        mcfg.use_fft = true;
-        mcfg.mesh_size = engine_->mbd_pme_mesh_size();          // FIXED training mesh (not adaptive)
-        mcfg.mesh_max = std::max(mcfg.mesh_max, engine_->mbd_pme_mesh_size());
-        mcfg.assignment = (engine_->mbd_pme_assignment() == "pcs") ? 1 : 0;
-        mcfg.ewald_alpha_prefactor = engine_->mbd_pme_ewald_alpha_prefactor();  // box-tied alpha = prefactor/(0.5 Lmin)
-      }
-      mbd_solver_->set_config(mcfg);
-    }
-    if (tree_fmm_solver_) {
-      mfftorch::TreeFmmConfig cfg;
-      cfg.theta = engine_->long_range_theta();
-      cfg.leaf_size = static_cast<int>(engine_->long_range_leaf_size());
-      cfg.multipole_order = static_cast<int>(engine_->long_range_multipole_order());
-      cfg.neutralize = engine_->long_range_neutralize();
-      cfg.screening = engine_->long_range_screening();
-      cfg.softening = engine_->long_range_softening();
-      cfg.energy_scale = engine_->long_range_energy_scale();
-      cfg.boundary = engine_->long_range_boundary();
-      cfg.energy_partition = engine_->long_range_energy_partition();
-      tree_fmm_solver_->set_config(cfg);
-    }
+
     validate_external_field_configuration();
     engine_loaded_ = true;
     engine_->warmup(32, 256);
@@ -872,11 +814,10 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   auto cell_t = torch::from_blob(cell_cpu, {1, 3, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
   if (nlocal == 0) {
     const bool exports_runtime_source = engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0;
-    const bool use_tree_fmm =
-        tree_fmm_solver_ && exports_runtime_source && engine_->long_range_runtime_backend() == "tree_fmm";
+
     const bool use_reciprocal =
-        reciprocal_solver_ && exports_runtime_source && !use_tree_fmm;
-    if (use_tree_fmm || use_reciprocal) {
+        reciprocal_solver_ && exports_runtime_source;
+    if (use_reciprocal) {
       auto empty_pos = torch::zeros({0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
       auto empty_source = torch::zeros(
           {0, engine_->reciprocal_source_channels()},
@@ -890,11 +831,9 @@ void PairMFFTorch::compute(int eflag, int vflag) {
             geom,
             static_cast<bool>(eflag),
             torch::Device(torch::kCPU));
-        if (use_tree_fmm) {
-          (void)tree_fmm_solver_->compute(reciprocal_inputs);
-        } else {
+
           (void)reciprocal_solver_->compute(reciprocal_inputs);
-        }
+
       } catch (const std::exception &e) {
         error->all(FLERR, (std::string("mff/torch runtime long-range solver failed on empty rank: ") + e.what()).c_str());
       }
@@ -967,7 +906,6 @@ void PairMFFTorch::compute(int eflag, int vflag) {
           buf_edge_shifts_cpu_.push_back(static_cast<float>(out_sy));
           buf_edge_shifts_cpu_.push_back(static_cast<float>(out_sz));
         }
-        // MBD/SLQ-MBD consumes one representative of
         // (src, dst, shift) ~ (dst, src, -shift).  Self-image couplings keep the
         // lexicographically positive shift half, matching the Python builder.
         if (use_dispersion_edges && rsq <= dispersion_cutsq_global_ &&
@@ -1066,7 +1004,6 @@ void PairMFFTorch::compute(int eflag, int vflag) {
         buf_edge_shifts_cpu_.push_back(static_cast<float>(-sy));
         buf_edge_shifts_cpu_.push_back(static_cast<float>(-sz));
       }
-      // MBD/SLQ-MBD consumes one representative of
       // (src, dst, shift) ~ (dst, src, -shift).  Self-image couplings keep the
       // lexicographically positive shift half, matching the Python builder.
       if (use_dispersion_edges && rsq <= dispersion_cutsq_global_ &&
@@ -1083,8 +1020,6 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 
   const int64_t E = static_cast<int64_t>(buf_edge_src_cpu_.size());
   const int64_t Edisp = use_dispersion_edges ? static_cast<int64_t>(buf_disp_edge_src_cpu_.size()) : 0;
-  // Do not skip one-edge graphs: canonical MBD/SLQ-MBD represents a two-atom
-  // oscillator coupling with exactly one undirected dispersion edge.
   if (!layerwise_exchange_ && E == 0 && (!use_dispersion_edges || Edisp == 0)) return;
   const auto profile_graph = profile_pair ? ProfileClock::now() : ProfileClock::time_point{};
   sort_edge_vectors(buf_edge_src_cpu_, buf_edge_dst_cpu_, buf_edge_shifts_cpu_);
@@ -1176,9 +1111,7 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   auto fidelity_ids_t = current_fidelity_tensor(torch::kCPU);
 
   const bool want_atom_virial = static_cast<bool>(vflag_atom);
-  // rRESPA inner: request the SR scalar energy even though eflag=0, so compute_outer() can tally it
-  // (the engine skips out.energy when need_energy is false). Cheap (a single atom-energy reduction).
-  const bool need_energy = static_cast<bool>(eflag) || (respa_phase_ == PHASE_INNER);
+  const bool need_energy = static_cast<bool>(eflag);
   mfftorch::MFFOutputs out;
   const auto profile_pack = profile_pair ? ProfileClock::now() : ProfileClock::time_point{};
   try {
@@ -1197,31 +1130,21 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 
   mfftorch::ReciprocalOutputs reciprocal_out;
   const bool exports_runtime_source = engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0;
-  const bool use_tree_fmm =
-      tree_fmm_solver_ && exports_runtime_source && engine_->long_range_runtime_backend() == "tree_fmm";
-  // Combined [elec | omega,alpha] packing: electrostatics is present unless this is an MBD-only model
-  // (packed source with zero electrostatic width). The reciprocal solver gets only the leading slice.
-  const bool mbd_packed = engine_->long_range_mbd_source_enabled();
-  const int64_t elec_width = engine_->long_range_mbd_source_offset();
-  const bool has_electrostatics = exports_runtime_source && (!mbd_packed || elec_width > 0);
+
+  const bool has_electrostatics = exports_runtime_source;
   const bool use_reciprocal =
-      reciprocal_solver_ && has_electrostatics && !use_tree_fmm;
-  const bool use_runtime_long_range = use_tree_fmm || use_reciprocal;
-  if (use_tree_fmm || use_reciprocal) {
+      reciprocal_solver_ && has_electrostatics;
+  const bool use_runtime_long_range = use_reciprocal;
+  if (use_reciprocal) {
     try {
       const auto reciprocal_device = engine_->device();
-      auto reciprocal_rows = out.reciprocal_source.defined()
-          ? (mbd_packed && elec_width > 0 ? out.reciprocal_source.narrow(1, 0, elec_width)
-                                          : out.reciprocal_source)
-          : out.reciprocal_source;
+      const auto& reciprocal_rows = out.reciprocal_source;
       auto local_source = reciprocal_rows.defined()
                               ? reciprocal_rows.narrow(0, 0, nlocal).to(reciprocal_device, torch::kFloat32).contiguous()
                               : torch::zeros(
                                     {nlocal, engine_->reciprocal_source_channels()},
                                     torch::TensorOptions().dtype(torch::kFloat32).device(reciprocal_device));
-      if (use_tree_fmm && engine_->long_range_source_kind() != "latent_charge") {
-        throw std::runtime_error("tree_fmm runtime currently requires long_range_source_kind=latent_charge");
-      }
+
       auto reciprocal_inputs = make_reciprocal_inputs(
           world,
           cached_pos_t_.narrow(0, 0, nlocal).to(reciprocal_device, torch::kFloat32).contiguous(),
@@ -1231,12 +1154,10 @@ void PairMFFTorch::compute(int eflag, int vflag) {
           static_cast<bool>(eflag),
           reciprocal_device);
 	      if (std::getenv("MFF_RECIPROCAL_MULTIPOLE_AUTOGRAD")) {
-	        reciprocal_out = use_tree_fmm ? tree_fmm_solver_->compute(reciprocal_inputs)
-	                                      : reciprocal_solver_->compute(reciprocal_inputs);
+	        reciprocal_out = reciprocal_solver_->compute(reciprocal_inputs);
 	      } else {
 	        c10::InferenceMode reciprocal_inference_guard(true);
-	        reciprocal_out = use_tree_fmm ? tree_fmm_solver_->compute(reciprocal_inputs)
-	                                      : reciprocal_solver_->compute(reciprocal_inputs);
+	        reciprocal_out = reciprocal_solver_->compute(reciprocal_inputs);
 	      }
 	      if (std::getenv("MFF_SYNC_AFTER_RECIPROCAL") && reciprocal_device.is_cuda()) {
 	        torch::cuda::synchronize();
@@ -1246,98 +1167,14 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 	    }
   }
 
-  // --- many-body dispersion (MBD) add-on. Env-gated demo (MFF_MBD_TEST): the per-atom source
-  // (omega, alpha) is synthesized from atom types -- a placeholder for a trained Hirshfeld-rescaled
-  // MBD head / source_kind=="mbd". compute() runs autograd internally (conservative forces); it sits
-  // outside the reciprocal InferenceMode guard so autograd is live.
-  // When pair_style was given 'dispersion <cutoff>', reuse the SAME ghost real-space list already built
-  // for the model (cached_disp_edge_*_t_) as the MBD T_SR list -- alpha is tied to that cutoff and the
-  // reciprocal mesh handles the long-range tail, so the dispersion range may exceed r_cut. Otherwise
-  // fall back to the solver's internal O(N^2) periodic build (small-cell / standalone).
-  mfftorch::MBDOutputs mbd_out;
-  const bool use_mbd = mbd_solver_ && (engine_->long_range_mbd_source_enabled() || std::getenv("MFF_MBD_TEST")
-                                       || engine_->long_range_source_kind() == "mbd");
-  respa_have_mbd_ = false;
-  if (use_mbd) {
-    try {
-      // Run the MBD solver on the ENGINE DEVICE (GPU): the FFT / spread-gather / Chebyshev matvecs /
-      // autograd all stay on-device. Only the small inputs are moved on (and the output forces are
-      // copied back to host for the f[] write); the heavy compute never round-trips to CPU.
-      const auto mbd_device = engine_->device();
-      torch::Tensor mbd_source;
-      const int64_t mbd_chan = engine_->long_range_mbd_source_channels();   // 2 isotropic, 8 anisotropic
-      if (engine_->long_range_mbd_source_enabled() && out.reciprocal_source.defined()
-          && out.reciprocal_source.size(1) >= elec_width + mbd_chan) {
-        // DEPLOY: the model emitted the MBD source packed after the electrostatic source [elec | omega,alpha
-        // (,B...)]. Width 2 = isotropic, 8 = anisotropic ([omega, alpha_iso, 6*B]); the solver rebuilds W.
-        mbd_source = out.reciprocal_source.narrow(0, 0, nlocal).narrow(1, elec_width, mbd_chan)
-                         .to(mbd_device, torch::kFloat32).contiguous();
-      } else {
-        // env-gated demo (MFF_MBD_TEST): (omega, alpha) from atom types (built on host, moved on-device)
-        int *type = atom->type;
-        auto src_host = torch::zeros({nlocal, 2}, torch::TensorOptions().dtype(torch::kFloat64));
-        auto sa = src_host.accessor<double, 2>();
-        for (int i = 0; i < nlocal; i++) { sa[i][0] = 1.0 + 0.05 * (type[i] - 1); sa[i][1] = 0.30; }
-        mbd_source = src_host.to(mbd_device, torch::kFloat32).contiguous();
-      }
-      auto mbd_pos = cached_pos_t_.narrow(0, 0, nlocal).to(mbd_device, torch::kFloat32).contiguous();
-      auto mbd_cell = cell_t.to(mbd_device, torch::kFloat32).contiguous().view({3, 3});
-      const int64_t Edisp = cached_disp_edge_src_t_.defined() ? cached_disp_edge_src_t_.numel() : 0;
-      const bool have_edges = (dispersion_cut_global_ > 0.0 && Edisp > 0);
-      torch::Tensor full_src, full_dst, full_sh;
-      if (have_edges) {
-        // The reused ghost list is NEAREST-image; the Ewald T_SR needs every image within r_cut, so
-        // enforce 2*r_cut <= box face height (single image). The reciprocal mesh covers beyond r_cut.
-        validate_mbd_dispersion_single_image_cutoff(error, geom, dispersion_cut_global_, "pair_style mff/torch MBD");
-        // Expand the canonical half list -> full (both directions); dipole_field adds to dst only.
-        auto cs = cached_disp_edge_src_t_.to(mbd_device);
-        auto cd = cached_disp_edge_dst_t_.to(mbd_device);
-        auto csh = cached_disp_edge_shifts_t_.to(mbd_device, torch::kFloat32);
-        full_src = torch::cat({cs, cd});
-        full_dst = torch::cat({cd, cs});
-        full_sh = torch::cat({csh, -csh});
-      }
-      if (respa_phase_ == PHASE_INNER) {
-        // rRESPA outer level runs every K steps; stage the MBD inputs for compute_outer() instead of
-        // solving now. The source/pos/edges already live on the engine device (clones detached from the
-        // AOTI buffer via run_aoti's CPU round-trip), so they survive K inner steps. The MBD force from
-        // the LAST outer solve is re-added every inner step in run_sr_core_and_stage_mbd() (held fixed
-        // between outer updates -> the standard rRESPA slow-force extrapolation).
-        respa_mbd_source_ = mbd_source;
-        respa_mbd_pos_ = mbd_pos;
-        respa_mbd_cell_ = mbd_cell;
-        respa_mbd_have_edges_ = have_edges;
-        if (have_edges) { respa_mbd_full_src_ = full_src; respa_mbd_full_dst_ = full_dst; respa_mbd_full_sh_ = full_sh; }
-        respa_have_mbd_ = true;
-      } else if (have_edges) {
-        mbd_out = mbd_solver_->compute(mbd_pos, mbd_source, mbd_cell, full_src, full_dst, full_sh,
-                                       dispersion_cut_global_, mbd_device);
-      } else {
-        mbd_out = mbd_solver_->compute(mbd_pos, mbd_source, mbd_cell, mbd_device);
-      }
-    } catch (const std::exception &e) {
-      error->all(FLERR, (std::string("mff/torch MBD solver failed: ") + e.what()).c_str());
-    }
-  }
-
-  // rRESPA inner level: the SR energy/per-atom/virial tally is DEFERRED to compute_outer() (thermo
-  // only samples at outer steps), and the MBD solve was staged above. Add the SR forces (done below)
-  // + the held MBD force, then return before the global-energy/virial tally.
-  const bool defer_tally = (respa_phase_ == PHASE_INNER);
-
-  if (!defer_tally && eflag) eng_vdwl += out.energy;
-  if (!defer_tally && use_runtime_long_range) eng_vdwl += reciprocal_out.energy;
-  if (!defer_tally && use_mbd) eng_vdwl += mbd_out.energy;
-  // Stage the SR scalar energy so compute_outer() can tally it (thermo samples only at outer steps).
-  if (respa_phase_ == PHASE_INNER) { respa_sr_energy_ = out.energy; respa_staged_nlocal_ = nlocal; }
+  if (eflag) eng_vdwl += out.energy;
+  if (use_runtime_long_range) eng_vdwl += reciprocal_out.energy;
 
   // When virial is needed, ghost forces must be in f[] for virial_fdotr_compute()
   // to produce correct results (it sums over nall = nlocal + nghost). In fold mode the model has no
   // ghost nodes (cross-boundary forces already landed on local owners), so we only write nlocal rows.
-  // rRESPA: the inner level always needs ghost SR forces in f[] (reverse_comm folds them onto owners
-  // before the per-level force is stored), so treat PHASE_INNER like the newton_pair/vflag_fdotr case.
   const int nwrite = fold_mode_ ? nlocal
-      : ((force->newton_pair || vflag_fdotr || respa_phase_ == PHASE_INNER) ? ntotal : nlocal);
+      : ((force->newton_pair || vflag_fdotr) ? ntotal : nlocal);
   auto forces_cpu = out.forces.to(torch::kCPU, torch::kFloat64).contiguous();
   const double *fp = forces_cpu.data_ptr<double>();
   for (int i = 0; i < nwrite; i++) {
@@ -1355,19 +1192,6 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       f[i][2] += rfp[i * 3 + 2];
     }
   }
-  if (use_mbd && mbd_out.forces.defined()) {
-    auto mbd_forces_cpu = mbd_out.forces.to(torch::kCPU, torch::kFloat64).contiguous();
-    const double *mfp = mbd_forces_cpu.data_ptr<double>();
-    for (int i = 0; i < nlocal; i++) {
-      f[i][0] += mfp[i * 3 + 0];
-      f[i][1] += mfp[i * 3 + 1];
-      f[i][2] += mfp[i * 3 + 2];
-    }
-  }
-
-  // rRESPA inner level defers all energy/virial tally to compute_outer(); skip the per-atom + fdotr
-  // blocks here (eflag_atom/vflag_atom/vflag_fdotr are stale from the previous outer ev_init anyway).
-  if (defer_tally) { respa_staged_ = true; return; }
 
   if (eflag_atom && eatom && out.atom_energy.defined()) {
     auto ae_cpu = out.atom_energy.to(torch::kCPU, torch::kFloat64).contiguous().view({n_model});
@@ -1410,80 +1234,4 @@ void PairMFFTorch::compute(int eflag, int vflag) {
         elapsed(profile_sort, profile_pack), elapsed(profile_pack, profile_engine),
         elapsed(profile_engine, profile_end), elapsed(profile_start, profile_end));
   }
-}
-
-// ---------------------------------------------------------------------------------------------------
-// rRESPA inner level: the cheap short-range core, run EVERY step. Builds the model graph from the full
-// neighbor list, runs the SR engine forward, writes ONLY the SR (+reciprocal) force into f[] (which
-// rRESPA just cleared and will store as the inner-level force), and stages the MBD inputs for the
-// outer level. No energy/virial tally here (deferred to compute_outer). The MBD force is NOT added at
-// this level -- rRESPA stores/applies the outer (MBD) force separately with the large outer timestep.
-void PairMFFTorch::compute_inner() {
-  respa_phase_ = PHASE_INNER;
-  respa_staged_ = false;
-  if (std::getenv("MFF_RESPA_COUNT")) {
-    static long n_inner = 0;
-    std::fprintf(stderr, "[mff/torch RESPA] compute_inner #%ld (step %lld)\n",
-                 ++n_inner, (long long)update->ntimestep);
-  }
-  // compute(0,0): eflag/vflag are ignored on the inner level (defer_tally guards every tally); we pass
-  // 0 so no per-atom arrays are touched. The SR force write inside still happens (phase-gated).
-  compute(0, 0);
-  respa_phase_ = PHASE_FULL;
-}
-
-// rRESPA middle level: unused (this pair is a 2-level inner/outer split). Empty by design.
-void PairMFFTorch::compute_middle() {}
-
-// rRESPA outer level: the expensive many-body-dispersion solve, run every K steps. Runs the MBD solve
-// from the inputs staged by the most recent compute_inner() (same positions -> consistent), writes
-// ONLY the MBD force into f[] (rRESPA cleared it; this becomes the outer-level force applied with the
-// large outer timestep), and tallies the staged SR energy + the MBD energy into the global accumulators
-// (ev_init here zeroed eng_vdwl; the inner level tallied nothing, so the outer level owns the energy).
-void PairMFFTorch::compute_outer(int eflag, int vflag) {
-  ev_init(eflag, vflag);
-  if (!engine_loaded_) init_style();
-  double **f = atom->f;
-  const int nlocal = atom->nlocal;
-  if (std::getenv("MFF_RESPA_COUNT")) {
-    static long n_outer = 0;
-    std::fprintf(stderr, "[mff/torch RESPA] compute_outer #%ld (step %lld, staged=%d mbd=%d)\n",
-                 ++n_outer, (long long)update->ntimestep, (int)respa_staged_, (int)respa_have_mbd_);
-  }
-
-  // Tally the staged SR energy (from the last inner step at these positions). The MBD energy is added
-  // below after the solve. Per-atom SR energy/virial under respa is not staged for the goal of this run
-  // (NVE conservation + speedup needs only the global energy + forces); pressure/per-atom is best-effort.
-  if (respa_staged_ && eflag_global) eng_vdwl += respa_sr_energy_;
-
-  // Run the MBD solve from the staged inputs (engine device). On a step where nothing was staged (e.g.
-  // an empty rank, or MBD disabled) this is a no-op -- f[] keeps only the inner SR force via f_level.
-  mfftorch::MBDOutputs mbd_out;
-  if (respa_staged_ && respa_have_mbd_ && mbd_solver_) {
-    try {
-      const auto mbd_device = engine_->device();
-      if (respa_mbd_have_edges_) {
-        mbd_out = mbd_solver_->compute(respa_mbd_pos_, respa_mbd_source_, respa_mbd_cell_,
-                                       respa_mbd_full_src_, respa_mbd_full_dst_, respa_mbd_full_sh_,
-                                       dispersion_cut_global_, mbd_device);
-      } else {
-        mbd_out = mbd_solver_->compute(respa_mbd_pos_, respa_mbd_source_, respa_mbd_cell_, mbd_device);
-      }
-    } catch (const std::exception &e) {
-      error->all(FLERR, (std::string("mff/torch MBD solver (respa outer) failed: ") + e.what()).c_str());
-    }
-  }
-
-  if (eflag_global && mbd_out.forces.defined()) eng_vdwl += mbd_out.energy;
-  if (mbd_out.forces.defined()) {
-    auto mbd_forces_cpu = mbd_out.forces.to(torch::kCPU, torch::kFloat64).contiguous();
-    const double *mfp = mbd_forces_cpu.data_ptr<double>();
-    const int nadd = std::min(nlocal, respa_staged_nlocal_);
-    for (int i = 0; i < nadd; i++) {
-      f[i][0] += mfp[i * 3 + 0];
-      f[i][1] += mfp[i * 3 + 1];
-      f[i][2] += mfp[i * 3 + 2];
-    }
-  }
-  // No virial_fdotr_compute under rRESPA (virial_style == VIRIAL_PAIR); pressure not targeted this run.
 }

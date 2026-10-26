@@ -19,8 +19,6 @@ PairStyle(mff/torch,PairMFFTorch);
 namespace mfftorch {
 class MFFTorchEngine;
 class MFFReciprocalSolver;
-class MFFMBDSolver;
-class MFFTreeFmmSolver;
 struct MFFOutputs;
 }
 
@@ -32,13 +30,6 @@ class PairMFFTorch : public Pair {
   ~PairMFFTorch() override;
 
   void compute(int eflag, int vflag) override;
-  // rRESPA multiple-time-stepping: the cheap short-range (SR) core runs on the INNER level (every
-  // step) while the expensive many-body-dispersion (MBD) solve runs on the OUTER level (every K
-  // steps). The dispersion force is smooth/slow so K=2-4 conserves energy well. See compute_inner/
-  // compute_outer below; the non-respa compute() above is unchanged (runs both every step).
-  void compute_inner() override;
-  void compute_middle() override;
-  void compute_outer(int eflag, int vflag) override;
   void settings(int narg, char **arg) override;
   void coeff(int narg, char **arg) override;
   double init_one(int i, int j) override;
@@ -113,8 +104,6 @@ class PairMFFTorch : public Pair {
 
   std::unique_ptr<mfftorch::MFFTorchEngine> engine_;
   std::unique_ptr<mfftorch::MFFReciprocalSolver> reciprocal_solver_;
-  std::unique_ptr<mfftorch::MFFMBDSolver> mbd_solver_;
-  std::unique_ptr<mfftorch::MFFTreeFmmSolver> tree_fmm_solver_;
   bool engine_loaded_ = false;
 
   // Persistent per-step CPU buffers (avoid repeated heap allocation).
@@ -140,32 +129,6 @@ class PairMFFTorch : public Pair {
   torch::Tensor cached_disp_edge_dst_t_;
   torch::Tensor cached_disp_edge_shifts_t_;
   torch::Tensor cached_cell_t_;
-
-  // --- rRESPA support -----------------------------------------------------------------------------
-  // compute() is parameterized by respa_phase_ so the inner/outer levels reuse its (large) graph
-  // builder + force/energy bookkeeping instead of duplicating it:
-  //   PHASE_FULL  (non-respa / run_style verlet): build graph, SR forward, reciprocal, MBD, tally all,
-  //               virial_fdotr_compute. Unchanged from before respa.
-  //   PHASE_INNER (compute_inner, every step): build graph, SR forward, add SR forces, run reciprocal,
-  //               STAGE the MBD inputs (reciprocal_source + disp edges + cell + pos). NO MBD solve, NO
-  //               energy/virial tally (deferred to the outer level).
-  //   PHASE_OUTER (compute_outer, every K steps): SKIP graph rebuild + SR forward; run the MBD solve
-  //               from the staged inputs, add MBD forces, and tally the staged SR energy + MBD energy.
-  enum RespaPhase { PHASE_FULL = 0, PHASE_INNER = 1, PHASE_OUTER = 2 };
-  int respa_phase_ = PHASE_FULL;
-
-  // Staged-for-outer state (filled in PHASE_INNER, consumed in PHASE_OUTER).
-  bool respa_staged_ = false;            // PHASE_INNER produced usable staged state this step
-  double respa_sr_energy_ = 0.0;         // staged SR scalar energy (out.energy)
-  int respa_staged_nlocal_ = 0;          // nlocal at stage time
-  bool respa_have_mbd_ = false;          // an MBD source/edges were staged this inner step
-  torch::Tensor respa_mbd_source_;       // staged MBD source [nlocal,chan] on engine device
-  torch::Tensor respa_mbd_pos_;          // staged positions [nlocal,3] on engine device
-  torch::Tensor respa_mbd_cell_;         // staged cell [3,3] on engine device
-  torch::Tensor respa_mbd_full_src_;     // staged full (both-dir) dispersion edge src (engine device)
-  torch::Tensor respa_mbd_full_dst_;     // staged full dispersion edge dst
-  torch::Tensor respa_mbd_full_sh_;      // staged full dispersion edge shifts
-  bool respa_mbd_have_edges_ = false;    // staged a LAMMPS dispersion edge list (vs solver fallback)
 };
 
 }  // namespace LAMMPS_NS

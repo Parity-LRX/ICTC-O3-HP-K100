@@ -34,7 +34,7 @@ from mace_ictc.models._mace_symmetric_contraction import MaceSymmetricContractio
 from mace_ictc.models.mlp import MainNet
 from mace_ictc.utils.scatter import scatter
 from mace_ictc.models.long_range import build_long_range_module
-from mace_ictc.models.dispersion import build_long_range_dispersion, normalize_dispersion_mode
+from mace_ictc.utils.legacy_dispersion import normalize_dispersion_mode
 
 
 _CONTRACTION_BATCH_EXAMPLE = 10
@@ -3692,82 +3692,20 @@ class PureCartesianICTDFix(nn.Module):
             self.long_range_energy_partition = "uniform"
             self.long_range_neutralize = bool(getattr(self.long_range_module, "neutralize", True))
 
-        # Long-range dispersion term. OFF by default -> None -> no contribution
-        # (byte-identical). The legacy boolean `long_range_dispersion=True` maps to
-        # `pairwise-c6`; future MBD modes should plug into this same interface rather
-        # than adding another hand-written branch in forward.
+        # Retain disabled historical metadata; trained dispersion checkpoints fail explicitly.
         self.long_range_dispersion_mode = normalize_dispersion_mode(
-            long_range_dispersion=bool(long_range_dispersion),
+            long_range_dispersion=long_range_dispersion,
             long_range_dispersion_mode=long_range_dispersion_mode,
         )
-        self.long_range_dispersion = self.long_range_dispersion_mode != "none"
-        self.dispersion_cutoff = float(dispersion_cutoff)
-        if dispersion_max_num_neighbors is not None and int(dispersion_max_num_neighbors) < 0:
-            raise ValueError("dispersion_max_num_neighbors must be >= 0 or None")
-        self.dispersion_max_num_neighbors = (
-            None if dispersion_max_num_neighbors is None or int(dispersion_max_num_neighbors) == 0
-            else int(dispersion_max_num_neighbors)
-        )
-        self.dispersion_neighbor_method = str(dispersion_neighbor_method)
-        self.dispersion_bruteforce_threshold = int(dispersion_bruteforce_threshold)
-        self.dispersion_allow_large_bruteforce_fallback = bool(dispersion_allow_large_bruteforce_fallback)
-        self.dispersion_slq_num_probes = int(dispersion_slq_num_probes)
-        self.dispersion_slq_lanczos_steps = int(dispersion_slq_lanczos_steps)
-        self.mbd_operator_backend = str(mbd_operator_backend)
-        self.mbd_pme_mesh_size = int(mbd_pme_mesh_size)
-        self.mbd_pme_assignment = str(mbd_pme_assignment)
-        self.mbd_pme_k_norm_floor = float(mbd_pme_k_norm_floor)
-        self.mbd_pme_assignment_window_floor = float(mbd_pme_assignment_window_floor)
-        self.mbd_pme_ewald_alpha_prefactor = float(mbd_pme_ewald_alpha_prefactor)
-        self.mbd_anisotropic_polarizability = bool(mbd_anisotropic_polarizability)
-        self.mbd_learnable_energy_scale = bool(mbd_learnable_energy_scale)
-        self.mbd_alpha_floor = float(mbd_alpha_floor)
-        self.dispersion_min_cutoff = float(dispersion_min_cutoff)
-        self.dispersion_switch_width = float(dispersion_switch_width)
+        self.long_range_dispersion = False
+        self.dispersion = None
+        for name, value in tuple(locals().items()):
+            if name.startswith(("dispersion_", "mbd_")):
+                setattr(self, name, value)
         self.dispersion_pbc = str(long_range_boundary) == "periodic"
-        self.dispersion = build_long_range_dispersion(
-            mode=self.long_range_dispersion_mode,
-            feature_dim=self.channels,
-            cutoff=self.dispersion_cutoff,
-            pbc=self.dispersion_pbc,
-            neighbor_method=self.dispersion_neighbor_method,
-            bruteforce_threshold=self.dispersion_bruteforce_threshold,
-            allow_large_bruteforce_fallback=self.dispersion_allow_large_bruteforce_fallback,
-            slq_num_probes=self.dispersion_slq_num_probes,
-            slq_lanczos_steps=self.dispersion_slq_lanczos_steps,
-            max_num_neighbors=self.dispersion_max_num_neighbors,
-            mbd_operator_backend=self.mbd_operator_backend,
-            mbd_pme_mesh_size=self.mbd_pme_mesh_size,
-            mbd_pme_assignment=self.mbd_pme_assignment,
-            mbd_pme_k_norm_floor=self.mbd_pme_k_norm_floor,
-            mbd_pme_assignment_window_floor=self.mbd_pme_assignment_window_floor,
-            mbd_pme_ewald_alpha_prefactor=self.mbd_pme_ewald_alpha_prefactor,
-            mbd_anisotropic_polarizability=self.mbd_anisotropic_polarizability,
-            mbd_learnable_energy_scale=self.mbd_learnable_energy_scale,
-            mbd_alpha_floor=self.mbd_alpha_floor,
-            dispersion_min_cutoff=self.dispersion_min_cutoff,
-            dispersion_switch_width=self.dispersion_switch_width,
-        )
-
-        # MBD-source packing metadata (read by the exporter -> .json -> C++ engine/pair-style). When the
-        # mbd-slq head exports a source, the deploy forward emits [electrostatic | omega, alpha]; the MBD
-        # (omega,alpha) begins at offset = the electrostatic source width (0 if no electrostatic source).
-        self.long_range_mbd_source_enabled = bool(
-            self.dispersion is not None and self.dispersion.exports_mbd_source()
-        )
-        # MBD source width: isotropic [omega, alpha] = 2; anisotropic [omega, alpha_iso, 6*B] = 8.
-        self.long_range_mbd_source_channels = 8 if self.mbd_anisotropic_polarizability else 2
-        _l = self.long_range_max_multipole_l
-        self.long_range_mbd_source_offset = (
-            int(getattr(self, "long_range_runtime_source_channels", 0))
-            * (1 + (3 if _l >= 1 else 0) + (9 if _l >= 2 else 0))
-            if self.long_range_exports_reciprocal_source
-            else 0
-        )
-        if self.long_range_mbd_source_enabled:
-            # emit the reciprocal_source even for an MBD-only model (no electrostatics) so the C++ MBD
-            # solver gets (omega, alpha); the reciprocal solver stays gated on the electrostatic channels.
-            self.long_range_exports_reciprocal_source = True
+        self.long_range_mbd_source_enabled = False
+        self.long_range_mbd_source_channels = 0
+        self.long_range_mbd_source_offset = 0
 
         # Optional fixed scale/shift on the network (short-range) per-atom interaction energy.
         # This mirrors MACE ScaleShiftMACE: E_inter_atom = scale * readout + shift. OFF by
@@ -4308,74 +4246,6 @@ class PureCartesianICTDFix(nn.Module):
                 )
             if long_range_energy is not None and not defer:
                 out = out + long_range_energy
-
-        # --- pairwise dispersion additive term (invariant) ---
-        if self.dispersion is not None:
-            last_state = layer_states[-1]
-            disp_l2 = None
-            if last_state.shape[-1] == self.channels:
-                disp_feat = last_state
-            else:
-                disp_feat = _split_irreps(last_state, self.channels, self.lmax)[0].reshape(
-                    last_state.shape[0], self.channels
-                )
-            # ANISOTROPIC MBD: feed the equivariant l=2 node block to the dispersion head (ICTC l=2 ->
-            # 3x3 anisotropic polarizability). Source = the last layer's INTERACTION output (pre-product
-            # message): the interaction always emits full-SO(3) (edge_lmax); only the PRODUCT truncates
-            # the last layer to l=0. So the l=2 block is present at every depth, single-layer included.
-            # _split_irreps front-slices l=2, so a wider edge_lmax message stays correct. (Without an
-            # l=2 source disp_l2 stays None and polarizability_factor falls back to the ISOTROPIC b0*I,
-            # silently leaving the anisotropic l2_mix/l2_gate untrained.)
-            if self.mbd_anisotropic_polarizability and self.lmax >= 2 and last_preproduct_state is not None:
-                disp_l2 = _split_irreps(last_preproduct_state, self.channels, self.lmax)[2]  # [N, channels, 5]
-            if return_reciprocal_source and self.dispersion.exports_mbd_source():
-                # Deploy: emit the head's (omega, alpha) as the MBD source and DEFER the coupled-dipole
-                # energy to the C++ MBD solver (no double count). PACK after any electrostatic source so
-                # a COMBINED model carries both: [elec | omega, alpha]. The C++ reciprocal solver ignores
-                # the trailing channels; the MBD solver reads source[:, mbd_offset:mbd_offset+2].
-                mbd_source = self.dispersion.emit_source(disp_feat, disp_l2)
-                reciprocal_source = (
-                    mbd_source if reciprocal_source is None
-                    else torch.cat([reciprocal_source, mbd_source], dim=1)
-                )
-            else:
-                disp_edge_src = edge_src
-                disp_edge_dst = edge_dst
-                disp_edge_length = edge_length
-                disp_edge_vec = edge_vec
-                disp_cutoff = self.dispersion_cutoff
-                if dispersion_edge_src is not None or dispersion_edge_dst is not None:
-                    if dispersion_edge_src is None or dispersion_edge_dst is None:
-                        raise ValueError("dispersion_edge_src and dispersion_edge_dst must be provided together")
-                    disp_edge_src = dispersion_edge_src
-                    disp_edge_dst = dispersion_edge_dst
-                    disp_cutoff = 0.0
-                    if precomputed_dispersion_edge_vec is not None:
-                        disp_edge_vec = precomputed_dispersion_edge_vec
-                    else:
-                        if dispersion_edge_shifts is None:
-                            raise ValueError(
-                                "dispersion_edge_shifts or precomputed_dispersion_edge_vec is required "
-                                "when explicit dispersion edges are provided"
-                            )
-                        disp_shift = dispersion_edge_shifts.to(dtype=dtype)
-                        disp_cells = cell[batch[disp_edge_dst]]
-                        disp_shift_vec = torch.einsum("ni,nij->nj", disp_shift, disp_cells)
-                        disp_edge_vec = pos[disp_edge_dst] - pos[disp_edge_src] + disp_shift_vec
-                    disp_edge_length = disp_edge_vec.norm(dim=1)
-                out = out + self.dispersion(
-                    disp_feat,
-                    pos,
-                    batch,
-                    cell,
-                    edge_src=disp_edge_src,
-                    edge_dst=disp_edge_dst,
-                    edge_lengths=disp_edge_length,
-                    edge_vec=disp_edge_vec,
-                    cutoff=disp_cutoff,
-                    pbc=self.dispersion_pbc,
-                    l2_feats=disp_l2,
-                )
 
         if return_combined_features:
             combined_features = torch.cat(layer_states, dim=-1)

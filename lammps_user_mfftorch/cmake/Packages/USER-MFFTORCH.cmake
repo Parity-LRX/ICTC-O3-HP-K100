@@ -24,8 +24,6 @@ endif()
 target_sources(lammps PRIVATE
   ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/mff_torch_engine.cpp
   ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/mff_reciprocal_solver.cpp
-  ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/mff_mbd_solver.cpp
-  ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/mff_tree_fmm_solver.cpp
   ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/compute_mff_torch_phys.cpp
   ${LAMMPS_SOURCE_DIR}/USER-MFFTORCH/pair_mff_torch.cpp
 )

@@ -123,7 +123,7 @@ def validate_dispersion_deployment_graph_rule(
     source_label: str = "dispersion_deployment_graph_rule",
 ) -> str:
     """Return the expected deployment graph rule and reject inconsistent metadata."""
-    from mace_ictc.models.dispersion import dispersion_deployment_graph_rule
+    from mace_ictc.utils.legacy_dispersion import dispersion_deployment_graph_rule
 
     expected = dispersion_deployment_graph_rule(
         long_range_dispersion_mode,
@@ -145,7 +145,7 @@ def validate_dispersion_training_graph_rule(
     source_label: str = "dispersion_training_graph_rule",
 ) -> str:
     """Return the expected training graph rule and reject inconsistent metadata."""
-    from mace_ictc.models.dispersion import dispersion_training_graph_rule
+    from mace_ictc.utils.legacy_dispersion import dispersion_training_graph_rule
 
     expected = dispersion_training_graph_rule(
         long_range_dispersion_mode,
@@ -167,7 +167,7 @@ def validate_dispersion_train_deploy_graph_compatibility(
     source_label: str = "dispersion_train_deploy_graph_compatibility",
 ) -> str:
     """Return the expected train/deploy graph compatibility label."""
-    from mace_ictc.models.dispersion import dispersion_train_deploy_graph_compatibility
+    from mace_ictc.utils.legacy_dispersion import dispersion_train_deploy_graph_compatibility
 
     expected = dispersion_train_deploy_graph_compatibility(
         long_range_dispersion_mode,

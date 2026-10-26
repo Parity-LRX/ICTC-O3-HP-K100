@@ -130,7 +130,8 @@ ReciprocalBackend parse_backend_env(const char* env) {
   if (value == "replicated" || value == "replicated_atoms") return ReciprocalBackend::ReplicatedAtoms;
   if (value == "mesh_reduce") return ReciprocalBackend::MeshReduce;
   if (value == "distributed" || value == "distributed_slab_fft") return ReciprocalBackend::DistributedSlabFFT;
-  if (value == "distributed_tree_fmm") return ReciprocalBackend::DistributedTreeFmm;
+  if (value == "distributed_tree_fmm")
+    throw std::runtime_error("FMM is not supported by this K100 distribution");
   return ReciprocalBackend::Auto;
 }
 
@@ -194,8 +195,6 @@ const char* MFFReciprocalSolver::backend_name(ReciprocalBackend backend) {
       return "mesh_reduce";
     case ReciprocalBackend::DistributedSlabFFT:
       return "distributed_slab_fft";
-    case ReciprocalBackend::DistributedTreeFmm:
-      return "distributed_tree_fmm";
   }
   return "unknown";
 }

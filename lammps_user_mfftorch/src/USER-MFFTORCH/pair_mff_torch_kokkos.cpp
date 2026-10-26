@@ -18,7 +18,6 @@
 #include "mff_torch_engine.h"
 #include "mff_device_runtime.h"
 #include "mff_reciprocal_solver.h"
-#include "mff_tree_fmm_solver.h"
 
 #include <Kokkos_Core.hpp>
 #include <algorithm>
@@ -258,7 +257,6 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
         comm->me,kokkos_gpu_device(),dev.c_str());
     try {
       if (!reciprocal_solver_) reciprocal_solver_ = std::make_unique<mfftorch::MFFReciprocalSolver>();
-      if (!tree_fmm_solver_) tree_fmm_solver_ = std::make_unique<mfftorch::MFFTreeFmmSolver>();
       if (debug_bundle) std::fprintf(stderr, "[USER-MFFTORCH] kk init_style before load_core\n");
       engine_->load_core(core_pt_path_, dev);
       if (debug_bundle) std::fprintf(stderr, "[USER-MFFTORCH] kk init_style after load_core\n");
@@ -280,19 +278,7 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
         cfg.assignment = (engine_->long_range_assignment() == "pcs") ? 1 : 0;  // match in-model PME
         reciprocal_solver_->set_config(cfg);
       }
-      if (tree_fmm_solver_) {
-        mfftorch::TreeFmmConfig cfg;
-        cfg.theta = engine_->long_range_theta();
-        cfg.leaf_size = static_cast<int>(engine_->long_range_leaf_size());
-        cfg.multipole_order = static_cast<int>(engine_->long_range_multipole_order());
-        cfg.neutralize = engine_->long_range_neutralize();
-        cfg.screening = engine_->long_range_screening();
-        cfg.softening = engine_->long_range_softening();
-        cfg.energy_scale = engine_->long_range_energy_scale();
-        cfg.boundary = engine_->long_range_boundary();
-        cfg.energy_partition = engine_->long_range_energy_partition();
-        tree_fmm_solver_->set_config(cfg);
-      }
+
       validate_external_field_configuration();
       if (debug_bundle) std::fprintf(stderr, "[USER-MFFTORCH] kk init_style after validate\n");
       engine_loaded_ = true;
@@ -489,8 +475,6 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 
 	    const int64_t E = static_cast<int64_t>(buf_edge_src_cpu_.size());
 	    const int64_t Edisp = static_cast<int64_t>(buf_disp_edge_src_cpu_.size());
-	    // Canonical MBD/SLQ-MBD can have exactly one dispersion edge for a
-	    // two-atom graph; that is a valid model call, not an empty system.
 	    if (E == 0 && Edisp == 0) return;
 	    sort_edge_vectors(buf_edge_src_cpu_, buf_edge_dst_cpu_, buf_edge_shifts_cpu_);
 	    sort_edge_vectors(buf_disp_edge_src_cpu_, buf_disp_edge_dst_cpu_, buf_disp_edge_shifts_cpu_);
@@ -536,21 +520,18 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 	    mfftorch::ReciprocalOutputs reciprocal_out;
 	    const bool exports_runtime_source =
 	        engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0;
-	    const bool use_tree_fmm =
-	        tree_fmm_solver_ && exports_runtime_source && engine_->long_range_runtime_backend() == "tree_fmm";
+
 	    const bool use_reciprocal =
-	        reciprocal_solver_ && exports_runtime_source && !use_tree_fmm;
-	    const bool use_runtime_long_range = use_tree_fmm || use_reciprocal;
-	    if (use_tree_fmm || use_reciprocal) {
+	        reciprocal_solver_ && exports_runtime_source;
+	    const bool use_runtime_long_range = use_reciprocal;
+	    if (use_reciprocal) {
 	      try {
 	        auto local_source = out.reciprocal_source.defined()
 	                                ? out.reciprocal_source.narrow(0, 0, nlocal_owned).to(dev, torch::kFloat32).contiguous()
 	                                : torch::zeros(
 	                                      {nlocal_owned, engine_->reciprocal_source_channels()},
 	                                      torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-	        if (use_tree_fmm && engine_->long_range_source_kind() != "latent_charge") {
-	          throw std::runtime_error("tree_fmm runtime currently requires long_range_source_kind=latent_charge");
-	        }
+
 	        auto reciprocal_inputs = make_reciprocal_inputs(
 	            world,
 	            pos_t.to(dev, torch::kFloat32).contiguous(),
@@ -560,12 +541,10 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 	            static_cast<bool>(eflag_global || eflag_atom),
 	            dev);
 	        if (std::getenv("MFF_RECIPROCAL_MULTIPOLE_AUTOGRAD")) {
-	          reciprocal_out = use_tree_fmm ? tree_fmm_solver_->compute(reciprocal_inputs)
-	                                        : reciprocal_solver_->compute(reciprocal_inputs);
+	          reciprocal_out = reciprocal_solver_->compute(reciprocal_inputs);
 	        } else {
 	          c10::InferenceMode reciprocal_inference_guard(true);
-	          reciprocal_out = use_tree_fmm ? tree_fmm_solver_->compute(reciprocal_inputs)
-	                                        : reciprocal_solver_->compute(reciprocal_inputs);
+	          reciprocal_out = reciprocal_solver_->compute(reciprocal_inputs);
 	        }
 	      } catch (const std::exception &e) {
 	        error->all(FLERR, (std::string("mff/torch/kk host-staged runtime long-range solver failed: ") + e.what()).c_str());
@@ -648,13 +627,10 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
       cached_cell_valid_ = true;
     }
     auto cell_t = cached_cell_t_;
-    const bool use_tree_fmm =
-        tree_fmm_solver_ && engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0 &&
-        engine_->long_range_runtime_backend() == "tree_fmm";
+
     const bool use_reciprocal =
-        reciprocal_solver_ && engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0 &&
-        !use_tree_fmm;
-    if (use_tree_fmm || use_reciprocal) {
+        reciprocal_solver_ && engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0;
+    if (use_reciprocal) {
       auto empty_pos = torch::zeros({0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
       auto empty_source = torch::zeros(
           {0, engine_->reciprocal_source_channels()},
@@ -668,11 +644,9 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
             geom,
             static_cast<bool>(eflag_global || eflag_atom),
             dev);
-        if (use_tree_fmm) {
-          (void)tree_fmm_solver_->compute(reciprocal_inputs);
-        } else {
+
           (void)reciprocal_solver_->compute(reciprocal_inputs);
-        }
+
       } catch (const std::exception &e) {
         error->all(FLERR, (std::string("mff/torch/kk runtime long-range solver failed on empty rank: ") + e.what()).c_str());
       }
@@ -875,7 +849,6 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
             edge_shifts_v(idx, 1) = 0.0f;
             edge_shifts_v(idx, 2) = 0.0f;
           }
-          // MBD/SLQ-MBD consumes one representative of
           // (src, dst, shift) ~ (dst, src, -shift).  Self-image couplings keep
           // the lexicographically positive shift half, matching the Python builder.
           const bool keep_disp = keep_disp_raw && keep_canonical_mbd_edge(src, i, -out_sx, -out_sy, -out_sz);
@@ -905,7 +878,6 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
     disp_valid_mask = buf_disp_edge_src_.ge(0);
     Edispfiltered = disp_valid_mask.sum().item<int64_t>();
   }
-  // Keep one-edge graphs alive for canonical MBD/SLQ-MBD.
   if (!layerwise_exchange_ && Efiltered == 0 && (!use_dispersion_edges || Edispfiltered == 0)) return;
   if (Efiltered != Etotal) {
     auto valid_idx = torch::nonzero(valid_mask).view({-1});
@@ -1115,21 +1087,18 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   mfftorch::ReciprocalOutputs reciprocal_out;
   torch::Tensor reciprocal_forces_dev;
   const bool exports_runtime_source = engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0;
-  const bool use_tree_fmm =
-      tree_fmm_solver_ && exports_runtime_source && engine_->long_range_runtime_backend() == "tree_fmm";
+
   const bool use_reciprocal =
-      reciprocal_solver_ && exports_runtime_source && !use_tree_fmm;
-  const bool use_runtime_long_range = use_tree_fmm || use_reciprocal;
-  if (use_tree_fmm || use_reciprocal) {
+      reciprocal_solver_ && exports_runtime_source;
+  const bool use_runtime_long_range = use_reciprocal;
+  if (use_reciprocal) {
     try {
       auto local_source = out.reciprocal_source.defined()
                               ? out.reciprocal_source.narrow(0, 0, nlocal).contiguous()
                               : torch::zeros(
                                     {nlocal, engine_->reciprocal_source_channels()},
                                     torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-      if (use_tree_fmm && engine_->long_range_source_kind() != "latent_charge") {
-        throw std::runtime_error("tree_fmm runtime currently requires long_range_source_kind=latent_charge");
-      }
+
       auto reciprocal_inputs = make_reciprocal_inputs(
           world,
           buf_pos_.narrow(0, 0, nlocal).contiguous(),
@@ -1139,12 +1108,10 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
           need_energy,
           dev);
       if (std::getenv("MFF_RECIPROCAL_MULTIPOLE_AUTOGRAD")) {
-        reciprocal_out = use_tree_fmm ? tree_fmm_solver_->compute(reciprocal_inputs)
-                                      : reciprocal_solver_->compute(reciprocal_inputs);
+        reciprocal_out = reciprocal_solver_->compute(reciprocal_inputs);
       } else {
         c10::InferenceMode reciprocal_inference_guard(true);
-        reciprocal_out = use_tree_fmm ? tree_fmm_solver_->compute(reciprocal_inputs)
-                                      : reciprocal_solver_->compute(reciprocal_inputs);
+        reciprocal_out = reciprocal_solver_->compute(reciprocal_inputs);
       }
     } catch (const std::exception &e) {
       error->all(FLERR, (std::string("mff/torch/kk runtime long-range solver failed: ") + e.what()).c_str());

@@ -148,8 +148,9 @@ dipole and quadrupole reciprocal models. The latter use the native HIP mesh
 backend, owned-source counting and differentiable RCCL Fourier-amplitude
 reductions. Three-axis grids and fixed screening are preserved. See the
 [electrostatics guide](../docs/ELECTROSTATICS.md#native-lammps-mfftorchkk).
-Extra input heads, physical tensor outputs and dispersion extensions require
-their corresponding implementation and validation.
+Extra input heads and physical tensor outputs require their corresponding
+implementation and validation. Dispersion/MBD and tree FMM extensions are excluded
+from this K100 distribution; mesh/FFT electrostatics is supported.
 
 Native inference uses FP32 with TF32 disabled. Export retains the original
 checkpoint; the runtime creates the FP32 inference model. Validate energy

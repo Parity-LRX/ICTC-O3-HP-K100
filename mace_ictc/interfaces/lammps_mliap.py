@@ -1338,9 +1338,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         mbd_pme_ewald_alpha_prefactor = float(
             ckpt.get("mbd_pme_ewald_alpha_prefactor", arch_meta.get("mbd_pme_ewald_alpha_prefactor", 5.0))
         )
-        # Anisotropic MBD adds l2_mix/l2_gate params (lmax>=2 3x3 polarizability). Missing this ->
-        # the constructor builds the ISOTROPIC dispersion head and strict load fails on the extra
-        # dispersion.term.l2_* keys. Read it back like the other mbd_* hyperparameters.
+        # Preserve disabled historical metadata; enabled dispersion was rejected above.
         mbd_anisotropic_polarizability = bool(
             ckpt.get("mbd_anisotropic_polarizability", arch_meta.get("mbd_anisotropic_polarizability", False))
         )

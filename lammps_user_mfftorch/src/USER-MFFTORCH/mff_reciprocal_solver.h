@@ -21,7 +21,6 @@ enum class ReciprocalBackend {
   ReplicatedAtoms,
   MeshReduce,
   DistributedSlabFFT,
-  DistributedTreeFmm,
 };
 
 enum class ReciprocalGreenMode {

@@ -527,6 +527,24 @@ static void load_custom_op_libs() {
 }
 
 void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
+  // Validate retired extensions before selecting native, TorchScript or AOTI loading.
+  {
+    std::ifstream metadata(core_pt_path + ".json");
+    if (metadata.good()) {
+      const std::string text((std::istreambuf_iterator<char>(metadata)), std::istreambuf_iterator<char>());
+      std::string mode = "none", source_kind = "none", backend = "none";
+      bool mbd_enabled = false;
+      (void)parse_string_from_metadata(text, "\"long_range_dispersion_mode\"", mode);
+      (void)parse_string_from_metadata(text, "\"long_range_source_kind\"", source_kind);
+      (void)parse_string_from_metadata(text, "\"long_range_runtime_backend\"", backend);
+      (void)parse_bool_from_metadata(text, "\"long_range_mbd_source_enabled\"", mbd_enabled);
+      if (mode != "none" || mbd_enabled || source_kind == "mbd")
+        throw std::runtime_error("Dispersion (pairwise C6/MBD) is not supported by this K100 distribution");
+      if (backend == "tree_fmm")
+        throw std::runtime_error("FMM is not supported by this K100 distribution");
+    }
+  }
+
   load_custom_op_libs();
   ensure_python_custom_op_registrations();
   ensure_native_hp_runtime(core_pt_path,device_);
@@ -677,8 +695,6 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
             dispersion_deployment_graph_rule_,
             long_range_dispersion_mode_,
             mbd_operator_backend_);
-        // mbd_operator_backend=pme_fft IS supported at deployment now: the MBD solver runs the reciprocal-only
-        // PME operator (use_fft) mirroring the trained apply_periodic_dipole_pme_field. (No throw.)
         if (long_range_source_channels_ <= 0) long_range_source_channels_ = reciprocal_source_channels_;
         if (long_range_runtime_backend_ == "none" && core_exports_reciprocal_source_ && reciprocal_source_channels_ > 0) {
           long_range_runtime_backend_ = "mesh_fft";
@@ -822,8 +838,6 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
           dispersion_deployment_graph_rule_,
           long_range_dispersion_mode_,
           mbd_operator_backend_);
-      // mbd_operator_backend=pme_fft IS supported at deployment now: the MBD solver runs the reciprocal-only
-      // PME operator (use_fft) mirroring the trained apply_periodic_dipole_pme_field. (No throw.)
       (void)parse_int64_from_metadata(content, "\"trace_num_nodes\"", trace_num_nodes_);
       (void)parse_int64_from_metadata(content, "\"trace_num_edges\"", trace_num_edges_);
       (void)parse_string_from_metadata(content, "\"external_tensor_irrep\"", external_tensor_irrep_);

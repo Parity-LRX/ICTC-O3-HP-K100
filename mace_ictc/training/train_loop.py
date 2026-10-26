@@ -911,111 +911,10 @@ class ForceTrainer:
 
     def _dispersion_edges_for_batch(self, pos, batch_idx, cell, extras):
         self._last_dispersion_neighbor_build_info = None
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        if getattr(raw_model, "dispersion", None) is None:
-            return None
-        dispersion_mode = str(getattr(raw_model, "long_range_dispersion_mode", "pairwise-c6"))
-        mbd_operator_backend = str(getattr(raw_model, "mbd_operator_backend", "edge_sparse"))
-        from mace_ictc.models.dispersion import (
-            dispersion_mode_uses_canonical_edges,
-            dispersion_mode_uses_cutoff_edges,
-        )
-
-        if not dispersion_mode_uses_cutoff_edges(
-            dispersion_mode,
-            mbd_operator_backend=mbd_operator_backend,
-        ):
-            return None
-        canonical_undirected = dispersion_mode_uses_canonical_edges(dispersion_mode)
-
-        def _extra_tensor(*names, dtype):
-            if not isinstance(extras, dict):
-                return None
-            for name in names:
-                value = extras.get(name, None)
-                if torch.is_tensor(value):
-                    return value.to(device=self.device, dtype=dtype)
-            return None
-
-        disp_src = _extra_tensor("dispersion_edge_src", "disp_edge_src", dtype=torch.long)
-        disp_dst = _extra_tensor("dispersion_edge_dst", "disp_edge_dst", dtype=torch.long)
-        disp_shifts = _extra_tensor("dispersion_edge_shifts", "disp_edge_shifts", dtype=pos.dtype)
-        if disp_src is not None or disp_dst is not None or disp_shifts is not None:
-            if disp_src is None or disp_dst is None or disp_shifts is None:
-                raise ValueError(
-                    "dispersion_edge_src, dispersion_edge_dst, and dispersion_edge_shifts must be provided together"
-                )
-            from mace_ictc.models.dispersion import normalize_dispersion_edges
-
-            disp_src, disp_dst, disp_shifts = normalize_dispersion_edges(
-                disp_src,
-                disp_dst,
-                disp_shifts,
-                canonical_undirected=canonical_undirected,
-                sort_edges=True,
-            )
-            bad_shape = (
-                disp_src.numel() != disp_dst.numel()
-                or disp_shifts.ndim != 2
-                or disp_shifts.shape[0] != disp_src.numel()
-                or disp_shifts.shape[1] != 3
-            )
-            if bad_shape:
-                raise ValueError(
-                    "explicit dispersion edges must have matching src/dst lengths and shifts shape [num_edges, 3]"
-                )
-            if disp_src.numel() > 0:
-                n_atoms = int(pos.shape[0])
-                out_of_range = (disp_src < 0) | (disp_dst < 0) | (disp_src >= n_atoms) | (disp_dst >= n_atoms)
-                if bool(out_of_range.any().item()):
-                    raise ValueError("explicit dispersion edges contain atom indices outside the current batch")
-                crosses_graph = batch_idx.index_select(0, disp_src) != batch_idx.index_select(0, disp_dst)
-                if bool(crosses_graph.any().item()):
-                    raise ValueError("explicit dispersion edges must not connect atoms from different batch graphs")
-            self._last_dispersion_neighbor_build_info = {
-                "requested_method": "explicit",
-                "selected_method": "explicit",
-            }
-            return disp_src, disp_dst, disp_shifts.to(device=self.device, dtype=pos.dtype)
-
-        from mace_ictc.models.dispersion import dispersion_neighbor_list
-
-        cutoff = float(getattr(raw_model, "dispersion_cutoff", getattr(raw_model, "max_radius", self.max_radius)))
-        if cutoff <= 0.0:
-            return None
-
-        pbc = bool(getattr(raw_model, "dispersion_pbc", True))
-        max_num_neighbors = getattr(raw_model, "dispersion_max_num_neighbors", None)
-        if max_num_neighbors is not None:
-            max_num_neighbors = int(max_num_neighbors)
-        neighbor_method = str(getattr(raw_model, "dispersion_neighbor_method", "auto"))
-        bruteforce_threshold = int(getattr(raw_model, "dispersion_bruteforce_threshold", 1024))
-        allow_large_bruteforce_fallback = bool(
-            getattr(raw_model, "dispersion_allow_large_bruteforce_fallback", False)
-        )
-        result = dispersion_neighbor_list(
-            pos.detach(),
-            batch_idx.detach(),
-            cell.detach(),
-            cutoff,
-            pbc=pbc,
-            canonical_undirected=canonical_undirected,
-            method=neighbor_method,
-            bruteforce_threshold=bruteforce_threshold,
-            max_num_neighbors=max_num_neighbors,
-            allow_large_bruteforce_fallback=allow_large_bruteforce_fallback,
-            return_info=True,
-        )
-        if len(result) == 4:
-            disp_src, disp_dst, disp_shifts, build_info = result
-        else:
-            disp_src, disp_dst, disp_shifts = result
-            build_info = {
-                "requested_method": neighbor_method,
-                "selected_method": "unknown",
-            }
-        self._last_dispersion_neighbor_build_info = dict(build_info)
-        return disp_src.to(self.device), disp_dst.to(self.device), disp_shifts.to(device=self.device, dtype=pos.dtype)
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if getattr(model, "dispersion", None) is not None:
+            raise ValueError("Dispersion is not supported by this K100 distribution")
+        return None
 
     def _uses_mesh_fft_long_range(self) -> bool:
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
@@ -1039,47 +938,8 @@ class ForceTrainer:
 
     @torch.no_grad()
     def _record_dispersion_graph_observation(self, batch_idx, cell, dispersion_edges):
-        if dispersion_edges is None:
-            return
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        dispersion_mode = str(getattr(raw_model, "long_range_dispersion_mode", "none"))
-        mbd_operator_backend = str(getattr(raw_model, "mbd_operator_backend", "edge_sparse"))
-        from mace_ictc.models.dispersion import (
-            dispersion_cutoff_is_single_image_exact,
-            dispersion_train_deploy_graph_compatibility,
-        )
-
-        compatibility = dispersion_train_deploy_graph_compatibility(
-            dispersion_mode,
-            mbd_operator_backend=mbd_operator_backend,
-        )
-        if compatibility != "conditional_on_single_image_cutoff":
-            return
-
-        self._dispersion_graph_observation_synced = None
-        disp_src, disp_dst, disp_shifts = dispersion_edges
-        obs = self._dispersion_graph_observation
-        obs["observed_batches"] += 1
-        obs["observed_edges"] += int(disp_src.numel())
-        build_info = self._last_dispersion_neighbor_build_info
-        selected_method = str(build_info.get("selected_method", "unknown")) if isinstance(build_info, dict) else "unknown"
-        builder_key = f"builder_{selected_method}_batches"
-        if builder_key not in obs:
-            builder_key = "builder_unknown_batches"
-        obs[builder_key] += 1
-
-        cutoff = float(getattr(raw_model, "dispersion_cutoff", getattr(raw_model, "max_radius", self.max_radius)))
-        pbc = bool(getattr(raw_model, "dispersion_pbc", True))
-        single_image_cell = bool(dispersion_cutoff_is_single_image_exact(cell.detach(), cutoff, pbc=pbc))
-        if single_image_cell:
-            obs["single_image_cell_batches"] += 1
-        else:
-            obs["non_single_image_cell_batches"] += 1
-
-        if disp_src.numel() > 0:
-            obs["self_image_edges"] += int((disp_src == disp_dst).sum().detach().cpu().item())
-            shift_i = disp_shifts.detach().round().to(dtype=torch.long)
-            obs["multi_image_shift_edges"] += int((shift_i.abs() > 1).any(dim=1).sum().cpu().item())
+        if dispersion_edges is not None:
+            raise ValueError("Dispersion graphs are not supported by this K100 distribution")
 
     def _dispersion_graph_observation_keys(self) -> tuple[str, ...]:
         return (
@@ -1964,7 +1824,7 @@ class ForceTrainer:
             # Explicit construction choices win (these are exactly what build_baseline_model
             # passed, so from_checkpoint rebuilds the same architecture).
             hp.update(self.extra_hparams)
-            from mace_ictc.models.dispersion import (
+            from mace_ictc.utils.legacy_dispersion import (
                 dispersion_deployment_graph_rule,
                 dispersion_train_deploy_graph_compatibility,
                 dispersion_training_graph_rule,

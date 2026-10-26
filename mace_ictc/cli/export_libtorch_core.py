@@ -751,7 +751,7 @@ def _export_single_core(
 
     model_eager = obj.wrapper.model
     metadata_model = model_eager
-    from mace_ictc.models.dispersion import (
+    from mace_ictc.utils.legacy_dispersion import (
         dispersion_deployment_graph_rule,
         dispersion_mode_uses_cutoff_edges,
         dispersion_train_deploy_graph_compatibility,

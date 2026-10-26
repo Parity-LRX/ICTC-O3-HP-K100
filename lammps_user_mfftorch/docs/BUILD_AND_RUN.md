@@ -328,8 +328,10 @@ The source also includes signature-dependent options:
 | `field`, `mfield` | A matching polar/axial vector external-field input |
 | `field6`, `field9` | A matching symmetric/full rank-two tensor input |
 | `fidelity` | A core accepting runtime fidelity IDs |
-| `dispersion` | A core and metadata requiring an explicit dispersion graph |
-| Long-range / MBD solvers | Matching source heads, boundary conditions and solver metadata |
+| Mesh/FFT electrostatics | Matching source heads, boundary conditions and solver metadata |
+
+Dispersion/MBD, tree FMM and the MBD-specific rRESPA split are excluded from
+this K100 distribution.
 
 These extensions and physical tensor outputs are outside the short-range
 energy/force validation described here. `compute mff/torch/phys` is not a

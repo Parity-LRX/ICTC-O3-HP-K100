@@ -53,7 +53,7 @@ def _long_range_deploy_metadata(
     use_explicit_dispersion_edges: bool,
 ) -> dict:
     """Metadata consumed by mff/torch for reciprocal and MBD deployment paths."""
-    from mace_ictc.models.dispersion import (
+    from mace_ictc.utils.legacy_dispersion import (
         dispersion_deployment_graph_rule,
         dispersion_train_deploy_graph_compatibility,
         dispersion_training_graph_rule,
@@ -880,28 +880,7 @@ def main() -> int:
     graph = _apply_species(make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device))
 
     def _with_dispersion_edges(g):
-        from mace_ictc.models.dispersion import dispersion_neighbor_list, dispersion_mode_uses_canonical_edges
-
-        disp_src, disp_dst, disp_shifts = dispersion_neighbor_list(
-            g[0],
-            g[2],
-            g[6],
-            float(getattr(_bare, "dispersion_cutoff", 0.0)),
-            pbc=bool(getattr(_bare, "dispersion_pbc", True)),
-            canonical_undirected=dispersion_mode_uses_canonical_edges(dispersion_mode),
-            method=str(getattr(_bare, "dispersion_neighbor_method", "auto")),
-            bruteforce_threshold=int(getattr(_bare, "dispersion_bruteforce_threshold", 1024)),
-            max_num_neighbors=getattr(_bare, "dispersion_max_num_neighbors", None),
-            allow_large_bruteforce_fallback=bool(
-                getattr(_bare, "dispersion_allow_large_bruteforce_fallback", False)
-            ),
-        )
-        if disp_src.numel() < 1:
-            raise RuntimeError(
-                "AOTI MBD/SLQ-MBD export example graph produced no dispersion edges; "
-                "increase --atoms or --degree, or use a larger checkpoint dispersion_cutoff."
-            )
-        return (g[0],) + tuple(g[1:]) + (disp_src, disp_dst, disp_shifts.to(dtype=g[5].dtype))
+        raise ValueError("Dispersion export is not supported by this K100 distribution")
 
     # Multipole long-range models emit a packed reciprocal_source as a 3rd graph output (E, force,
     # reciprocal_source); the C++ reciprocal solver does the sum at deploy time. Detect off the bare
@@ -916,7 +895,7 @@ def main() -> int:
     use_explicit_dispersion_edges = False
     dispersion_mode = str(getattr(_bare, "long_range_dispersion_mode", "none"))
     mbd_operator_backend = str(getattr(_bare, "mbd_operator_backend", "edge_sparse"))
-    from mace_ictc.models.dispersion import dispersion_mode_needs_deployment_edges
+    from mace_ictc.utils.legacy_dispersion import dispersion_mode_needs_deployment_edges
 
     if (
         getattr(_bare, "dispersion", None) is not None

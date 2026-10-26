@@ -230,7 +230,7 @@ does not add the real-space, self or background terms of a complete Ewald
 model. The learned moments are latent model outputs trained through the
 energy/force loss; they are not prescribed oxidation states or supervised
 physical charges. Neutralization is enabled and the k=0 mode is excluded.
-This is separate from the optional dispersion models, which remain off here.
+The long-range implementation supports learned monopole, dipole and quadrupole sources.
 
 `32³` is an example grid, not an accuracy setting for every cell. Choose
 and check grid resolution for the cell sizes in your dataset. Rectangular
@@ -661,3 +661,11 @@ qualification; successful energy/force evaluation does not validate them.
 For details, see the [HP API](HP_API.md), [electrostatics conventions](ELECTROSTATICS.md),
 [LAMMPS build guide](../lammps_user_mfftorch/docs/BUILD_AND_RUN.md), and
 [upstream Kokkos build options](https://docs.lammps.org/Build_extras.html#kokkos-package).
+
+## Dispersion and FMM
+
+This K100 distribution supports short-range MACE and learned mesh/FFT
+electrostatics. Dispersion (pairwise C6/MBD) and tree FMM implementations are
+excluded. Existing checkpoints with dispersion disabled retain their architecture
+metadata and load normally. Checkpoints requiring those removed contributions
+are rejected during reconstruction or deployment loading.

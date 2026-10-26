@@ -645,81 +645,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "head gentle when WARM-STARTING a trained backbone (--finetune) while staying trainable; "
                          "set 1.0 for the ungated from-scratch behavior. The gate is folded into the exported source, "
                          "so train and deploy stay consistent.")
-    ap.add_argument("--long-range-dispersion-mode", default="none", choices=["none", "pairwise-c6", "mbd", "mbd-slq"],
-                    help="Optional long-range dispersion term. pairwise-c6 is the existing learned C6/R0 model; "
-                         "mbd is a dense QHO many-body baseline; mbd-slq is the matrix-free stochastic-Lanczos "
-                         "cutoff approximation.")
-    ap.add_argument("--long-range-dispersion", dest="long_range_dispersion_mode",
-                    action="store_const", const="pairwise-c6",
-                    help="Deprecated alias for --long-range-dispersion-mode pairwise-c6.")
-    ap.add_argument("--dispersion-cutoff", type=float, default=8.0,
-                    help="Cutoff (A) for the long-range dispersion neighbor list. ~8 gives ~5%% MBD-energy "
-                         "convergence (energy decays ~1/r^6). Use 0 to reuse the input edge list.")
-    ap.add_argument("--dispersion-max-num-neighbors", type=int, default=0,
-                    help="Optional max neighbors per atom for torch_cluster dispersion radius search. "
-                         "0 estimates a conservative cap from density and cutoff.")
-    ap.add_argument("--dispersion-neighbor-method", default="auto", choices=["auto", "cell", "bruteforce"],
-                    help="Dispersion neighbor-list builder used during training when explicit dispersion edges "
-                         "are absent. auto uses dense only below --dispersion-bruteforce-threshold and otherwise "
-                         "uses torch_cluster; cell is an exact sorted Python cell-list path for nearest-image cases.")
-    ap.add_argument("--dispersion-bruteforce-threshold", type=int, default=1024,
-                    help="Largest per-graph atom count that auto may send to the dense O(N^2) dispersion builder.")
-    ap.add_argument("--dispersion-allow-large-bruteforce-fallback", action="store_true",
-                    help="Allow auto to fall back to the dense O(N^2) dispersion builder when torch_cluster is "
-                         "missing above the threshold. Default is to fail loudly.")
-    ap.add_argument("--dispersion-slq-num-probes", type=int, default=8,
-                    help="Number of deterministic Hutchinson probes for --long-range-dispersion-mode mbd-slq.")
-    ap.add_argument("--dispersion-slq-lanczos-steps", type=int, default=16,
-                    help="Lanczos steps per probe for --long-range-dispersion-mode mbd-slq.")
-    ap.add_argument("--mbd-operator-backend", default="edge_sparse", choices=["edge_sparse", "pme_fft"],
-                    help="SLQ-MBD matrix-vector backend. edge_sparse uses the explicit cutoff dispersion graph "
-                         "(direct, fast for small/medium systems); pme_fft is a reciprocal-only torch.fft matvec "
-                         "that bypasses the real-space graph. BOTH deploy: AOTI/LAMMPS export the (omega,alpha) "
-                         "head and the C++ MBD solver runs the matching operator (edge_sparse=direct, pme_fft="
-                         "use_fft). Match the backend across train and deploy for consistent forces.")
-    ap.add_argument("--mbd-pme-mesh-size", type=int, default=32,
-                    help="PME mesh size for --mbd-operator-backend pme_fft (finer = more accurate at larger boxes).")
-    ap.add_argument("--mbd-anisotropic", dest="mbd_anisotropic_polarizability", action="store_true",
-                    help="Anisotropic (l=2 tensor) MBD polarizability: the ICTC l=2 node block sets a per-atom 3x3 "
-                         "polarizability alpha^{1/2}=B (coupling W=omega*B) instead of a scalar. Emits an [N,8] "
-                         "(omega, alpha_iso, 6*B) deploy source the C++ MBD solver consumes. Default off (scalar [N,2]).")
-    ap.add_argument("--mbd-fixed-energy-scale", dest="mbd_learnable_energy_scale", action="store_false",
-                    help="Pin the MBD dispersion.term.energy_scale at a fixed 1.0 (registered as a buffer, not a "
-                         "trainable Parameter) instead of letting gradient descent freely learn it. Diagnostic: the "
-                         "learnable default let energy_scale settle at ~0.056 on carbon (heads starved even after "
-                         "the ramp) -- pinning forces the alpha/omega/l2 heads to adapt around a mandatory "
-                         "full-strength MBD term instead of being able to suppress it. Default learnable (unchanged).")
-    ap.add_argument("--dispersion-min-cutoff", type=float, default=0.0,
-                    help="Exclude dispersion edges shorter than this (default 0.0 = no exclusion, all edges "
-                         "0..dispersion-cutoff included -- opt in explicitly per run). For --long-range-"
-                         "dispersion-mode mbd-slq/mbd, the coupled-oscillator formula's PD-safety spectral "
-                         "clamp is a global per-graph budget that bonded/intralayer edges can dominate, "
-                         "starving genuinely long-range pairs (2026-07-01 carbon diagnosis) -- setting this "
-                         "to --max-radius removes that competition. Tried as an always-on default (2026-07-02) "
-                         "but the payoff was too thin/inconsistent to justify auto-applying (turned an "
-                         "exactly-flat carbon isolation-test signal into a non-flat but still accuracy-"
-                         "irrelevant one; didn't prevent MD22's mbd-slq arm from being net-negative), so it's "
-                         "opt-in. Not motivated at all for pairwise-c6 (a plain per-edge additive term with "
-                         "its own Becke-Johnson short-range damping, no shared-budget mechanism) -- only pass "
-                         "this there to deliberately mimic an mbd-slq isolation design for comparison.")
-    ap.add_argument("--mbd-alpha-floor", type=float, default=1.0e-4,
-                    help="Floor added to softplus(alpha_head(...)) for the MBD polarizability (default 1e-4, "
-                         "matches ManyBodyDispersionSLQ's own default). Root-cause fix (2026-07-01 carbon "
-                         "diagnosis): alpha collapsing near this floor shrinks the Tang-Toennies damping radius "
-                         "below real covalent bond lengths, so damp saturates to ~undamped even at bond length, "
-                         "a few short edges get huge raw coupling blocks, and the PD positive-definite safety "
-                         "clamp (pd_rescale/pd_margin) reacts by suppressing the ENTIRE coupling operator by "
-                         "~1e4x -- killing the genuine long-range/interlayer signal as collateral damage. Raising "
-                         "this (e.g. to 1.0, so the damping radius exceeds a C-C bond length once beta is applied) "
-                         "should let short bonds damp properly and keep the PD clamp from engaging so aggressively.")
-    ap.add_argument("--mbd-pme-assignment", default="pcs", choices=["ngp", "cic", "pcs"],
-                    help="Mesh assignment for experimental --mbd-operator-backend pme_fft.")
-    ap.add_argument("--mbd-pme-k-norm-floor", type=float, default=1.0e-6,
-                    help="Small-k floor for experimental MBD PME matvec.")
-    ap.add_argument("--mbd-pme-assignment-window-floor", type=float, default=1.0e-6,
-                    help="Assignment deconvolution floor for experimental MBD PME matvec.")
-    ap.add_argument("--mbd-pme-ewald-alpha-prefactor", type=float, default=5.0,
-                    help="Ewald alpha prefactor for experimental MBD PME matvec.")
+    # Disabled historical fields remain in checkpoint metadata.
+    ap.set_defaults(
+        dispersion_cutoff=8.0,
+        dispersion_max_num_neighbors=0,
+        dispersion_neighbor_method='auto',
+        dispersion_bruteforce_threshold=1024,
+        dispersion_allow_large_bruteforce_fallback=False,
+        dispersion_slq_num_probes=8,
+        dispersion_slq_lanczos_steps=16,
+        mbd_operator_backend='edge_sparse',
+        mbd_pme_mesh_size=32,
+        mbd_anisotropic_polarizability=False,
+        mbd_learnable_energy_scale=True,
+        dispersion_min_cutoff=0.0,
+        mbd_alpha_floor=0.0001,
+        mbd_pme_assignment='pcs',
+        mbd_pme_k_norm_floor=1e-06,
+        mbd_pme_assignment_window_floor=1e-06,
+        mbd_pme_ewald_alpha_prefactor=5.0,
+    )
+    ap.add_argument("--long-range-dispersion-mode", default="none", choices=["none"],
+                    help="Historical checkpoint compatibility; only disabled dispersion is supported.")
     # atomic-energy E0 offset
     ap.add_argument("--atomic-energy-keys", default=None, help='e.g. "1,6,7,8"')
     ap.add_argument("--atomic-energy-values", default=None, help='e.g. "-430.5,-821.0,-1488.2,-2044.4"')
@@ -844,12 +791,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Warm-start: non-strict load of --resume-checkpoint (load matching backbone weights, "
                          "leave any NEWLY-ADDED long-range head freshly initialized). Fresh optimizer (do not "
                          "combine with --resume-training-state). Train the backbone first, then add native "
-                         "long-range physics on top: MBD dispersion (--long-range-dispersion-mode), reciprocal "
+                         "long-range physics on top: reciprocal "
                          "electrostatics (--long-range-mode reciprocal-spectral-v1), or multipole electrostatics "
                          "(add --long-range-reciprocal-backend mesh_fft --long-range-max-multipole-l {1,2} "
                          "--long-range-mesh-fft-full-ewald). Each head starts gentle (the electrostatics "
-                         "energy_scale and the multipole gate init near zero; MBD has built-in spectral guards), "
-                         "so the warm-started backbone is not destabilized. See USER_MANUAL section 12.6.")
+                         "energy_scale and the multipole gate init near zero), "
+                         "so the warm-started backbone is not destabilized. See docs/USAGE.md.")
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--log-interval", type=int, default=10)
     ap.add_argument("--evals-per-epoch", type=int, default=1,
@@ -988,12 +935,10 @@ def main(argv=None):
         mb = str(args.makefx_buckets).strip()
         makefx_buckets = [int(x) for x in mb.split(",") if x.strip()] if "," in mb else int(mb)
     node_padding_enabled = bool(args.pad_nodes_to_max or makefx_buckets is not None)
-    nonlocal_physics_enabled = (
-        args.long_range_mode != "none" or args.long_range_dispersion_mode != "none"
-    )
+    nonlocal_physics_enabled = args.long_range_mode != "none"
     if node_padding_enabled and nonlocal_physics_enabled:
         raise ValueError(
-            "node padding/makefx bucketing is not currently safe with long-range or dispersion "
+            "node padding/makefx bucketing is not currently safe with long-range "
             "physics: dummy atoms can enter nonlocal interactions. Disable node padding/bucketing "
             "or disable the nonlocal term."
         )
@@ -1065,41 +1010,6 @@ def main(argv=None):
                 raise ValueError("--long-range-max-multipole-l > 0 requires --long-range-reciprocal-backend mesh_fft")
             if not args.long_range_mesh_fft_full_ewald:
                 raise ValueError("--long-range-max-multipole-l > 0 requires --long-range-mesh-fft-full-ewald")
-    if args.long_range_dispersion_mode != "none" and args.dispersion_cutoff < 0:
-        raise ValueError("--dispersion-cutoff must be >= 0")
-    # Dispersion self-builds its own neighbor list at runtime (NOT baked in the H5, so it is outside
-    # the rcut/H5 guard). But its cutoff should extend BEYOND the short-range graph -- a dispersion
-    # range shorter than --max-radius is almost always a misconfiguration.
-    if args.long_range_dispersion_mode != "none" and 0 <= args.dispersion_cutoff < args.max_radius:
-        logging.warning(
-            "--dispersion-cutoff (%.2f A) < --max-radius (%.2f A): the dispersion neighbor list is "
-            "SHORTER than the short-range message-passing graph. Dispersion is meant to add the "
-            "long-range tail BEYOND the local cutoff; a shorter range is almost certainly wrong.",
-            args.dispersion_cutoff, args.max_radius,
-        )
-    if int(args.dispersion_max_num_neighbors) < 0:
-        raise ValueError("--dispersion-max-num-neighbors must be >= 0")
-    if int(args.dispersion_bruteforce_threshold) < 0:
-        raise ValueError("--dispersion-bruteforce-threshold must be >= 0")
-    if args.long_range_dispersion_mode == "mbd-slq":
-        if int(args.dispersion_slq_num_probes) <= 0:
-            raise ValueError("--dispersion-slq-num-probes must be > 0")
-        if int(args.dispersion_slq_lanczos_steps) <= 0:
-            raise ValueError("--dispersion-slq-lanczos-steps must be > 0")
-        if args.mbd_operator_backend == "pme_fft":
-            if int(args.mbd_pme_mesh_size) <= 0:
-                raise ValueError("--mbd-pme-mesh-size must be > 0")
-            if float(args.mbd_pme_k_norm_floor) <= 0.0:
-                raise ValueError("--mbd-pme-k-norm-floor must be > 0")
-            if float(args.mbd_pme_assignment_window_floor) <= 0.0:
-                raise ValueError("--mbd-pme-assignment-window-floor must be > 0")
-            if float(args.mbd_pme_ewald_alpha_prefactor) <= 0.0:
-                raise ValueError("--mbd-pme-ewald-alpha-prefactor must be > 0")
-            logging.warning(
-                "--mbd-operator-backend pme_fft is an experimental reciprocal-only torch.fft "
-                "backend. AOTI/LAMMPS export runs the matching C++ reciprocal PME operator; "
-                "keep mbd_operator_backend, mesh size, assignment, and alpha prefactor matched."
-            )
     energy_output_scale_enabled = args.scaling != "no_scaling" or args.atomic_inter_scale is not None
     energy_output_shift_enabled = (
         (args.scaling != "no_scaling" and not args.no_atomic_inter_shift)
