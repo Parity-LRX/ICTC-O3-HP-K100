@@ -29,3 +29,20 @@ model = potential.model
 
 `operator_plan="checkpoint"` preserves the checkpoint route. Configure the HP
 training or inference plan explicitly when changing the intended execution mode.
+
+## Independent operator implementation
+
+`ictc_o3` owns the operator implementation and never imports `mace_ictc`.
+
+- `basis/` owns Cartesian bases, coupling tensors, frozen angular assets, block
+  layouts and fixed representation bridges.
+- `ops/` owns tensor products, graph messages, symmetric contractions, channel
+  linears and activations.
+- `autograd/` owns derivative requirements and rematerialization schedules.
+- `backends/k100/` owns HIP/Triton implementations, JIT loading and native sources.
+- `electrostatics/` owns reciprocal functionals, mesh assignment and derivatives.
+
+MACE source heads and model-specific long-range assembly remain in `mace_ictc`.
+Historical `mace_ictc.models` operator modules resolve to the canonical modules
+so released imports and serialized model paths continue to work. There is one
+implementation of each operator. Custom-op registration names remain stable.

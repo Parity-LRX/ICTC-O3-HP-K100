@@ -51,8 +51,8 @@ from typing import Dict, List, Tuple
 import torch
 from e3nn import o3
 
-from mace_ictc.models.ictd_irreps import direction_harmonics_all
-from mace_ictc.mace_basis import orthogonal_Q_blocks
+from ictc_o3.basis.ictd_irreps import direction_harmonics_all
+from ictc_o3.basis.mace import orthogonal_Q_blocks
 
 
 def _compute_normalize2mom_silu_k() -> float:

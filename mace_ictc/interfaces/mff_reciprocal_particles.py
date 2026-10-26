@@ -57,15 +57,17 @@ class _Particles:
 
 
 def _pack(source, dipole, quadrupole):
-    from mace_ictc.models.hip_reciprocal_fft import pack_moments
+    from ictc_o3.backends.k100.hip_reciprocal_fft import pack_moments
     return pack_moments(source,dipole,quadrupole,compact_quadrupole=True)
 
 
 def energy(kernel, pos, batch, cell, source, dipole, quadrupole,
            *, size, rank, counts, reduce_energy):
-    from mace_ictc.models.long_range import _prepare_frac_for_boundary_batched
-    from mace_ictc.models.hip_electrostatics import spread, gather
-    from mace_ictc.models.hip_reciprocal_fft import geometry, multipole_spectral_energy
+    from ictc_o3.electrostatics.functional import _prepare_frac_for_boundary_batched
+    from ictc_o3.backends.k100.hip_electrostatics import spread
+    from ictc_o3.backends.k100.hip_electrostatics import gather
+    from ictc_o3.backends.k100.hip_reciprocal_fft import geometry
+    from ictc_o3.backends.k100.hip_reciprocal_fft import multipole_spectral_energy
     from .mff_reciprocal_slabs import transform_local, inverse_local
     if cell.shape[0] != 1:
         raise ValueError('Native particle routing requires one periodic cell')

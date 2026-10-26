@@ -136,8 +136,8 @@ def inverse_local(spectrum, *, mesh_shape, size, rank):
 
 def multipole_energy(kernel, pos, batch, cell, source, dipole, quadrupole,
                      *, size, rank, counts, reduce_energy):
-    from mace_ictc.models.long_range import _prepare_frac_for_boundary_batched
-    from mace_ictc.models.hip_reciprocal_fft import multipole_spectral_energy
+    from ictc_o3.electrostatics.functional import _prepare_frac_for_boundary_batched
+    from ictc_o3.backends.k100.hip_reciprocal_fft import multipole_spectral_energy
     frac = _prepare_frac_for_boundary_batched(pos, batch, cell,
         boundary=kernel.boundary, slab_padding_factor=kernel.slab_padding_factor)
     n, channels = source.shape

@@ -26,7 +26,8 @@ class _Sum(torch.autograd.Function):
 
 class NativeReciprocal:
     def __init__(self, module):
-        from mace_ictc.models.long_range import LatentReciprocalLongRange, MeshLongRangeKernel3D
+        from mace_ictc.models.long_range import LatentReciprocalLongRange
+        from ictc_o3.electrostatics.functional import MeshLongRangeKernel3D
         if not isinstance(module, LatentReciprocalLongRange) or not isinstance(module.kernel, MeshLongRangeKernel3D):
             raise ValueError('Native MFF electrostatics requires reciprocal-spectral-v1 with mesh_fft')
         if module.kernel.full_ewald and not module.kernel.reciprocal_only:
@@ -48,8 +49,9 @@ class NativeReciprocal:
             fft_fallback='single rank, small work in auto, or my < ranks uses replicated transforms')
 
     def __call__(self, pos, batch, cell, q, dipole, quadrupole, *, owned, size):
-        from mace_ictc.models.long_range import _prepare_frac_for_boundary_batched
-        from mace_ictc.models.hip_reciprocal_fft import scalar_potential, multipole_energy
+        from ictc_o3.electrostatics.functional import _prepare_frac_for_boundary_batched
+        from ictc_o3.backends.k100.hip_reciprocal_fft import scalar_potential
+        from ictc_o3.backends.k100.hip_reciprocal_fft import multipole_energy
         if cell.shape != (1, 3, 3) or q.shape[0] != owned:
             raise ValueError('Native MFF reciprocal evaluation requires one cell and owned sources')
         kernel = self.module.kernel

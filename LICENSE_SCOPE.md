@@ -12,7 +12,7 @@ Original third-party copyright notices and license terms are retained:
 
 - Earlier MACE-ICTC code: [MIT](LICENSES/MACE-ICTC-MIT.txt).
 - MACE-derived Clebsch-Gordan and symmetric-contraction code, including
-  `mace_ictc/models/_mace_cg.py` and `_mace_symmetric_contraction.py`:
+  `ictc_o3/basis/_mace_cg.py` and `ictc_o3/ops/_mace_symmetric_contraction.py`:
   [MIT](LICENSES/MACE-MIT.txt), with the original author notices retained.
 - e3nn: [MIT](LICENSES/e3nn-MIT.txt).
 

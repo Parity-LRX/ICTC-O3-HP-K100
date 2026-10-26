@@ -37,7 +37,7 @@ _repo_root = os.path.dirname(os.path.dirname(_script_dir))
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from mace_ictc.utils.mesh import normalize_mesh_size
+from ictc_o3.electrostatics.mesh import normalize_mesh_size
 
 from mace_ictc.training.makefx_compile import trace_and_compile_force
 

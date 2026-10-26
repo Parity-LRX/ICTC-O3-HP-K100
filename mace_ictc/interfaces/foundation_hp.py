@@ -19,9 +19,9 @@ from mace_ictc.interfaces.mace_converter import (
     _e3nn_linear_effective_matrices, _mace_conv_tp_paths,
     _reorder_linear_input_paths,
 )
-from mace_ictc.mace_basis import orthogonal_Q_blocks
-from mace_ictc.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
-from mace_ictc.models.pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3
+from ictc_o3.basis.mace import orthogonal_Q_blocks
+from ictc_o3.basis.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
 
 
 _LOAD_LOCK = RLock()
@@ -194,7 +194,7 @@ class FoundationConvolution(nn.Module):
         self.message_calls = 0
 
     def configure(self, *, chunk_edges=262144, backward_edges=32768, radial_chunk=32768):
-        from mace_ictc.models.fp32_policy import strict_fp32
+        from ictc_o3.backends.k100.fp32_policy import strict_fp32
         strict_fp32()
         if any(p.requires_grad for p in self.parameters()):
             raise ValueError("Foundation streamed inference requires explicitly frozen weights")
@@ -228,7 +228,7 @@ class FoundationConvolution(nn.Module):
             for l, value in _blocks(projected, self.input_degrees).items()}
         if self.generated:
             hidden, edge_density = _NarrowRadial.apply(radial, cutoff, species, src, dst, self)
-            from mace_ictc.models.streamed_gate_message import streamed_gate_message
+            from ictc_o3.ops.streamed_gate_message import streamed_gate_message
             outputs = streamed_gate_message(self.tp, blocks,
                 {l: value.unsqueeze(-2) for l, value in enumerate(harmonics)},
                 hidden, self.projection, src, dst, None, output_nodes=owned)
@@ -293,8 +293,8 @@ class FoundationProduct(nn.Module):
             # layer produces that basis, so eliminate Q.T -> Q and Q.T -> Q
             # round trips and their graph-sized packing buffers altogether.
             # The same actual-U reconstruction gate and learned weights remain.
-            from mace_ictc.models.factorized_contraction import _plan
-            from mace_ictc.models.species_circuit import species_circuit
+            from ictc_o3.ops.factorized_contraction import _plan
+            from ictc_o3.ops.species_circuit import species_circuit
             plan = _plan(self.sc, features)
             if plan is None:
                 raise ValueError("SC constants do not reconstruct within the HP precision budget")
@@ -396,7 +396,7 @@ class FoundationHP(nn.Module):
         owned = total if owned is None else owned
         attrs = F.one_hot(species, len(self.native.atomic_numbers)).to(vectors)
         lengths = vectors.norm(dim=-1, keepdim=True)
-        from mace_ictc.hp import direction_harmonics
+        from ictc_o3 import direction_harmonics
         harmonics = direction_harmonics(vectors / lengths.clamp_min(1e-12), self.edge_lmax,
             policy="generated" if self.generated else "reference")
         radial, cutoff = self.native.radial_embedding(lengths, attrs,

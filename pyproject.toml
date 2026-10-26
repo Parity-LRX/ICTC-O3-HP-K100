@@ -40,4 +40,4 @@ include = ["ictc_o3", "ictc_o3.*", "mace_ictc", "mace_ictc.*"]
 exclude = ["mace_ictc.bench", "mace_ictc.bench.*", "mace_ictc.test", "mace_ictc.test.*"]
 
 [tool.setuptools.package-data]
-mace_ictc = ["models/_ictd_basis/v1/*.pt", "csrc/*.cpp", "csrc/*.cu"]
+ictc_o3 = ["basis/_ictd_basis/v1/*.pt", "backends/k100/csrc/*.cpp", "backends/k100/csrc/*.cu"]

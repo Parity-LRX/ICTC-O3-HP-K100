@@ -10,27 +10,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import o3
 
-from mace_ictc.utils.mesh import normalize_mesh_size
-from mace_ictc.models.ictd_irreps import (
-    EdgeWeightedPathPreservingTensorProduct,
-    EquivariantChannelLinearSO3,
-    EquivariantChannelLinearSO3Rect,
-    HarmonicElementwiseProduct,
-    HarmonicPathWeightedTensorProduct,
-    direction_harmonics_all,
-    ictd_u_matrix_so3,
-)
+from ictc_o3.electrostatics.mesh import normalize_mesh_size
+from ictc_o3.basis.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+from ictc_o3.basis.ictd_irreps import EquivariantChannelLinearSO3
+from ictc_o3.basis.ictd_irreps import EquivariantChannelLinearSO3Rect
+from ictc_o3.basis.ictd_irreps import HarmonicElementwiseProduct
+from ictc_o3.basis.ictd_irreps import HarmonicPathWeightedTensorProduct
+from ictc_o3.basis.ictd_irreps import direction_harmonics_all
+from ictc_o3.basis.ictd_irreps import ictd_u_matrix_so3
 from mace_ictc.models.radial_basis import mace_radial_embedding, mace_polynomial_cutoff
-from mace_ictc.models.pure_cartesian_ictd_layers import (
-    EquivariantScalarReadoutSO3,
-    SO3BlockRMSNorm,
-    _irreps_total_dim,
-    _merge_irreps,
-    _split_irreps,
-    apply_channel_adapter_per_l,
-    resolve_save_multiple_mix_channels,
-)
-from mace_ictc.models._mace_symmetric_contraction import MaceSymmetricContraction
+from mace_ictc.models.pure_cartesian_ictd_layers import EquivariantScalarReadoutSO3
+from mace_ictc.models.pure_cartesian_ictd_layers import SO3BlockRMSNorm
+from mace_ictc.models.pure_cartesian_ictd_layers import _irreps_total_dim
+from ictc_o3.basis.layout import _merge_irreps
+from ictc_o3.basis.layout import _split_irreps
+from mace_ictc.models.pure_cartesian_ictd_layers import apply_channel_adapter_per_l
+from mace_ictc.models.pure_cartesian_ictd_layers import resolve_save_multiple_mix_channels
+from ictc_o3.ops._mace_symmetric_contraction import MaceSymmetricContraction
 from mace_ictc.models.mlp import MainNet
 from mace_ictc.utils.scatter import scatter
 from mace_ictc.models.long_range import build_long_range_module
@@ -187,8 +183,7 @@ def _init_element_conditioned_mace_style_(module: nn.Module | None) -> None:
                 value.zero_()
 
 
-def _hidden_irreps(channels: int, lmax: int) -> o3.Irreps:
-    return o3.Irreps(" + ".join(f"{int(channels)}x{l}{'e' if l % 2 == 0 else 'o'}" for l in range(int(lmax) + 1)))
+from ictc_o3.basis.bridge import _hidden_irreps
 
 
 def _mace_like_conv_tp_path_scales(
@@ -210,7 +205,7 @@ def _mace_like_conv_tp_path_scales(
     TensorProduct directly so from-scratch ICTC training can start in the same
     effective path scale.
     """
-    from mace_ictc.mace_basis import orthogonal_Q_blocks
+    from ictc_o3.basis.mace import orthogonal_Q_blocks
 
     param_dtype = tp.weight.dtype
     calib_dtype = torch.float64
@@ -310,13 +305,10 @@ def _mace_like_conv_tp_path_scales(
     return scales
 
 
-def _so3_flat_to_mace_features(x: torch.Tensor, channels: int, lmax: int) -> torch.Tensor:
-    blocks = _split_irreps(x, int(channels), int(lmax))
-    return torch.cat([blocks[l] for l in range(int(lmax) + 1)], dim=-1)
+from ictc_o3.basis.bridge import _so3_flat_to_mace_features
 
 
-def _merge_blocks_subset(blocks: Dict[int, torch.Tensor], channels: int, lmax: int) -> torch.Tensor:
-    return torch.cat([blocks[l].reshape(blocks[l].shape[0], int(channels) * (2 * l + 1)) for l in range(int(lmax) + 1)], dim=-1)
+from ictc_o3.basis.bridge import _merge_blocks_subset
 
 
 def _concat_so3_states_by_l(states: List[torch.Tensor], channels: int, lmax: int) -> torch.Tensor:
@@ -437,7 +429,8 @@ class ElementConditionedLinearSO3(nn.Module):
         out_blocks: Dict[int, torch.Tensor] = {}
         groups = None
         if getattr(self, "_grouped_species_gemm", False):
-            from .species_linear import species_groups, grouped_species_linear
+            from ictc_o3.ops.species_linear import species_groups
+            from ictc_o3.ops.species_linear import grouped_species_linear
             groups = species_groups(idx, self.num_elements)
         for l in range(self.lmax + 1):
             weight = self.weights[str(l)].to(dtype=x.dtype, device=x.device)
@@ -446,7 +439,8 @@ class ElementConditionedLinearSO3(nn.Module):
                 out_blocks[l] = grouped_species_linear(blocks[l], weight, idx, bias, groups=groups)
                 continue
             if getattr(self,"_shared_species_gemm",False):
-                from .species_linear import shared_species_linear,supported
+                from ictc_o3.ops.species_linear import shared_species_linear
+                from ictc_o3.ops.species_linear import supported
                 if supported(blocks[l],weight):
                     bias=None if self.bias is None else self.bias[str(l)].to(dtype=x.dtype,device=x.device)
                     out_blocks[l]=shared_species_linear(blocks[l],weight,idx,bias)
@@ -683,7 +677,7 @@ class _Normalize2MomSiLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if getattr(self,"_fuse_activation",False):
-            from .fused_activation import normalized_silu
+            from ictc_o3.ops.fused_activation import normalized_silu
             return normalized_silu(x,self._scale)
         return F.silu(x) * self._scale
 
@@ -1174,72 +1168,7 @@ class ICTDScalarProductBasisBlock(nn.Module):
         return self.output_norm(out)
 
 
-class SO3ToE3NNBasisBridge(nn.Module):
-    """
-    Fixed per-l orthogonal bridge between the ICTC SO3 basis and e3nn/MACE basis.
-
-    `direction_harmonics_all` now matches e3nn component normalization in RMS, but
-    each l block can still differ by an orthogonal basis convention. Native MACE
-    contraction assumes the e3nn convention, while ICTC interaction emits ICTC
-    convention features. The bridge uses a deterministic least-squares/SVD fit
-    from sampled directions to construct Q_l such that:
-
-        Y_ictd_l @ Q_l ~= Y_e3nn_l
-    """
-
-    def __init__(self, channels: int, lmax: int, num_samples: int = 8192):
-        super().__init__()
-        self.channels = int(channels)
-        self.lmax = int(lmax)
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(20260426)
-        dirs = torch.randn(int(num_samples), 3, generator=generator, dtype=torch.float64)
-        dirs = dirs / dirs.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        y_ictd = direction_harmonics_all(dirs, self.lmax)
-        y_e3nn = o3.spherical_harmonics(
-            o3.Irreps.spherical_harmonics(self.lmax),
-            dirs,
-            normalize=True,
-            normalization="component",
-        )
-        offset = 0
-        for l in range(self.lmax + 1):
-            width = 2 * l + 1
-            a = y_ictd[l].to(dtype=torch.float64)
-            b = y_e3nn[:, offset : offset + width].to(dtype=torch.float64)
-            offset += width
-            u, _, vh = torch.linalg.svd(a.T @ b)
-            q = (u @ vh).to(dtype=torch.get_default_dtype())
-            self.register_buffer(f"q_{l}", q, persistent=True)
-
-    def _q(self, l: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        return getattr(self, f"q_{int(l)}").to(dtype=dtype, device=device)
-
-    def ictd_flat_to_e3nn_blocks(self, x: torch.Tensor, lmax: int) -> Dict[int, torch.Tensor]:
-        blocks = _split_irreps(x, self.channels, int(lmax))
-        out: Dict[int, torch.Tensor] = {}
-        for l, block in blocks.items():
-            out[l] = torch.einsum("ncm,mp->ncp", block, self._q(l, dtype=x.dtype, device=x.device))
-        return out
-
-    def e3nn_flat_to_ictd_blocks(self, x: torch.Tensor, lmax: int) -> Dict[int, torch.Tensor]:
-        blocks = _split_irreps(x, self.channels, int(lmax))
-        out: Dict[int, torch.Tensor] = {}
-        for l, block in blocks.items():
-            out[l] = torch.einsum("ncm,pm->ncp", block, self._q(l, dtype=x.dtype, device=x.device))
-        return out
-
-    def ictd_flat_to_e3nn_features(self, x: torch.Tensor, lmax: int) -> torch.Tensor:
-        blocks = self.ictd_flat_to_e3nn_blocks(x, int(lmax))
-        return torch.cat([blocks[l] for l in range(int(lmax) + 1)], dim=-1)
-
-    def ictd_flat_to_e3nn_flat(self, x: torch.Tensor, lmax: int) -> torch.Tensor:
-        blocks = self.ictd_flat_to_e3nn_blocks(x, int(lmax))
-        return _merge_blocks_subset(blocks, self.channels, int(lmax))
-
-    def e3nn_flat_to_ictd_flat(self, x: torch.Tensor, lmax: int) -> torch.Tensor:
-        blocks = self.e3nn_flat_to_ictd_blocks(x, int(lmax))
-        return _merge_blocks_subset(blocks, self.channels, int(lmax))
+from ictc_o3.basis.bridge import SO3ToE3NNBasisBridge
 
 
 class NativeMACEProductBasisBlockSO3(nn.Module):
@@ -1299,7 +1228,7 @@ def _cueq_o3_e3nn_group():
         from mace.tools.cg import O3_e3nn
     except Exception:
         try:
-            from mace_ictc.models._mace_cg import O3_e3nn
+            from ictc_o3.basis._mace_cg import O3_e3nn
         except Exception as exc:  # pragma: no cover - optional accelerator dependency
             raise RuntimeError(
                 "ictd_fix_product_backend='cueq' requires the e3nn-compatible "
@@ -1608,130 +1537,7 @@ class CueqMACEProductBasisBlockSO3(nn.Module):
         return out
 
 
-class ICTDBridgeUSymmetricContractionSO3(nn.Module):
-    """
-    Bridge-U symmetric contraction expressed directly in the ICTC basis.
-
-    This is algebraically equivalent to:
-      ICTC features -> e3nn basis -> MACE SymmetricContraction -> ICTC basis
-    but the per-l basis change is folded into the stored U tensors once at
-    initialization. The forward path therefore consumes and returns ICTC-basis
-    flat SO3 features. This backend is the stable high-l bridge used when
-    pure ICTC U generation is not numerically reliable.
-    """
-
-    def __init__(
-        self,
-        *,
-        num_elements: int,
-        channels: int,
-        lmax: int,
-        target_lmax: int,
-        correlation: int = 3,
-        use_reduced_cg: bool = False,
-    ):
-        super().__init__()
-        self.channels = int(channels)
-        self.lmax = int(lmax)
-        self.target_lmax = int(target_lmax)
-        self.use_reduced_cg = bool(use_reduced_cg)
-        self.hidden_irreps = _hidden_irreps(self.channels, self.lmax)
-        self.target_irreps = _hidden_irreps(self.channels, self.target_lmax)
-        self.basis_bridge = SO3ToE3NNBasisBridge(self.channels, max(self.lmax, self.target_lmax))
-        self.symmetric_contractions = MaceSymmetricContraction(
-            irreps_in=self.hidden_irreps,
-            irreps_out=self.target_irreps,
-            correlation=int(correlation),
-            num_elements=int(num_elements),
-            use_reduced_cg=self.use_reduced_cg,
-        )
-        self._fold_basis_change_into_u_tensors()
-
-    def _input_q(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        blocks = [self.basis_bridge._q(l, dtype=dtype, device=device) for l in range(self.lmax + 1)]
-        return torch.block_diag(*blocks)
-
-    def _transform_u_tensor(self, u_tensor: torch.Tensor, output_l: int) -> torch.Tensor:
-        dtype = u_tensor.dtype
-        device = u_tensor.device
-        q_in = self._input_q(dtype=dtype, device=device)
-        nu = int(u_tensor.dim() - 1) if int(output_l) == 0 else int(u_tensor.dim() - 2)
-        if int(output_l) == 0:
-            if nu == 1:
-                return torch.einsum("ai,ip->ap", q_in, u_tensor)
-            if nu == 2:
-                return torch.einsum("ai,bj,ijp->abp", q_in, q_in, u_tensor)
-            if nu == 3:
-                return torch.einsum("ai,bj,ck,ijkp->abcp", q_in, q_in, q_in, u_tensor)
-        q_out = self.basis_bridge._q(output_l, dtype=dtype, device=device)
-        if nu == 1:
-            return torch.einsum("ro,ai,oip->rap", q_out, q_in, u_tensor)
-        if nu == 2:
-            return torch.einsum("ro,ai,bj,oijp->rabp", q_out, q_in, q_in, u_tensor)
-        if nu == 3:
-            return torch.einsum("ro,ai,bj,ck,oijkp->rabcp", q_out, q_in, q_in, q_in, u_tensor)
-        # Preserve the established small-order expressions. Higher orders use
-        # the same fixed basis map on each tensor leg, without a cubic cap or
-        # an einsum alphabet limit. This only lowers immutable U coefficients.
-        if int(output_l)==0:
-            result=u_tensor
-            first_axis=0
-        else:
-            result=torch.tensordot(q_out,u_tensor,dims=([1],[0]))
-            first_axis=1
-        for axis in range(first_axis,first_axis+nu):
-            result=torch.tensordot(q_in,result,dims=([1],[axis])).movedim(0,axis)
-        return result
-
-    def _fold_basis_change_into_u_tensors(self) -> None:
-        with torch.no_grad():
-            for (mul, ir), contraction in zip(self.target_irreps, self.symmetric_contractions.contractions):
-                del mul
-                output_l = int(ir.l)
-                for nu in range(1, int(contraction.correlation) + 1):
-                    name = f"U_matrix_{nu}"
-                    old = getattr(contraction, name)
-                    new = self._transform_u_tensor(old, output_l)
-                    old.copy_(new.to(dtype=old.dtype, device=old.device))
-                if getattr(contraction, "_use_scalar_corr3_fast", False) and hasattr(
-                    contraction, "refresh_scalar_corr3_fast_buffers"
-                ):
-                    contraction.refresh_scalar_corr3_fast_buffers()
-
-    def forward(
-        self,
-        node_feats: torch.Tensor,
-        node_attrs: torch.Tensor,
-        node_type_idx: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = _so3_flat_to_mace_features(node_feats, self.channels, self.lmax)
-        deployment=getattr(self,"_deployment_contraction",None)
-        if deployment is not None:
-            if node_type_idx is None:node_type_idx=node_attrs.argmax(-1)
-            return deployment(x,node_type_idx)
-        if node_type_idx is None:
-            from .reference_u_residency import prepare_reference_u
-            prepare_reference_u(self,x)
-            return self.symmetric_contractions(x, node_attrs)
-        if getattr(self, "_factorized_contraction", False):
-            from .factorized_contraction import factorized_contractions
-            factorized = factorized_contractions(self, x, node_type_idx)
-            if factorized is not None:
-                return factorized
-        if getattr(self, "_compact_contraction", False):
-            from .compact_contraction import compact_contractions
-            compact = compact_contractions(self.symmetric_contractions.contractions, x, node_type_idx)
-            if compact is not None:
-                return compact
-        from .reference_u_residency import prepare_reference_u
-        prepare_reference_u(self,x)
-        return torch.cat(
-            [
-                contraction(x, node_attrs, node_type_idx=node_type_idx)
-                for contraction in self.symmetric_contractions.contractions
-            ],
-            dim=-1,
-        )
+from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
 
 
 class ICTDBridgeUProductBasisBlockSO3(nn.Module):
@@ -2101,7 +1907,7 @@ class CueqConvTensorProductSO3(nn.Module):
                 "cuequivariance_torch to be installed"
             ) from exc
 
-        from mace_ictc.mace_basis import orthogonal_Q_blocks
+        from ictc_o3.basis.mace import orthogonal_Q_blocks
 
         self.channels = int(tp.channels)
         self.lmax = int(tp.lmax)  # edge (in2) lmax
@@ -2762,7 +2568,7 @@ class ICTDResidualInteractionBlock(nn.Module):
             fused_message_blocks=deployment_message(x1,edge_attrs,self.fc(edge_feats),edge_src,edge_dst,edge_mask)
         if (getattr(self,"_streamed_gates",False) and getattr(self,"_edge_fusion","reference")=="triton_remat"
                 and self.tp_cueq is None and self.interaction_attn_heads==0 and edge_block_callback is None and fused_message_blocks is None):
-            from .streamed_gate_message import streamed_gate_message
+            from ictc_o3.ops.streamed_gate_message import streamed_gate_message
             if receiver_rows is not None and compact_message_output:
                 receiver_map = torch.full((num_nodes,), -1, dtype=torch.long, device=edge_dst.device)
                 receiver_map[receiver_rows] = torch.arange(receiver_rows.numel(), device=edge_dst.device)
@@ -2772,7 +2578,7 @@ class ICTDResidualInteractionBlock(nn.Module):
             if fused_message_blocks is None:
                 fused_message_blocks=streamed_gate_message(self.tp,x1,edge_attrs,edge_feats,self.fc,edge_src,edge_dst,edge_mask)
         if fused_message_blocks is None:
-            from .radial_checkpoint import radial_apply
+            from ictc_o3.autograd.radial_checkpoint import radial_apply
             gates = radial_apply(self.fc,edge_feats,checkpoint=getattr(self.tp,'_radial_checkpoint',False),
                 gemm_policy=getattr(self.tp,'_training_gate_gemm_policy','torch'),
                 chunk_rows=getattr(self.tp,'_radial_chunk_rows',0))
@@ -2781,7 +2587,7 @@ class ICTDResidualInteractionBlock(nn.Module):
         if (getattr(self, "_edge_fusion", "reference") in ("triton", "cuda", "cuda_projection", "triton_projection", "triton_csr", "triton_remat")
                 and self.tp_cueq is None and self.interaction_attn_heads == 0
                 and edge_block_callback is None and fused_message_blocks is None):
-            from .fused_message import aggregate_message
+            from ictc_o3.ops.fused_message import aggregate_message
             fused_message_blocks = aggregate_message(self.tp,x1,edge_attrs,gates,edge_src,edge_dst,edge_mask,backend=self._edge_fusion)
         if fused_message_blocks is not None:
             edge_blocks = {}
@@ -3794,7 +3600,7 @@ class PureCartesianICTDFix(nn.Module):
         basis -> bit-identical output. Idempotent; runs once (lazily on first forward)."""
         if getattr(self, "_e3nn_folded", False):
             return
-        from mace_ictc.mace_basis import orthogonal_Q_blocks
+        from ictc_o3.basis.mace import orthogonal_Q_blocks
         ref = next(self.parameters())
         q_blocks_cpu = orthogonal_Q_blocks(
             max(self.lmax, self.ictd_fix_edge_lmax),
@@ -3830,7 +3636,7 @@ class PureCartesianICTDFix(nn.Module):
             raise ValueError("activate_e3nn_basis_from_folded_state_dict requires angular_basis='e3nn'")
         if getattr(self, "_e3nn_folded", False):
             return
-        from mace_ictc.mace_basis import orthogonal_Q_blocks
+        from ictc_o3.basis.mace import orthogonal_Q_blocks
         ref = next(self.parameters())
         q_blocks_cpu = orthogonal_Q_blocks(
             max(self.lmax, self.ictd_fix_edge_lmax),
@@ -3859,12 +3665,12 @@ class PureCartesianICTDFix(nn.Module):
         :mod:`mace_ictc.mace_basis`). Energy, forces and the virial are SO(3) invariants / physical
         tensors and are basis-independent, so this only matters for equivariant (l>=1) features.
         """
-        from mace_ictc.mace_basis import to_mace_basis as _to_mace
+        from ictc_o3.basis.mace import to_mace_basis as _to_mace
         return _to_mace(x, self.lmax)
 
     def to_ictd_basis(self, x: torch.Tensor) -> torch.Tensor:
         """Inverse of :meth:`to_mace_basis` (original-MACE/e3nn -> ICTC)."""
-        from mace_ictc.mace_basis import to_ictd_basis as _to_ictd
+        from ictc_o3.basis.mace import to_ictd_basis as _to_ictd
         return _to_ictd(x, self.lmax)
 
     def forward(
@@ -3964,7 +3770,7 @@ class PureCartesianICTDFix(nn.Module):
         deployment_harmonics=getattr(self,"_deployment_harmonics",None)
         if deployment_harmonics is not None:Y_list=deployment_harmonics(n.to(dtype=dtype))
         if Y_list is None and getattr(self,"_fused_direction_harmonics",False):
-            from .generated_direction_harmonics import generated_direction_harmonics
+            from ictc_o3.ops.generated_direction_harmonics import generated_direction_harmonics
             Y_list=generated_direction_harmonics(n.to(dtype=dtype),self.ictd_fix_edge_lmax)
         if Y_list is None:Y_list = direction_harmonics_all(n.to(dtype=dtype), self.ictd_fix_edge_lmax)
         if self.angular_basis == "e3nn":

@@ -5,9 +5,9 @@
 
 `ictc_o3/` and `mace_ictc/` are sibling packages in the repository. The former
 provides standalone operators; the latter provides MACE-compatible models,
-training and conversion interfaces. Both are installed with `ictc-o3-hp-k100`
-and share the existing HP kernels. Standalone operators can be used without
-constructing a MACE model.
+training and conversion interfaces. Both are installed with `ictc-o3-hp-k100`.
+Operator implementations and native resources are owned by `ictc_o3`.
+Standalone operators do not import `mace_ictc`, including during execution.
 
 This package targets Hygon K100 (`gfx926`) with the matching HIP/DTK PyTorch
 stack. The documented fast path is eager FP32 with native HIP kernels.

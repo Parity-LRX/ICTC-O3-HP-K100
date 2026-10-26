@@ -22,7 +22,7 @@ def _positive_integer(value, name):
 
 
 def _eager(sample):
-    from mace_ictc.models.fp32_policy import strict_fp32
+    from ictc_o3.backends.k100.fp32_policy import strict_fp32
     strict_fp32()
     from torch.fx.experimental.proxy_tensor import get_proxy_mode
     from torch._subclasses.fake_tensor import is_fake
@@ -33,7 +33,7 @@ def _eager(sample):
 
 
 def _tp_coverage(tp, input_lmax, edge_lmax):
-    from mace_ictc.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+    from ictc_o3.basis.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
     _degree(input_lmax, "input_lmax")
     _degree(edge_lmax, "edge_lmax")
     if not isinstance(tp, EdgeWeightedPathPreservingTensorProduct):
@@ -58,7 +58,8 @@ class _EdgeAdjoint(torch.autograd.Function):
     """Direct edge first/mixed adjoints, without graph-layout round trips."""
     @staticmethod
     def forward(ctx,x,sh,gates,weight,grad,owner,plan,projection,needed):
-        from mace_ictc.models.generated_cartesian_message import _extension,_launch
+        from ictc_o3.backends.k100.generated_cartesian_message import _extension
+        from ictc_o3.backends.k100.generated_cartesian_message import _launch
         ctx.set_materialize_grads(False)
         ctx.owner,ctx.plan,ctx.projection,ctx.needed=owner,plan,projection,needed
         grad=grad.contiguous();ctx.save_for_backward(x,sh,gates,weight,grad)
@@ -70,21 +71,22 @@ class _EdgeAdjoint(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx,hx,hs,hg):
-        from mace_ictc.models.adjoint_requirements import required_gradients
+        from ictc_o3.autograd.adjoint_requirements import required_gradients
         x,sh,gates,weight,grad=ctx.saved_tensors
         owner,plan,projection=ctx.owner,ctx.plan,ctx.projection
         needs=required_gradients((x,sh,gates,grad),(*ctx.needs_input_grad[:3],ctx.needs_input_grad[4]))
         higher=torch.is_grad_enabled()
         if not higher:
-            from mace_ictc.models.generated_message_second import generated_second
+            from ictc_o3.backends.k100.generated_message_second import generated_second
             ids=owner._ids(x.shape[0])
             dx,ds,_,dg,dy=generated_second(x,sh,weight,gates,ids,ids,owner._mask,grad,
                 plan,projection,(hx,hs,None,hg),(needs[0],needs[1],False,needs[2]),needs[3])
             return dx,ds,dg,None,dy,None,None,None,None
         # Higher derivatives retain the exact native
         # polynomial. No live weight or cotangent is detached in this route.
-        from mace_ictc.models.rematerialized_message import _native
-        from mace_ictc.models.fused_message import _normal_feature_gradient,_channel_cotangent
+        from ictc_o3.ops.rematerialized_message import _native
+        from ictc_o3.ops.fused_message import _normal_feature_gradient
+        from ictc_o3.ops.fused_message import _channel_cotangent
         with torch.enable_grad():
             local=tuple(v.clone() for v in (x,sh,gates));cotangent=grad.clone()
             ids=owner._ids(x.shape[0])
@@ -104,13 +106,14 @@ class _EdgeAdjoint(torch.autograd.Function):
 class _Edge(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, sh, gates, weight, owner):
-        from mace_ictc.models.generated_cartesian_message import _extension, _launch
+        from ictc_o3.backends.k100.generated_cartesian_message import _extension
+        from ictc_o3.backends.k100.generated_cartesian_message import _launch
         plan, projection = owner._prepare()
         ctx.owner, ctx.plan, ctx.projection = owner, dict(plan), projection
         ctx.internal_layout = owner.execution == "legacy" and owner.layout == "mul_ir"
         ctx.save_for_backward(x, sh, gates, weight)
         if ctx.internal_layout:
-            from mace_ictc.models.fused_message import _channel_node
+            from ictc_o3.ops.fused_message import _channel_node
             x = _channel_node(x, plan)
         ids = owner._ids(x.shape[0])
         output = x.new_empty(x.shape[0], plan["odim"])
@@ -119,21 +122,23 @@ class _Edge(torch.autograd.Function):
             bool(plan.get("unit_weights",False)), *_launch(plan, x, x.shape[0]),
         )
         if ctx.internal_layout:
-            from mace_ictc.models.fused_message import _normal_message_output
+            from ictc_o3.ops.fused_message import _normal_message_output
             output = _normal_message_output(output, plan)
         return output
 
     @staticmethod
     def backward(ctx, grad):
-        from mace_ictc.models.adjoint_requirements import required_gradients
-        from mace_ictc.models.generated_cartesian_message import _extension, _launch
+        from ictc_o3.autograd.adjoint_requirements import required_gradients
+        from ictc_o3.backends.k100.generated_cartesian_message import _extension
+        from ictc_o3.backends.k100.generated_cartesian_message import _launch
         x, sh, gates, weight = ctx.saved_tensors
         owner, plan, projection = ctx.owner, ctx.plan, ctx.projection
         ids = owner._ids(x.shape[0])
         needed = required_gradients((x, sh, gates), ctx.needs_input_grad[:3])
         grad = grad.contiguous()
         if ctx.internal_layout:
-            from mace_ictc.models.fused_message import _channel_node, _channel_cotangent
+            from ictc_o3.ops.fused_message import _channel_node
+            from ictc_o3.ops.fused_message import _channel_cotangent
             x, grad = _channel_node(x, plan), _channel_cotangent(grad, plan)
         if torch.is_grad_enabled():
             dx,dh,dg=_EdgeAdjoint.apply(x,sh,gates,weight,grad,owner,plan,projection,needed)
@@ -148,7 +153,7 @@ class _Edge(torch.autograd.Function):
             dh = dh if needed[1] else None
             dg = dg if needed[2] else None
         if ctx.internal_layout and dx is not None:
-            from mace_ictc.models.fused_message import _normal_feature_gradient
+            from ictc_o3.ops.fused_message import _normal_feature_gradient
             dx = _normal_feature_gradient(dx, plan)
         return dx, dh, dg, None, None
 
@@ -197,7 +202,7 @@ class EdgeTensorProduct(torch.nn.Module):
         _degree(output_lmax, "output_lmax")
         if torch.device(device).type != "cuda":
             raise ValueError("Generated edge TP requires a CUDA device")
-        from mace_ictc.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+        from ictc_o3.basis.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
         paths = [(i, j, k) for i in range(input_lmax+1) for j in range(edge_lmax+1)
                  for k in range(output_lmax+1) if abs(i-j) <= k <= i+j and (i+j+k) % 2 == 0]
         tp = EdgeWeightedPathPreservingTensorProduct(
@@ -231,8 +236,8 @@ class EdgeTensorProduct(torch.nn.Module):
         _tp_coverage(self.tp, self.input_lmax, self.edge_lmax)
         device = str(self.tp.weight.device)
         if self._plan is None or self._prepared_device != device:
-            from mace_ictc.models.fused_message import _plan
-            from mace_ictc.models.bond_projection import projection_plan
+            from ictc_o3.ops.fused_message import _plan
+            from ictc_o3.ops.bond_projection import projection_plan
             self._plan = dict(_plan(self.tp, list(range(self.input_lmax+1)), self.tp.weight.device, True))
             self._plan.update(generated_forward=True, generated_adjoint=True, generated_second=True,
                               generated_specialized_adjoint=self.execution=="direct" and max(self.input_lmax,self.edge_lmax,self.tp.lmax)<=3,
@@ -247,7 +252,7 @@ class EdgeTensorProduct(torch.nn.Module):
                 self._plan.update(generated_lane_width=64,
                                   generated_channel_tile=64 if self.tp.channels>64 else 0,
                                   generated_split_adjoint=self.edge_lmax>=3 and len(self.tp.paths)>=16)
-                from mace_ictc.models.k100_message_schedule import schedule
+                from ictc_o3.backends.k100.k100_message_schedule import schedule
                 self._plan=schedule(self._plan,self.tp.weight)
             self._projection = dict(projection_plan(
                 self.tp, self.tp._get_bond_projectors(self.tp.weight.device, torch.float32),
@@ -318,19 +323,19 @@ class EdgeTensorProduct(torch.nn.Module):
             return empty.expand(0, self.output_width)
         plan, projection = self._prepare()
         if self.layout == "mul_ir" and self.execution == "direct":
-            from mace_ictc.models.fused_message import _channel_node
+            from ictc_o3.ops.fused_message import _channel_node
             features = _channel_node(features, plan)
         if projection["keys"] != list(range(self.edge_lmax+1)):
             harmonics = torch.cat([harmonics[:, l*l:(l+1)**2] for l in projection["keys"]], -1)
         if torch.is_grad_enabled() and any(v.requires_grad for v in (features,harmonics,gates)):
             # CUDA extension initialization belongs on the caller thread, before
             # the autograd worker requests a mixed derivative.
-            from mace_ictc.models.generated_message_second import _extension as second_extension
+            from ictc_o3.backends.k100.generated_message_second import _extension as second_extension
             second_extension(plan,projection)
         output = _Edge.apply(features.contiguous(), harmonics.contiguous(),
                              gates.reshape(rows, self.tp.num_paths, self.tp.channels).contiguous(), self.tp.weight, self)
         if self.layout == "mul_ir" and self.execution == "direct":
-            from mace_ictc.models.fused_message import _normal_message_output
+            from ictc_o3.ops.fused_message import _normal_message_output
             output = _normal_message_output(output, plan)
         return output
 
@@ -400,7 +405,7 @@ class PackedGraphMessage(torch.nn.Module):
         g=gates.reshape(e,self.tp.num_paths,self.tp.channels).contiguous()
         m=features.new_empty(0) if mask is None else mask.reshape(e).contiguous()
         x,w=features.contiguous(),self.tp.weight
-        from mace_ictc.models.rematerialized_message import rematerialized_message
+        from ictc_o3.ops.rematerialized_message import rematerialized_message
         return rematerialized_message(x,sh.contiguous(),w,g,src.contiguous(),dst.contiguous(),m,p,projection)
 
 
@@ -455,7 +460,7 @@ class GraphMessage(torch.nn.Module):
             if mask.requires_grad or tuple(mask.shape) not in ((e,), (e, 1)):
                 raise ValueError("mask must be fixed and have shape [E] or [E,1]")
             _operand(mask, mask.shape, self.tp.weight, "mask")
-        from mace_ictc.models.fused_message import aggregate_message
+        from ictc_o3.ops.fused_message import aggregate_message
         output = aggregate_message(self.tp, features, harmonics, gates, src, dst, mask,
                                    backend="triton_remat", generated_options=self._options)
         if output is None:
@@ -475,13 +480,13 @@ def direction_harmonics(directions, lmax, *, policy="auto"):
     if policy not in ("auto", "generated", "reference"):
         raise ValueError("Harmonic policy must be auto, generated or reference")
     if policy != "reference":
-        from mace_ictc.models.generated_direction_harmonics import generated_direction_harmonics
+        from ictc_o3.ops.generated_direction_harmonics import generated_direction_harmonics
         output = generated_direction_harmonics(directions, lmax)
         if output is not None:
             return output
         if policy == "generated":
             raise ValueError("Generated harmonics require eager CUDA FP32 and no autocast")
-    from mace_ictc.models.ictd_irreps import direction_harmonics_all
+    from ictc_o3.basis.ictd_irreps import direction_harmonics_all
     return direction_harmonics_all(directions, lmax)
 
 
@@ -507,9 +512,9 @@ def create_symmetric_contraction(*, num_elements, lmax, target_lmax=None, channe
     _degree(target_lmax, "target_lmax")
     if not isinstance(num_elements, int) or isinstance(num_elements, bool) or num_elements < 1:
         raise ValueError("num_elements must be a positive integer")
-    from mace_ictc.models.fp32_policy import strict_fp32
+    from ictc_o3.backends.k100.fp32_policy import strict_fp32
     strict_fp32()
-    from mace_ictc.models.pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
     module = ICTDBridgeUSymmetricContractionSO3(
         num_elements=num_elements, channels=channels, lmax=lmax, target_lmax=target_lmax,
         correlation=correlation, use_reduced_cg=use_reduced_cg,
@@ -530,9 +535,9 @@ def configure_symmetric_contraction(module, *, policy="auto", high_l_policy="aut
     High-L cubic auto residency keeps immutable dense U on CPU after planning;
     reference_buffer_policy=device keeps them on the parameter device.
     """
-    from mace_ictc.models.fp32_policy import strict_fp32
+    from ictc_o3.backends.k100.fp32_policy import strict_fp32
     strict_fp32()
-    from mace_ictc.models.pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
     if not isinstance(module, ICTDBridgeUSymmetricContractionSO3):
         raise TypeError("Expected ICTDBridgeUSymmetricContractionSO3")
     if policy not in ("auto", "generated", "reference"):
@@ -544,7 +549,8 @@ def configure_symmetric_contraction(module, *, policy="auto", high_l_policy="aut
     if not isinstance(training,bool):raise TypeError("training must be a boolean")
     if reference_buffer_policy not in ('auto','device'):
         raise ValueError('reference_buffer_policy must be auto or device')
-    from mace_ictc.models.reference_u_residency import host_reference_unavailable,restore_reference_u
+    from ictc_o3.ops.reference_u_residency import host_reference_unavailable
+    from ictc_o3.ops.reference_u_residency import restore_reference_u
     parameter = next(module.parameters())
     supported = (parameter.is_cuda and parameter.dtype == torch.float32 and module.channels > 0 and not module.use_reduced_cg
                  and module.lmax >= 0 and module.target_lmax >= 0
@@ -589,7 +595,7 @@ def channel_linear(features, weight, bias=None):
     Matrices stay live and ordinary autograd includes their higher gradients.
     Non-scalar bias would break equivariance and is rejected.
     """
-    from mace_ictc.models.fp32_policy import strict_fp32
+    from ictc_o3.backends.k100.fp32_policy import strict_fp32
     strict_fp32()
     if features.ndim < 2 or weight.ndim != 2 or features.shape[-2] != weight.shape[1]:
         raise ValueError("Expected features [*,Cin,m] and weight [Cout,Cin]")
@@ -609,5 +615,5 @@ def normalized_silu(features, scale=1.0):
     """Fused FP32 CUDA SiLU times a fixed scale, with differentiable fallbacks."""
     if not isinstance(scale, (int, float)) or isinstance(scale, bool):
         raise TypeError("scale must be a fixed numeric scalar")
-    from mace_ictc.models.fused_activation import normalized_silu as implementation
+    from ictc_o3.ops.fused_activation import normalized_silu as implementation
     return implementation(features, float(scale))

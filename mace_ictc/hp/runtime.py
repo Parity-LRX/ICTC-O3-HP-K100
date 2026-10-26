@@ -205,7 +205,7 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
     electrostatics_backend selects auto, hip or reference mesh operations
     independently of backbone planning, without changing the functional.
     """
-    from mace_ictc.models.fp32_policy import strict_fp32
+    from ictc_o3.backends.k100.fp32_policy import strict_fp32
     if electrostatics_backend not in ('auto','hip','reference'):
         raise ValueError('electrostatics_backend must be auto, hip or reference')
     if capture and electrostatics_backend == 'hip':
@@ -329,7 +329,8 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
         parameter=next(core.parameters())
         basis_enabled=(parameter.is_cuda and
             getattr(torch.cuda.get_device_properties(parameter.device),'gcnArchName','').split(':')[0]=='gfx926')
-    from mace_ictc.models.pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3,ElementConditionedLinearSO3
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
+    from mace_ictc.models.pure_cartesian_ictd_fix import ElementConditionedLinearSO3
     indexed_count=0
     for module in core.modules():
         if isinstance(module,ElementConditionedLinearSO3):
@@ -434,7 +435,7 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
                     +(['direction_harmonics'] if core._fused_direction_harmonics else []),
                 'torch_helpers':['csr_topology']+(['normalized_silu'] if capture else [])
                     +([] if core._fused_direction_harmonics else ['direction_harmonics'])}
-    from .electrostatics import configure_electrostatics
+    from ictc_o3.electrostatics.api import configure_electrostatics
     info['electrostatics'] = configure_electrostatics(
         model, backend='reference' if policy == 'reference' or capture else electrostatics_backend)
     return {**info, "layout": layout if info["selected"] == "generated" else None}
@@ -450,7 +451,7 @@ def prepare_for_export(model: torch.nn.Module, *, policy="auto", layout=None, dy
     Qualified high-L cor3 keeps canonical U on CPU after plan preparation;
     reference_buffer_policy="device" retains conventional device buffers.
     """
-    from mace_ictc.models.fp32_policy import strict_fp32
+    from ictc_o3.backends.k100.fp32_policy import strict_fp32
     strict_fp32()
     _layout(layout, optional=True)
     if dynamic and policy != "checkpoint":
@@ -463,7 +464,7 @@ def prepare_for_export(model: torch.nn.Module, *, policy="auto", layout=None, dy
                     "e3nn.set_optimization_defaults(jit_script_fx=False) before rebuilding/loading the model. "
                     f"Scripted modules remain: {scripted[:3]}. Use dynamic=False only for an intentionally static-N package.")
     from mace_ictc.interfaces.deployment_triton import configure_mace_deployment_plan
-    from .electrostatics import configure_electrostatics
+    from ictc_o3.electrostatics.api import configure_electrostatics
     configure_electrostatics(model, backend='reference')
     return configure_mace_deployment_plan(model, policy=policy, generated_layout=layout,
                                          reference_buffer_policy=reference_buffer_policy)

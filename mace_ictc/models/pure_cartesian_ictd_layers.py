@@ -23,21 +23,19 @@ from mace_ictc.models.radial_basis import soft_one_hot_linspace_mace_cutoff as s
 import math
 from functools import lru_cache
 
-from mace_ictc.models.ictd_irreps import (
-    HarmonicElementwiseProduct,
-    HarmonicChannelWiseTensorProduct,
-    HarmonicFullyConnectedTensorProduct,
-    EquivariantChannelLinearSO3,
-    EquivariantChannelLinearSO3Rect,
-    MultipleContractionSO3,
-    apply_channel_adapter_per_l,
-    direction_harmonics,
-    direction_harmonics_all,
-    build_harmonic_projectors,
-    build_harmonic_reconstructors,
-    sym_dim,
-)
-from mace_ictc.models.ictd_fast import _counts_list
+from ictc_o3.basis.ictd_irreps import HarmonicElementwiseProduct
+from ictc_o3.basis.ictd_irreps import HarmonicChannelWiseTensorProduct
+from ictc_o3.basis.ictd_irreps import HarmonicFullyConnectedTensorProduct
+from ictc_o3.basis.ictd_irreps import EquivariantChannelLinearSO3
+from ictc_o3.basis.ictd_irreps import EquivariantChannelLinearSO3Rect
+from ictc_o3.basis.ictd_irreps import MultipleContractionSO3
+from ictc_o3.basis.ictd_irreps import apply_channel_adapter_per_l
+from ictc_o3.basis.ictd_irreps import direction_harmonics
+from ictc_o3.basis.ictd_irreps import direction_harmonics_all
+from ictc_o3.basis.ictd_irreps import build_harmonic_projectors
+from ictc_o3.basis.ictd_irreps import build_harmonic_reconstructors
+from ictc_o3.basis.ictd_irreps import sym_dim
+from ictc_o3.basis.ictd_fast import _counts_list
 from mace_ictc.models.mlp import RobustScalarWeightedSum
 from mace_ictc.models.mlp import MainNet
 from mace_ictc.models.long_range import apply_long_range_modules, configure_long_range_modules
@@ -61,21 +59,10 @@ def resolve_save_multiple_mix_channels(
     return max(1, math.ceil(channels * num_interaction / 2))
 
 
-def _split_irreps(x: torch.Tensor, channels: int, lmax: int) -> dict[int, torch.Tensor]:
-    widths = [channels * (2 * l + 1) for l in range(lmax + 1)]
-    # One split joins cotangents once, instead of creating and adding a
-    # full-width zero-padded gradient for every independently sliced degree.
-    # Preserve front-slicing when a caller requests only the lower degrees.
-    blocks = x.split([*widths, x.shape[-1] - sum(widths)], dim=-1)
-    return {l: blocks[l].view(*x.shape[:-1], channels, 2 * l + 1)
-            for l in range(lmax + 1)}
+from ictc_o3.basis.layout import _split_irreps
 
 
-def _merge_irreps(blocks: dict[int, torch.Tensor], channels: int, lmax: int) -> torch.Tensor:
-    parts = []
-    for l in range(lmax + 1):
-        parts.append(blocks[l].reshape(*blocks[l].shape[:-2], channels * (2 * l + 1)))
-    return torch.cat(parts, dim=-1)
+from ictc_o3.basis.layout import _merge_irreps
 
 
 class SO3BlockRMSNorm(nn.Module):

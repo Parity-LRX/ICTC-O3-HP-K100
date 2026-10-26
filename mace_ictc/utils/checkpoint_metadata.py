@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 import torch
 
-from .mesh import normalize_mesh_size
+from ictc_o3.electrostatics.mesh import normalize_mesh_size
 
 
 DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
@@ -189,17 +189,7 @@ def resolve_save_multiple_mix_channels_default(
     num_interaction = int(num_interaction)
     return max(1, math.ceil(channels * num_interaction / 2))
 
-def derive_long_range_far_max_radius_multiplier(
-    far_num_shells: int,
-    far_shell_growth: float,
-) -> float:
-    far_num_shells = int(far_num_shells)
-    far_shell_growth = float(far_shell_growth)
-    if far_num_shells < 1:
-        raise ValueError("long_range_far_num_shells must be >= 1")
-    if far_shell_growth <= 1.0:
-        raise ValueError("long_range_far_shell_growth must be > 1")
-    return float(math.pow(far_shell_growth, far_num_shells))
+from ictc_o3.electrostatics.cutoff import derive_long_range_far_max_radius_multiplier
 
 
 def maybe_load_checkpoint(path: str | None, *, map_location: str | torch.device = "cpu") -> dict[str, Any] | None:

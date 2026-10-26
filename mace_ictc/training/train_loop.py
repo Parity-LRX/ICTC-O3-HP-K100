@@ -273,7 +273,7 @@ class ForceTrainer:
             raise ValueError("Native HIP electrostatics requires eager training")
         mesh_backend = "reference" if operator_plan == "reference" or self.train_makefx_compile else electrostatics_backend
         if mesh_backend is not None:
-            from mace_ictc.hp.electrostatics import configure_electrostatics
+            from ictc_o3.electrostatics.api import configure_electrostatics
             self.operator_plan_info["electrostatics"] = configure_electrostatics(self.model, backend=mesh_backend)
         if backward_targets not in ("auto", "parameters", "all"):
             raise ValueError("backward_targets must be auto, parameters or all")

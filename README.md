@@ -35,6 +35,7 @@ from mace_ictc.training import ForceTrainer
 See the [operator API](docs/O3_API.md) for shapes, gradients and standalone usage,
 and the [model API](docs/HP_API.md) for training, inference and conversion.
 Existing operator imports from `mace_ictc.hp` remain compatible.
+See [architecture and module ownership](docs/ARCHITECTURE.md) for the implementation layout.
 
 ## Installation
 

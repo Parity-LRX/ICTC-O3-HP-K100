@@ -99,8 +99,12 @@ def _message_source(p,projection):
 
 
 def prepare_message(layer,device):
-    from mace_ictc.models.fused_message import _plan,_channel_node,_channel_cotangent,_normal_message_output,_normal_feature_gradient
-    from mace_ictc.models.bond_projection import projection_plan
+    from ictc_o3.ops.fused_message import _plan
+    from ictc_o3.ops.fused_message import _channel_node
+    from ictc_o3.ops.fused_message import _channel_cotangent
+    from ictc_o3.ops.fused_message import _normal_message_output
+    from ictc_o3.ops.fused_message import _normal_feature_gradient
+    from ictc_o3.ops.bond_projection import projection_plan
     from torch.library import triton_op,wrap_triton
     import triton
     tp=layer.tp;p=dict(_plan(tp,list(range(layer.input_lmax+1)),device,True))
@@ -179,7 +183,7 @@ def _module(source,stem):
 
 
 def prepare_harmonics(model,device):
-    from mace_ictc.models.generated_direction_harmonics import _plan
+    from ictc_o3.ops.generated_direction_harmonics import _plan
     from torch.library import triton_op,wrap_triton
     import triton
     lmax=int(model.ictd_fix_edge_lmax)
@@ -206,7 +210,7 @@ def prepare_harmonics(model,device):
 
 
 def prepare_contraction(owner,device):
-    from mace_ictc.models.factorized_contraction import _plan
+    from ictc_o3.ops.factorized_contraction import _plan
     c=int(owner.channels);size=(int(owner.lmax)+1)**2
     plan=_plan(owner,torch.empty(1,c,size,device=device,dtype=torch.float32))
     if plan is None:raise ValueError("This symmetric contraction has no qualified factorized deployment plan")
@@ -238,7 +242,7 @@ def prepare_contraction(owner,device):
 
 
 def _prepare_circuit(plan,c,size):
-    from mace_ictc.models.factorized_circuit import _generate
+    from ictc_o3.ops.factorized_circuit import _generate
     from torch.library import triton_op,wrap_triton
     import triton
     p=plan["final"]["sizes"][2];m=plan["final"]["sizes"][3]
@@ -280,7 +284,7 @@ def configure_mace_deployment_plan(model, *, policy="auto", generated_layout=Non
         raise ValueError("Unsupported generated deployment layout")
     if reference_buffer_policy not in ("auto","device"):
         raise ValueError("reference_buffer_policy must be auto or device")
-    from mace_ictc.models.reference_u_residency import restore_model_reference_u
+    from ictc_o3.ops.reference_u_residency import restore_model_reference_u
     if policy == "checkpoint":
         restore_model_reference_u(model)
         return {"requested": policy, "selected": "checkpoint", "reasons": [], "counts": {}}
@@ -299,7 +303,7 @@ def configure_mace_deployment_plan(model, *, policy="auto", generated_layout=Non
              for layer in core.interactions]
     set_mace_backbone_plan(core, shared_channel_gemm=True)
     for layer,layout in zip(core.interactions,layouts):layer.tp._generated_layout=layout
-    from mace_ictc.models.reference_u_residency import host_reference_unavailable
+    from ictc_o3.ops.reference_u_residency import host_reference_unavailable
     counts = prepare_deployment_triton(core,host_reference=(reference_buffer_policy=="auto" and host_reference_unavailable(model) is None))
     return {"requested": policy, "selected": "generated", "reasons": [], "counts": counts,
             "reference_buffer_policy":reference_buffer_policy}
@@ -307,7 +311,7 @@ def configure_mace_deployment_plan(model, *, policy="auto", generated_layout=Non
 
 def prepare_deployment_triton(model,*,host_reference=True):
     """Prepare an independent parameterized FP32 model before FX/export."""
-    from mace_ictc.models.pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
     if not hasattr(torch.library,"triton_op"):raise RuntimeError("Deployment kernels require torch.library.triton_op")
     sample=next(model.parameters())
     if sample.dtype!=torch.float32 or not sample.is_cuda:raise ValueError("Deployment Triton mode requires CUDA FP32")
@@ -319,7 +323,9 @@ def prepare_deployment_triton(model,*,host_reference=True):
     if any(type(module).__module__.startswith("cuequivariance") or getattr(module,"tp_cueq",None) is not None for module in model.modules()):raise ValueError("Independent deployment cannot mix cuEq")
     prepare_harmonics(model,sample.device)
     for layer in model.interactions:prepare_message(layer,sample.device)
-    from mace_ictc.models.reference_u_residency import host_reference_unavailable,offload_reference_u,restore_reference_u
+    from ictc_o3.ops.reference_u_residency import host_reference_unavailable
+    from ictc_o3.ops.reference_u_residency import offload_reference_u
+    from ictc_o3.ops.reference_u_residency import restore_reference_u
     count=sparse_count=host_count=0
     host_allowed=host_reference and host_reference_unavailable(model) is None
     for module in model.modules():

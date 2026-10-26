@@ -9,7 +9,11 @@ from .operators import (
     configure_symmetric_contraction, create_symmetric_contraction, direction_harmonics, normalized_silu,
 )
 from .runtime import check_model, configure_model, create_model, energy_and_forces, prepare_for_export
-from .electrostatics import MeshElectrostatics, configure_electrostatics, mesh_spread, mesh_gather, mesh_shape_for_cell
+from ictc_o3.electrostatics.api import MeshElectrostatics
+from ictc_o3.electrostatics.api import configure_electrostatics
+from ictc_o3.electrostatics.api import mesh_spread
+from ictc_o3.electrostatics.api import mesh_gather
+from ictc_o3.electrostatics.api import mesh_shape_for_cell
 
 __all__ = [
     "EdgeTensorProduct", "GraphMessage", "PackedGraphMessage", "direction_harmonics",

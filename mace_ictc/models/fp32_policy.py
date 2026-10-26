@@ -1,11 +1,6 @@
-# SPDX-License-Identifier: MIT
-"""The HP package uses ordinary IEEE FP32, including library GEMMs."""
-import torch
+"""Compatibility alias for released import and pickle paths."""
+from importlib import import_module
+import sys
 
-
-def strict_fp32():
-    """Disable TF32 globally; never cast tensors or change trainability."""
-    if torch.get_float32_matmul_precision()!='highest' or torch.backends.cuda.matmul.allow_tf32:
-        torch.set_float32_matmul_precision('highest')
-        torch.backends.cuda.matmul.allow_tf32=False
-    if torch.backends.cudnn.allow_tf32:torch.backends.cudnn.allow_tf32=False
+_implementation = import_module("ictc_o3.backends.k100.fp32_policy")
+sys.modules[__name__] = _implementation

@@ -14,7 +14,7 @@ whole-model APIs. These sibling Python packages are installed together with
 `ictc-o3-hp-k100`. See the [O3 operator overview](O3_API.md) for a quick reference.
 Existing operator imports from `mace_ictc.hp` remain compatible. Users do not
 need to call internal functions such as `_source`, `_plan` or GPU kernel launchers
-in `models/`.
+in `ictc_o3/backends/`.
 
 ## Terminology and notation
 

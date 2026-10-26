@@ -19,10 +19,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mace_ictc.models.pure_cartesian_ictd_layers import (
-    PhysicalTensorICTDRecovery,
-    _split_irreps,
-)
+from mace_ictc.models.pure_cartesian_ictd_layers import PhysicalTensorICTDRecovery
+from ictc_o3.basis.layout import _split_irreps
 
 
 def pack_multipole_source(

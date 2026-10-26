@@ -22,7 +22,7 @@ def main(argv=None):
     if not torch.version.hip or not torch.cuda.is_available():
         parser.error("mff-lammps requires HIP-enabled PyTorch on K100")
     torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
-    from mace_ictc.models.fp32_policy import strict_fp32
+    from ictc_o3.backends.k100.fp32_policy import strict_fp32
     strict_fp32()
     from mace_ictc.interfaces.lammps_hp import shutdown
     from lammps import lammps

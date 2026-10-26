@@ -29,7 +29,8 @@ def generated_plan_unavailable(model: torch.nn.Module, *, training: bool = False
     The default policy is conservative about unqualified architecture variants.
     """
     import importlib.util
-    from .pure_cartesian_ictd_fix import PureCartesianICTDFix, ICTDBridgeUSymmetricContractionSO3
+    from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
     core = mace_backbone_core(model)
     if not isinstance(core, PureCartesianICTDFix):
         return ["model is not the MACE-ICTC backbone"]
@@ -85,7 +86,7 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
     Generated eager training defaults to contiguous node/component message GEMMs;
     reference and inference plans restore the einsum layout.
     """
-    from .fp32_policy import strict_fp32
+    from ictc_o3.backends.k100.fp32_policy import strict_fp32
     strict_fp32()
     if policy not in ("auto", "reference", "generated"):
         raise ValueError("operator plan must be auto, reference or generated")
@@ -100,7 +101,9 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
     if training_message_linear_layout not in ('einsum','node_component'):
         raise ValueError('training_message_linear_layout must be einsum or node_component')
     core = mace_backbone_core(model)
-    from .reference_u_residency import host_reference_unavailable,restore_model_reference_u,restore_reference_u
+    from ictc_o3.ops.reference_u_residency import host_reference_unavailable
+    from ictc_o3.ops.reference_u_residency import restore_model_reference_u
+    from ictc_o3.ops.reference_u_residency import restore_reference_u
     if policy == "reference":
         from .pure_cartesian_ictd_fix import PureCartesianICTDFix
         counts = set_mace_backbone_plan(core) if isinstance(core, PureCartesianICTDFix) else {}
@@ -131,7 +134,7 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
         gate_cache_bytes=gate_cache_bytes, generated_layout=generated_layout,
         training_message_linear_layout=training_message_linear_layout if training else "einsum",
     )
-    from .pure_cartesian_ictd_fix import ICTDBridgeUSymmetricContractionSO3
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
     high=(high_l_policy=="auto" and 4<=core.lmax<=5 and core.ictd_fix_edge_lmax<=5)
     cubic=any(c.correlation==3 for module in core.modules()
               if isinstance(module,ICTDBridgeUSymmetricContractionSO3)
@@ -175,19 +178,7 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
             "arithmetic":"IEEE FP32; TF32 disabled"}
 
 
-def bond_first_projection(a: torch.Tensor, b: torch.Tensor, projector: torch.Tensor,
-                          angular_backend: str = "torch") -> torch.Tensor:
-    """Contract a single-channel geometry leg before broadcasting over channels.
-
-    a: [..., channels, m1], b: [..., 1, m2], projector: [m2, m1*k].
-    Unlike broadcasting a batched matmul over channels, this bmm has no repeated
-    geometry map and never forms [..., channels, m1*m2].
-    """
-    magnetic = torch.matmul(b.squeeze(-2), projector).reshape(
-        *b.shape[:-2], a.shape[-1], projector.shape[-1] // a.shape[-1]
-    )
-    from .angular_operator import angular_product
-    return angular_product(a, magnetic, angular_backend)
+from ictc_o3.ops.bond_first import bond_first_projection
 
 
 def set_mace_backbone_plan(model: torch.nn.Module, *, bond_first: bool = False,
@@ -258,9 +249,16 @@ def set_mace_backbone_plan(model: torch.nn.Module, *, bond_first: bool = False,
                     or type(module).__name__.startswith("Cueq")
                     or getattr(module,"tp_cueq",None) is not None):
                 raise ValueError("Independent ICTC plans cannot mix cuEq operators; select a native ICTC backend")
-    from .ictd_irreps import HarmonicPathWeightedTensorProduct, EdgeWeightedPathPreservingTensorProduct, EquivariantChannelLinearSO3, EquivariantChannelLinearSO3Rect
-    from .pure_cartesian_ictd_fix import ICTDResidualInteractionBlock, _Normalize2MomSiLU, ICTDBridgeUSymmetricContractionSO3,ElementConditionedLinearSO3,PathPreservingLinearSO3
-    from ._mace_symmetric_contraction import _Contraction
+    from ictc_o3.basis.ictd_irreps import HarmonicPathWeightedTensorProduct
+    from ictc_o3.basis.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+    from ictc_o3.basis.ictd_irreps import EquivariantChannelLinearSO3
+    from ictc_o3.basis.ictd_irreps import EquivariantChannelLinearSO3Rect
+    from mace_ictc.models.pure_cartesian_ictd_fix import ICTDResidualInteractionBlock
+    from mace_ictc.models.pure_cartesian_ictd_fix import _Normalize2MomSiLU
+    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
+    from mace_ictc.models.pure_cartesian_ictd_fix import ElementConditionedLinearSO3
+    from mace_ictc.models.pure_cartesian_ictd_fix import PathPreservingLinearSO3
+    from ictc_o3.ops._mace_symmetric_contraction import _Contraction
     if hasattr(model,"angular_basis") and hasattr(model,"ictd_fix_edge_lmax"):
         model._fused_direction_harmonics=bool(fused_harmonics)
     count = {"bond_first": 0, "path_assembly": 0, "edge_fusion": 0, "species_bank": 0,

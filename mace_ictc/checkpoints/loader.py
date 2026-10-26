@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 import torch
-from mace_ictc.utils.mesh import normalize_mesh_size
+from ictc_o3.electrostatics.mesh import normalize_mesh_size
 from .adapters import AtomForcesWrapper, _maybe_torchscript_trace_model
 # Baseline build: PureCartesianICTDFix + its baseline layer are always available.
 from mace_ictc.models.pure_cartesian_ictd_layers import (
@@ -51,18 +51,16 @@ try:
 except Exception:
     PureCartesianICTDSaveO3TransformerLayer = None
 from mace_ictc.utils.config import ModelConfig
-from mace_ictc.utils.checkpoint_metadata import (
-    derive_long_range_far_max_radius_multiplier,
-    get_checkpoint_e3_state_dict,
-    infer_external_tensor_rank_from_state_dict,
-    infer_ictd_save_final_readout_mode_from_state_dict,
-    infer_ictd_save_multiple_fusion_scheme_from_state_dict,
-    infer_ictd_save_multiple_order_from_state_dict,
-    infer_physical_tensor_outputs_from_state_dict,
-    validate_dispersion_deployment_graph_rule,
-    validate_dispersion_train_deploy_graph_compatibility,
-    validate_dispersion_training_graph_rule,
-)
+from ictc_o3.electrostatics.cutoff import derive_long_range_far_max_radius_multiplier
+from mace_ictc.utils.checkpoint_metadata import get_checkpoint_e3_state_dict
+from mace_ictc.utils.checkpoint_metadata import infer_external_tensor_rank_from_state_dict
+from mace_ictc.utils.checkpoint_metadata import infer_ictd_save_final_readout_mode_from_state_dict
+from mace_ictc.utils.checkpoint_metadata import infer_ictd_save_multiple_fusion_scheme_from_state_dict
+from mace_ictc.utils.checkpoint_metadata import infer_ictd_save_multiple_order_from_state_dict
+from mace_ictc.utils.checkpoint_metadata import infer_physical_tensor_outputs_from_state_dict
+from mace_ictc.utils.checkpoint_metadata import validate_dispersion_deployment_graph_rule
+from mace_ictc.utils.checkpoint_metadata import validate_dispersion_train_deploy_graph_compatibility
+from mace_ictc.utils.checkpoint_metadata import validate_dispersion_training_graph_rule
 from mace_ictc.utils.external_tensor_specs import normalize_external_tensor_specs
 from mace_ictc.models.zbl import maybe_wrap_model_with_zbl
 from mace_ictc.utils.tensor_utils import map_tensor_values
