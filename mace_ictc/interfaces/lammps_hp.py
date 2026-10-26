@@ -142,7 +142,7 @@ def _load(checkpoint, metadata, device):
         atomic_energy_keys=e0_keys, atomic_energy_values=e0_values,
         avg_num_neighbors=metadata.get("avg_num_neighbors"))
     model = potential.wrapper.model.to(device=device, dtype=torch.float32).eval().requires_grad_(False)
-    from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
+    from mace_ictc.models.mace.backbone import PureCartesianICTDFix
     if not isinstance(model, PureCartesianICTDFix):
         raise ValueError("Native MFF requires a PureCartesianICTDFix model")
     if (model.dispersion is not None

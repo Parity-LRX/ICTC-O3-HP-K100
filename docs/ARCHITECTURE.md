@@ -46,3 +46,22 @@ MACE source heads and model-specific long-range assembly remain in `mace_ictc`.
 Historical `mace_ictc.models` operator modules resolve to the canonical modules
 so released imports and serialized model paths continue to work. There is one
 implementation of each operator. Custom-op registration names remain stable.
+
+## MACE composition
+
+`mace_ictc.models.mace` separates model responsibilities:
+
+- `common.py`: initialization, path normalization and feature helpers.
+- `layers.py`: element-conditioned linears and interaction layers.
+- `products.py`: product-block assembly around shared O3 contractions.
+- `heads.py`: energy readouts and the multipole feature contract.
+- `backbone.py`: architecture construction and graph orchestration.
+
+The multipole head consumes the final interaction output before the last product
+truncates it to scalar features. This retains dipole/quadrupole information for
+both one-layer and deeper models. The feature tap returns a view or the existing
+tensor without detaching derivatives.
+
+The historical `pure_cartesian_ictd_fix` module resolves to the backbone and
+continues to expose its former classes. Parameter attribute paths and
+`state_dict` keys are preserved.

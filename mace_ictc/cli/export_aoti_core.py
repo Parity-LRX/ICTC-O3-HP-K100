@@ -404,7 +404,7 @@ def _torch_export_with_strict_fallback(gm, example_inputs, *, dynamic_shapes, pr
 
 
 def _replace_products_with_cueq(model, *, device: torch.device) -> None:
-    from mace_ictc.models.pure_cartesian_ictd_fix import CueqMACEProductBasisBlockSO3
+    from mace_ictc.models.mace.products import CueqMACEProductBasisBlockSO3
 
     if not hasattr(model, "products"):
         raise TypeError("--cueq-product expects a model with a .products ModuleList")

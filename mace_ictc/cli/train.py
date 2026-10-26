@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from mace_ictc.data import H5Dataset, collate_fn_h5, BucketBatchSampler
-from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
+from mace_ictc.models.mace.backbone import PureCartesianICTDFix
 from mace_ictc.utils.config import ModelConfig
 from mace_ictc.training.train_loop import ForceTrainer, _DEFAULT_E0_KEYS, _DEFAULT_E0_VALUES, disable_tf32
 

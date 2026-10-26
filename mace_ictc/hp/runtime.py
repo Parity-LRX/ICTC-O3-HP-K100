@@ -330,7 +330,7 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
         basis_enabled=(parameter.is_cuda and
             getattr(torch.cuda.get_device_properties(parameter.device),'gcnArchName','').split(':')[0]=='gfx926')
     from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
-    from mace_ictc.models.pure_cartesian_ictd_fix import ElementConditionedLinearSO3
+    from mace_ictc.models.mace.layers import ElementConditionedLinearSO3
     indexed_count=0
     for module in core.modules():
         if isinstance(module,ElementConditionedLinearSO3):

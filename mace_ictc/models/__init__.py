@@ -7,7 +7,7 @@ zoo) are not part of this build.
 
 from mace_ictc.models.mlp import MainNet, MainNet2, RobustScalarWeightedSum
 from mace_ictc.models.losses import RMSELoss, weighted_mse_loss_stats
-from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
+from mace_ictc.models.mace.backbone import PureCartesianICTDFix
 
 __all__ = [
     "PureCartesianICTDFix",

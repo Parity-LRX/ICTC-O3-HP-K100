@@ -10,7 +10,7 @@ import torch
 
 def mace_backbone_core(model: torch.nn.Module) -> torch.nn.Module:
     """Unwrap deployment/DDP wrappers without selecting an unrelated backbone."""
-    from .pure_cartesian_ictd_fix import PureCartesianICTDFix
+    from mace_ictc.models.mace.backbone import PureCartesianICTDFix
     while not isinstance(model, PureCartesianICTDFix):
         child = getattr(model, "module", None)
         if child is None:
@@ -29,7 +29,7 @@ def generated_plan_unavailable(model: torch.nn.Module, *, training: bool = False
     The default policy is conservative about unqualified architecture variants.
     """
     import importlib.util
-    from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
+    from mace_ictc.models.mace.backbone import PureCartesianICTDFix
     from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
     core = mace_backbone_core(model)
     if not isinstance(core, PureCartesianICTDFix):
@@ -105,7 +105,7 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
     from ictc_o3.ops.reference_u_residency import restore_model_reference_u
     from ictc_o3.ops.reference_u_residency import restore_reference_u
     if policy == "reference":
-        from .pure_cartesian_ictd_fix import PureCartesianICTDFix
+        from mace_ictc.models.mace.backbone import PureCartesianICTDFix
         counts = set_mace_backbone_plan(core) if isinstance(core, PureCartesianICTDFix) else {}
         restore_model_reference_u(core)
         return {"requested": policy, "selected": "reference", "reasons": [], "counts": counts,
@@ -114,7 +114,7 @@ def configure_mace_runtime_plan(model: torch.nn.Module, *, policy: str = "auto",
     if reasons:
         if policy == "generated":
             raise ValueError("Generated operator plan unavailable: " + "; ".join(reasons))
-        from .pure_cartesian_ictd_fix import PureCartesianICTDFix
+        from mace_ictc.models.mace.backbone import PureCartesianICTDFix
         counts=set_mace_backbone_plan(core) if isinstance(core,PureCartesianICTDFix) else {}
         restore_model_reference_u(core)
         return {"requested": policy, "selected": "reference", "reasons": reasons, "counts": counts,
@@ -253,11 +253,11 @@ def set_mace_backbone_plan(model: torch.nn.Module, *, bond_first: bool = False,
     from ictc_o3.basis.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
     from ictc_o3.basis.ictd_irreps import EquivariantChannelLinearSO3
     from ictc_o3.basis.ictd_irreps import EquivariantChannelLinearSO3Rect
-    from mace_ictc.models.pure_cartesian_ictd_fix import ICTDResidualInteractionBlock
-    from mace_ictc.models.pure_cartesian_ictd_fix import _Normalize2MomSiLU
+    from mace_ictc.models.mace.layers import ICTDResidualInteractionBlock
+    from mace_ictc.models.mace.layers import _Normalize2MomSiLU
     from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
-    from mace_ictc.models.pure_cartesian_ictd_fix import ElementConditionedLinearSO3
-    from mace_ictc.models.pure_cartesian_ictd_fix import PathPreservingLinearSO3
+    from mace_ictc.models.mace.layers import ElementConditionedLinearSO3
+    from mace_ictc.models.mace.layers import PathPreservingLinearSO3
     from ictc_o3.ops._mace_symmetric_contraction import _Contraction
     if hasattr(model,"angular_basis") and hasattr(model,"ictd_fix_edge_lmax"):
         model._fused_direction_harmonics=bool(fused_harmonics)

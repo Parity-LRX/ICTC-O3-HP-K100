@@ -59,7 +59,7 @@ from mace_ictc.models.pure_cartesian_ictd_layers import (
     PhysicalTensorICTDRecovery,
     PureCartesianICTDTransformerLayer as PureCartesianICTDTransformerLayerSave,
 )
-from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
+from mace_ictc.models.mace.backbone import PureCartesianICTDFix
 
 # Variant backbones (spherical / sparse / o3) are NOT shipped in this baseline-only build.
 # Their imports are guarded so `from_checkpoint` still loads `pure-cartesian-ictd-fix`

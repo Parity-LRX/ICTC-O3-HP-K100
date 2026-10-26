@@ -16,7 +16,8 @@ import torch
 from e3nn import o3
 
 from mace_ictc.interfaces.mace_converter import convert_mace_to_ictd
-from mace_ictc.models.pure_cartesian_ictd_fix import PureCartesianICTDFix, _radial_mlp_widths
+from mace_ictc.models.mace.backbone import PureCartesianICTDFix
+from mace_ictc.models.mace.common import _radial_mlp_widths
 
 
 log = logging.getLogger(__name__)

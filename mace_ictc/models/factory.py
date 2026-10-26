@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from mace_ictc.utils.config import ModelConfig
-from .pure_cartesian_ictd_fix import PureCartesianICTDFix
+from mace_ictc.models.mace.backbone import PureCartesianICTDFix
 
 
 def build_baseline_model(
