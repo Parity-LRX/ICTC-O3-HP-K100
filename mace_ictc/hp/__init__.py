@@ -21,3 +21,8 @@ __all__ = [
     "create_model", "check_model", "configure_model", "energy_and_forces", "prepare_for_export",
     "MeshElectrostatics", "configure_electrostatics", "mesh_spread", "mesh_gather", "mesh_shape_for_cell",
 ]
+
+from mace_ictc.runtime import (RuntimePlan, MessagePlan, ContractionPlan, TrainingPlan,
+                               InferencePlan, ElectrostaticsPlan)
+__all__ += ["RuntimePlan", "MessagePlan", "ContractionPlan", "TrainingPlan",
+            "InferencePlan", "ElectrostaticsPlan"]

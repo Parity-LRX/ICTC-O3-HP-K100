@@ -785,16 +785,53 @@ original checkpoint when a clean original route is required.
 `fused_pack` remains opt-in; its speed and memory effects depend on graph,
 model and execution mode. The default is `packed`.
 
+### Structured runtime configuration
+
+Runtime settings can be grouped with `RuntimePlan`. This uses the same coverage
+checks, defaults and operator bindings as the existing keyword API.
+
+```python
+from mace_ictc.hp import configure_model
+from mace_ictc.runtime import RuntimePlan, MessagePlan, TrainingPlan
+
+plan = RuntimePlan(
+    training=True,
+    policy="generated",
+    message=MessagePlan(layout="fused_pack"),
+    training_schedule=TrainingPlan(message_linear_layout="node_component"),
+)
+info = configure_model(model, plan=plan)
+```
+
+| Group | Settings |
+| --- | --- |
+| `MessagePlan` | Buffer layout, message schedule, reduction, topology and edge chunks |
+| `ContractionPlan` | Wide-channel and high-degree policies, species schedules and reference-buffer residency |
+| `TrainingPlan` | Gate memory schedule, message linears, mixed adjoints and radial checkpointing |
+| `InferencePlan` | Gate-cache budget, message layout, GEMM and backward chunks, basis fusion |
+| `ElectrostaticsPlan` | Mesh execution backend |
+
+Top-level `training`, `policy` and `capture` select the execution context.
+Use `plan=` or nondefault legacy keywords in one call. `plan.to_legacy()` returns
+a fresh keyword mapping; `RuntimePlan.from_legacy(**options)` groups an existing
+configuration. All plan types are also available from `mace_ictc.hp`.
+
+Configuration binds schedules before evaluation. It does not cast or freeze
+model parameters. Freeze parameters explicitly before generated inference and
+restore the intended trainability before returning to training. The established
+keyword API, including `training_message_linear_layout="node_component"`,
+remains supported.
+
 ## 8. Advanced combinations requiring separate validation
 
 Cor2 configurations using reduced CG are outside current `auto` coverage.
 The existing low-level selector
-`mace_ictc.models.operator_plans.set_mace_backbone_plan` remains available for
+`mace_ictc.runtime.planning.set_mace_backbone_plan` remains available for
 explicit combinations. For an FP32/C64 model independently validated by the
 caller:
 
 ```python
-from mace_ictc.models.operator_plans import set_mace_backbone_plan
+from mace_ictc.runtime.planning import set_mace_backbone_plan
 
 set_mace_backbone_plan(
     model, bond_first=True, angular_backend="triton_full", path_assembly="concat",

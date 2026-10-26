@@ -851,7 +851,7 @@ def main() -> int:
     for param in model.parameters():
         param.requires_grad_(False)
     print("[aoti] model parameters frozen for force-only inference export")
-    from mace_ictc.interfaces.deployment_triton import configure_mace_deployment_plan
+    from mace_ictc.runtime.export import configure_mace_deployment_plan
     if args.operator_plan == "generated" and args.cueq_product:
         raise ValueError("Generated independent deployment cannot mix cuEq")
     plan_info = configure_mace_deployment_plan(model, policy=args.operator_plan, generated_layout=args.generated_layout,

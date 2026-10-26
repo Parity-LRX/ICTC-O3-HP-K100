@@ -1199,7 +1199,7 @@ def load_checkpoint(
         device=device,
         dtype=dtype,
     )
-    from mace_ictc.interfaces.deployment_triton import configure_mace_deployment_plan
+    from mace_ictc.runtime.export import configure_mace_deployment_plan
     if use_ts and operator_plan == "generated":
         raise ValueError("Generated inference requires eager/AOTI, not TorchScript")
     result.operator_plan_info = configure_mace_deployment_plan(

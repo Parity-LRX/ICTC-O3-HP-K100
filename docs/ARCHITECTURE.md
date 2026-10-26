@@ -65,3 +65,30 @@ tensor without detaching derivatives.
 The historical `pure_cartesian_ictd_fix` module resolves to the backbone and
 continues to expose its former classes. Parameter attribute paths and
 `state_dict` keys are preserved.
+
+## Runtime ownership
+
+`mace_ictc.runtime` owns model-level execution settings and plan selection:
+
+- `config.py` defines `RuntimePlan` and its message, contraction, training,
+  inference and electrostatics groups.
+- `configure.py` validates settings and binds existing operator schedules before
+  evaluation. The public HP keyword API delegates through the same configuration.
+- `planning.py` owns MACE coverage checks and backbone operator selection.
+- `export.py` and `deployment_sparse.py` own the existing prepared-export paths.
+
+Legacy planning/export module paths remain aliases. Configuration objects carry
+settings only; model weights, input tensors and simulation state stay with their
+owners. Native MFF retains its performance/capacity policies and transport.
+K100 execution remains eager FP32; moving export preparation does not add
+whole-model compilation support.
+
+```mermaid
+flowchart LR
+    Apps[Training, conversion, LAMMPS] --> Models[MACE composition]
+    Loading[Factory and checkpoints] --> Models
+    Runtime[Runtime plans] --> Models
+    Runtime --> O3[ICTC-O3 operators]
+    Models --> O3
+    O3 --> Backend[K100 backends and resources]
+```

@@ -263,7 +263,7 @@ class ForceTrainer:
                 if hasattr(_m, "mbd_static_batch"):
                     _m.mbd_static_batch = True   # equal-size (bucketing-padded) graphs -> reshape, no .nonzero
         self.require_train_makefx_compile = bool(require_train_makefx_compile)
-        from mace_ictc.models.operator_plans import configure_mace_runtime_plan
+        from mace_ictc.runtime.planning import configure_mace_runtime_plan
         self.operator_plan_info = configure_mace_runtime_plan(
             self.model, policy=operator_plan, training=True, capture=self.train_makefx_compile,
             generated_layout=generated_layout,

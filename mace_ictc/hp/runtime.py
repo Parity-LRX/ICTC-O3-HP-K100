@@ -118,7 +118,7 @@ def _layout(value, *, optional=False):
 
 def check_model(model: torch.nn.Module, *, training=False, capture=False) -> dict:
     """Read-only coverage check; no freezing, casting, planning or compilation."""
-    from mace_ictc.models.operator_plans import generated_plan_unavailable
+    from mace_ictc.runtime.planning import generated_plan_unavailable
     reasons = generated_plan_unavailable(model, training=training, capture=capture)
     return {"supported": not reasons, "reasons": reasons}
 
@@ -138,7 +138,7 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
                     inference_adjoint_channel_tile="auto",inference_gate_adjoint_rows=0,
                     inference_gemm_policy="torch",inference_message_adjoint_edges=0,
                     inference_basis_fusion=False,species_linear_schedule="auto",
-                    electrostatics_backend="auto") -> dict:
+                    electrostatics_backend="auto", plan=None) -> dict:
     """Configure every interaction for eager training or full-force inference.
 
     auto selects qualified independent HP operators or reports why the existing
@@ -204,241 +204,55 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
     device buffers, and reference/export paths restore them before use.
     electrostatics_backend selects auto, hip or reference mesh operations
     independently of backbone planning, without changing the functional.
+
+
+    Pass plan=RuntimePlan(...) for grouped configuration. Use either a plan
+    or nondefault legacy keywords in a call; both share the same validation.
     """
-    from ictc_o3.backends.k100.fp32_policy import strict_fp32
-    if electrostatics_backend not in ('auto','hip','reference'):
-        raise ValueError('electrostatics_backend must be auto, hip or reference')
-    if capture and electrostatics_backend == 'hip':
-        raise ValueError('Native HIP electrostatics currently requires eager execution')
-    strict_fp32()
-    _layout(layout)
-    if message_schedule=='compact':
-        raise ValueError('The experimental STF-coordinate schedule is retired; use native or roles in the original ICTC basis')
-    if message_schedule not in ('native','roles'):
-        raise ValueError('message_schedule must be native or roles')
-    if graph_reduction not in ('auto','atomic','csr'):
-        raise ValueError('graph_reduction must be auto, atomic or csr')
-    if topology_backend not in ('native','device'):
-        raise ValueError('topology_backend must be native or device')
-    if csr_accumulator_limit is not None and (not isinstance(csr_accumulator_limit,int) or isinstance(csr_accumulator_limit,bool) or csr_accumulator_limit<1):
-        raise ValueError('csr_accumulator_limit must be a positive integer or None')
-    if not isinstance(csr_slice_search,bool):raise ValueError('csr_slice_search must be a bool')
-    if geometry_schedule not in ('auto','native','streamed'):
-        raise ValueError('geometry_schedule must be auto, native or streamed')
-    if species_schedule not in ('grouped','indexed'):
-        raise ValueError('species_schedule must be grouped or indexed')
-    if species_linear_schedule not in ('auto','gather','grouped'):
-        raise ValueError('species_linear_schedule must be auto, gather or grouped')
-    if species_linear_schedule=='grouped' and capture and policy!='reference':
-        raise ValueError('Grouped species linears require eager execution')
-    if inference_adjoint_channel_tile != 'auto' and (isinstance(inference_adjoint_channel_tile,bool)
-            or not isinstance(inference_adjoint_channel_tile,int)
-            or inference_adjoint_channel_tile not in (0,32,64)):
-        raise ValueError('inference_adjoint_channel_tile must be 0, 32, 64 or auto')
-    if inference_adjoint_channel_tile not in (0,'auto') and training:
-        raise ValueError('inference_adjoint_channel_tile requires training=False')
-    if (isinstance(inference_gate_adjoint_rows,bool) or not isinstance(inference_gate_adjoint_rows,int)
-            or inference_gate_adjoint_rows<0):
-        raise ValueError('inference_gate_adjoint_rows must be a nonnegative integer')
-    if inference_gate_adjoint_rows and training:
-        raise ValueError('inference_gate_adjoint_rows requires training=False')
-    if inference_gemm_policy not in ('torch','dtk2604'):
-        raise ValueError('inference_gemm_policy must be torch or dtk2604')
-    if inference_gemm_policy!='torch' and (training or capture):
-        raise ValueError('inference_gemm_policy=dtk2604 requires eager inference')
-    if (isinstance(inference_message_adjoint_edges,bool) or not isinstance(inference_message_adjoint_edges,int)
-            or inference_message_adjoint_edges<0):
-        raise ValueError('inference_message_adjoint_edges must be a nonnegative integer')
-    if inference_message_adjoint_edges and (training or capture):
-        raise ValueError('inference_message_adjoint_edges requires eager inference')
-    if not isinstance(inference_basis_fusion,bool):
-        raise ValueError('inference_basis_fusion must be bool')
-    if inference_basis_fusion and (training or capture):
-        raise ValueError('inference_basis_fusion requires eager inference')
-    if inference_message_layout not in ('native','degree'):
-        raise ValueError('inference_message_layout must be native or degree')
-    if inference_message_layout=='degree' and policy!='reference':
-        if training or capture:
-            raise ValueError('Degree message layout currently requires eager inference')
-        if layout!='fused_pack':
-            raise ValueError('Degree message layout requires layout=fused_pack')
-    gate_schedules=(training_gate_schedule,) if isinstance(training_gate_schedule,str) else training_gate_schedule
-    if (not isinstance(gate_schedules,(tuple,list)) or not gate_schedules
-            or any(not isinstance(value,str) or value not in ('materialized','cached','recompute') for value in gate_schedules)):
-        raise ValueError('training_gate_schedule must contain materialized, cached or recompute')
-    paged_gates=any(value!='materialized' for value in gate_schedules)
-    if not isinstance(radial_checkpoint,bool):raise ValueError('radial_checkpoint must be a bool')
-    if not training and policy!='reference' and (paged_gates or radial_checkpoint):
-        raise ValueError('A training gate schedule requires training=True')
-    if mixed_channel_tile is not None:
-        if isinstance(mixed_channel_tile,bool) or not isinstance(mixed_channel_tile,int) or mixed_channel_tile not in (0,32,64):
-            raise ValueError('mixed_channel_tile must be None, 0, 32 or 64')
-        if not training and policy!='reference':
-            raise ValueError('A mixed-adjoint channel tile requires training=True')
-    if mixed_geometry_schedule not in ('fused','split'):
-        raise ValueError('mixed_geometry_schedule must be fused or split')
-    if training_gate_gemm_policy not in ('torch','k100_tiled'):
-        raise ValueError('training_gate_gemm_policy must be torch or k100_tiled')
-    if training_adjoint_channel_tile is not None:
-        if (isinstance(training_adjoint_channel_tile,bool)
-                or not isinstance(training_adjoint_channel_tile,int)
-                or training_adjoint_channel_tile not in (0,32,64)):
-            raise ValueError('training_adjoint_channel_tile must be None, 0, 32 or 64')
-        if not training and policy!='reference':
-            raise ValueError('The training adjoint channel tile requires training=True')
-    if not training and policy!='reference' and (mixed_geometry_schedule!='fused'
-            or training_gate_gemm_policy!='torch'):
-        raise ValueError('Mixed geometry and gate gradient GEMM schedules require training=True')
-    if paged_gates and policy!='reference' and (training_gate_gemm_policy!='torch'
-            or mixed_geometry_schedule!='fused' or training_adjoint_channel_tile is not None):
-        raise ValueError('Explicit first-adjoint, split-geometry and gate-GEMM schedules require materialized training gates')
-    if capture and policy!='reference' and (training_gate_gemm_policy!='torch'
-            or mixed_geometry_schedule!='fused' or training_adjoint_channel_tile is not None):
-        raise ValueError('Explicit first-adjoint, split-geometry and gate-GEMM schedules require eager execution')
-    if message_chunk_edges is not None and (not isinstance(message_chunk_edges,int) or isinstance(message_chunk_edges,bool) or message_chunk_edges<1):
-        raise ValueError('message_chunk_edges must be a positive integer or None')
-    from mace_ictc.models.operator_plans import mace_backbone_core
-    core=mace_backbone_core(model)
-    interactions=tuple(layer for layer in getattr(core,'interactions',()) if hasattr(layer,'tp'))
-    per_layer=not isinstance(training_gate_schedule,str)
-    if per_layer and len(gate_schedules)!=len(interactions):
-        raise ValueError('A per-interaction training_gate_schedule must match the interaction count')
-    if radial_checkpoint and capture and policy!='reference':raise ValueError('radial_checkpoint requires eager execution')
-    if (policy!='reference' and inference_message_layout=='degree' and hasattr(core,'lmax')
-            and hasattr(core,'ictd_fix_edge_lmax') and max(core.lmax,core.ictd_fix_edge_lmax)>3):
-        raise ValueError('Degree message layout currently requires hidden/edge L<=3')
-    if (policy!='reference' and (paged_gates or radial_checkpoint or mixed_channel_tile is not None
-            or training_adjoint_channel_tile is not None) and hasattr(core,'lmax')
-            and hasattr(core,'ictd_fix_edge_lmax') and max(core.lmax,core.ictd_fix_edge_lmax)>3):
-        raise ValueError('Explicit training gate/mixed schedules currently require hidden/edge L<=3')
-    if (policy!='reference' and message_schedule!='native' and hasattr(core,'lmax')
-            and hasattr(core,'ictd_fix_edge_lmax') and max(core.lmax,core.ictd_fix_edge_lmax)>3):
-        raise ValueError('Requested low-L message schedule requires hidden/edge L<=3')
-    from mace_ictc.models.operator_plans import configure_mace_runtime_plan
-    info = configure_mace_runtime_plan(
-        model, policy=policy, training=training, capture=capture,
-        gate_cache_bytes=gate_cache_bytes, generated_layout=layout,
+
+    from mace_ictc.runtime.config import RuntimePlan
+    from mace_ictc.runtime.configure import apply_runtime_plan
+    options = dict(
+        training=training,
+        policy=policy,
+        layout=layout,
+        gate_cache_bytes=gate_cache_bytes,
+        capture=capture,
         wide_channel_policy=wide_channel_policy,
         high_l_policy=high_l_policy,
         reference_buffer_policy=reference_buffer_policy,
+        message_schedule=message_schedule,
+        graph_reduction=graph_reduction,
+        topology_backend=topology_backend,
+        csr_accumulator_limit=csr_accumulator_limit,
+        csr_slice_search=csr_slice_search,
+        geometry_schedule=geometry_schedule,
+        message_chunk_edges=message_chunk_edges,
+        species_schedule=species_schedule,
+        training_gate_schedule=training_gate_schedule,
+        mixed_channel_tile=mixed_channel_tile,
+        mixed_geometry_schedule=mixed_geometry_schedule,
+        training_gate_gemm_policy=training_gate_gemm_policy,
+        training_adjoint_channel_tile=training_adjoint_channel_tile,
         training_message_linear_layout=training_message_linear_layout,
+        radial_checkpoint=radial_checkpoint,
+        inference_message_layout=inference_message_layout,
+        inference_adjoint_channel_tile=inference_adjoint_channel_tile,
+        inference_gate_adjoint_rows=inference_gate_adjoint_rows,
+        inference_gemm_policy=inference_gemm_policy,
+        inference_message_adjoint_edges=inference_message_adjoint_edges,
+        inference_basis_fusion=inference_basis_fusion,
+        species_linear_schedule=species_linear_schedule,
+        electrostatics_backend=electrostatics_backend,
     )
-    selected=info['selected']=='generated'
-    basis_enabled=False
-    if selected and inference_basis_fusion and torch.version.hip:
-        parameter=next(core.parameters())
-        basis_enabled=(parameter.is_cuda and
-            getattr(torch.cuda.get_device_properties(parameter.device),'gcnArchName','').split(':')[0]=='gfx926')
-    from ictc_o3.ops.symmetric_contraction import ICTDBridgeUSymmetricContractionSO3
-    from mace_ictc.models.mace.layers import ElementConditionedLinearSO3
-    indexed_count=0
-    for module in core.modules():
-        if isinstance(module,ElementConditionedLinearSO3):
-            module._grouped_species_gemm=selected and species_linear_schedule=='grouped'
-            if species_linear_schedule!='auto':
-                module._shared_species_gemm=False
-        if isinstance(module,ICTDBridgeUSymmetricContractionSO3):
-            module._species_circuit=(selected and species_schedule=='indexed'
-                and max(module.lmax,module.target_lmax)<=3 and module._factorized_circuit
-                and not module._partitioned_circuit)
-            module._hip_fused_basis=bool(basis_enabled and module._species_circuit
-                and not getattr(module,'_staged_circuit',False)
-                and not getattr(module,'_compact_circuit_adjoints',False))
-            if training or not module._hip_fused_basis:
-                module._frozen_projected_bank=None
-            indexed_count+=int(module._species_circuit)
-    info['species_schedule']=species_schedule if selected else 'reference'
-    info['species_linear_schedule']=species_linear_schedule if selected else 'reference'
-    info['counts']['grouped_species_linears']=sum(bool(getattr(module,'_grouped_species_gemm',False)) for module in core.modules())
-    info['counts']['shared_species_gemm']=sum(bool(getattr(module,'_shared_species_gemm',False)) for module in core.modules())
-    info['counts']['indexed_species_circuits']=indexed_count
-    info['counts']['hip_basis_fusion']=sum(bool(getattr(module,'_hip_fused_basis',False)) for module in core.modules())
-    info['inference_basis_fusion']=bool(info['counts']['hip_basis_fusion'])
-    for index,layer in enumerate(interactions):
-        if training or not selected:
-            layer.tp._frozen_gate_weights=None
-        degree_layout=selected and not training and inference_message_layout=='degree'
-        layer.tp._inference_degree_layout=degree_layout
-        layer.tp._inference_adjoint_channel_tile=inference_adjoint_channel_tile if selected and not training else 0
-        layer.tp._inference_gate_adjoint_rows=inference_gate_adjoint_rows if selected and not training else 0
-        layer.tp._inference_gemm_policy=inference_gemm_policy if selected and not training else 'torch'
-        layer.tp._inference_message_adjoint_edges=inference_message_adjoint_edges if selected and not training else 0
-        if hasattr(layer,'message_linear'):
-            layer.message_linear._inference_degree_layout=degree_layout
-        schedule=gate_schedules[index] if per_layer else gate_schedules[0]
-        layer.tp._training_gate_schedule=schedule if selected and training else 'materialized'
-        layer.tp._radial_checkpoint=bool(selected and training and radial_checkpoint)
-        layer.tp._generated_second_channel_tile=mixed_channel_tile if selected and training else None
-        layer.tp._training_adjoint_channel_tile=training_adjoint_channel_tile if selected and training else None
-        layer.tp._generated_second_harmonic_split=bool(selected and training and mixed_geometry_schedule=='split')
-        layer.tp._training_gate_gemm_policy=training_gate_gemm_policy if selected and training else 'torch'
-        layer.tp._generated_specialized_adjoint=selected and message_schedule!='native'
-        layer.tp._generated_second_roles=selected and message_schedule!='native'
-        layer.tp._generated_compact_cartesian=False
-        cached=getattr(layer.tp,'_bond_projection_adjoint_plan',None)
-        if cached is not None:cached[1].pop('compact_cartesian_state',None)
-        if selected and graph_reduction!='auto':
-            layer.tp._generated_csr_forward=graph_reduction=='csr'
-        layer.tp._generated_topology=topology_backend if selected else 'native'
-        layer.tp._csr_slice_search=selected and csr_slice_search
-        if selected and geometry_schedule!='auto':
-            layer.tp._generated_geometry_streaming=geometry_schedule=='streamed'
-        if selected and message_chunk_edges is not None:
-            layer.tp._message_chunk_edges=message_chunk_edges
-        if selected and csr_accumulator_limit is not None:
-            layer.tp._csr_accumulator_limit=csr_accumulator_limit
-        # Reconfiguration must not retain rejected experimental source adjoints.
-        layer.tp._generated_csr_fused_adjoint=False
-    info['message_schedule']=message_schedule if selected else 'reference'
-    info['training_gate_schedule']=training_gate_schedule if selected and training else 'materialized'
-    info['mixed_channel_tile']=mixed_channel_tile if selected and training else None
-    info['training_adjoint_channel_tile']=training_adjoint_channel_tile if selected and training else None
-    info['mixed_geometry_schedule']=mixed_geometry_schedule if selected and training else 'fused'
-    info['training_gate_gemm_policy']=training_gate_gemm_policy if selected and training else 'torch'
-    info['radial_checkpoint']=bool(selected and training and radial_checkpoint)
-    info['inference_message_layout']=inference_message_layout if selected and not training else 'native'
-    info['inference_adjoint_channel_tile']=inference_adjoint_channel_tile if selected and not training else 0
-    info['inference_gate_adjoint_rows']=inference_gate_adjoint_rows if selected and not training else 0
-    info['inference_gemm_policy']=inference_gemm_policy if selected and not training else 'torch'
-    info['inference_message_adjoint_edges']=inference_message_adjoint_edges if selected and not training else 0
-    info['counts']['degree_packed_inference']=sum(bool(getattr(layer.tp,'_inference_degree_layout',False))
-                                                for layer in interactions)
-    info['counts']['paged_training_gates']=sum(
-        getattr(layer.tp,'_training_gate_schedule','materialized')!='materialized'
-        for layer in getattr(core,'interactions',()) if hasattr(layer,'tp'))
-    info.update(graph_reduction=graph_reduction if selected else 'reference',
-                topology_backend=topology_backend if selected else 'native',
-                csr_accumulator_limit=csr_accumulator_limit,csr_slice_search=selected and csr_slice_search)
-    info.update(geometry_schedule=geometry_schedule if selected else 'reference',message_chunk_edges=message_chunk_edges)
-    if selected:
-        info['counts']['generated_csr_forward']=sum(bool(getattr(layer.tp,'_generated_csr_forward',False))
-            for layer in getattr(core,'interactions',()) if hasattr(layer,'tp'))
-    if selected and not training and torch.version.hip:
-        parameter=next(core.parameters())
-        if (parameter.is_cuda and
-                getattr(torch.cuda.get_device_properties(parameter.device),'gcnArchName','').split(':')[0]=='gfx926'):
-            # This DTK target cannot compile the optional Triton helpers. Use
-            # qualified HIP harmonics and normalized SiLU, while reporting
-            # the remaining PyTorch helpers explicitly.
-            core._fused_direction_harmonics=getattr(core,'ictd_fix_edge_lmax',4)<=3
-            if capture:
-                # Keep the preceding capture path; HIP SiLU is qualified eager.
-                for module in core.modules():
-                    if hasattr(module,'_fuse_activation'):module._fuse_activation=False
-                info['counts']['activation_fusion']=0
-            for layer in interactions:layer.tp._generated_topology='native'
-            info['topology_backend']='native'
-            info['device_adaptations']={'target':'gfx926',
-                'native_hip':['tp_adjoint','csr_forward','message_layout','species_circuit_first_order']
-                    +([] if capture else ['normalized_silu'])
-                    +(['basis_packing'] if info['inference_basis_fusion'] else [])
-                    +(['direction_harmonics'] if core._fused_direction_harmonics else []),
-                'torch_helpers':['csr_topology']+(['normalized_silu'] if capture else [])
-                    +([] if core._fused_direction_harmonics else ['direction_harmonics'])}
-    from ictc_o3.electrostatics.api import configure_electrostatics
-    info['electrostatics'] = configure_electrostatics(
-        model, backend='reference' if policy == 'reference' or capture else electrostatics_backend)
-    return {**info, "layout": layout if info["selected"] == "generated" else None}
+    requested = RuntimePlan.from_legacy(**options)
+    if plan is not None:
+        if not isinstance(plan, RuntimePlan):
+            raise TypeError("plan must be a RuntimePlan")
+        if requested != RuntimePlan():
+            raise ValueError("Use a RuntimePlan or nondefault legacy runtime keywords in one call")
+        requested = plan
+    return apply_runtime_plan(model, requested)
 
 
 def prepare_for_export(model: torch.nn.Module, *, policy="auto", layout=None, dynamic=True,
@@ -455,7 +269,7 @@ def prepare_for_export(model: torch.nn.Module, *, policy="auto", layout=None, dy
     strict_fp32()
     _layout(layout, optional=True)
     if dynamic and policy != "checkpoint":
-        from mace_ictc.models.operator_plans import generated_plan_unavailable,mace_backbone_core
+        from mace_ictc.runtime.planning import generated_plan_unavailable,mace_backbone_core
         core = mace_backbone_core(model)
         if not generated_plan_unavailable(core):
             scripted = [name for name, child in core.named_modules() if isinstance(child, torch.jit.ScriptModule)]
@@ -463,7 +277,7 @@ def prepare_for_export(model: torch.nn.Module, *, policy="auto", layout=None, dy
                 raise ValueError("Dynamic AOTI requires FX e3nn submodules: use create_model, or set "
                     "e3nn.set_optimization_defaults(jit_script_fx=False) before rebuilding/loading the model. "
                     f"Scripted modules remain: {scripted[:3]}. Use dynamic=False only for an intentionally static-N package.")
-    from mace_ictc.interfaces.deployment_triton import configure_mace_deployment_plan
+    from mace_ictc.runtime.export import configure_mace_deployment_plan
     from ictc_o3.electrostatics.api import configure_electrostatics
     configure_electrostatics(model, backend='reference')
     return configure_mace_deployment_plan(model, policy=policy, generated_layout=layout,
