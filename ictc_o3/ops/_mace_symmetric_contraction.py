@@ -293,7 +293,7 @@ class _Contraction(torch.nn.Module):
             self.U_matrix_1_fast_t.to(x),
         ).view(batch, channels, num_ell)
         out = torch.sum((out1 + c1) * x, dim=-1)
-        return out.reshape(batch, -1)
+        return out.reshape(batch, channels)
 
     def _forward_selected_elements(
         self,
@@ -379,7 +379,7 @@ class _Contraction(torch.nn.Module):
             )
             c_tensor = c_tensor + out
             out = contract_features(c_tensor, x)
-        return out.view(out.shape[0], -1)
+        return out.reshape(out.shape[0], self.num_features * (2 * self.output_lmax + 1))
 
     def U_tensors(self, nu: int) -> torch.Tensor:
         return dict(self.named_buffers())[f"U_matrix_{nu}"]

@@ -106,6 +106,22 @@ class ICTDBridgeUSymmetricContractionSO3(nn.Module):
         if deployment is not None:
             if node_type_idx is None:node_type_idx=node_attrs.argmax(-1)
             return deployment(x,node_type_idx)
+        if node_type_idx is not None and self._small_scalar_training(x):
+            # For tiny live-weight scalar workloads the original matrix recursion
+            # has fewer launches. Preserve the discrete-index convention even
+            # when attrs is absent or disagrees with the supplied indices.
+            self._frozen_projected_bank=None
+            if getattr(self, '_require_factorized_plan', False):
+                from ictc_o3.ops.factorized_contraction import _plan
+                if _plan(self,x) is None:
+                    raise ValueError('SC constants do not reconstruct within the generated-plan precision budget')
+            elements=self.symmetric_contractions.contractions[0].weights_max.shape[0]
+            if node_type_idx.shape != (x.shape[0],) or node_type_idx.device != x.device or node_type_idx.dtype != torch.int64:
+                raise ValueError('Species indices must be int64 [N] on the feature device')
+            torch._assert_async(((node_type_idx>=0)&(node_type_idx<elements)).all(),
+                                'Species index outside the coefficient bank')
+            node_attrs=torch.nn.functional.one_hot(node_type_idx,elements).to(x.dtype)
+            node_type_idx=None
         if node_type_idx is None:
             from ictc_o3.ops.reference_u_residency import prepare_reference_u
             prepare_reference_u(self,x)
@@ -129,4 +145,14 @@ class ICTDBridgeUSymmetricContractionSO3(nn.Module):
             ],
             dim=-1,
         )
+
+    def _small_scalar_training(self, x: torch.Tensor) -> bool:
+        """K100 launch-bound scalar fallback for the standalone auto plan."""
+        if (not getattr(self, '_standalone_sc_auto', False) or self.target_lmax != 0 or self.lmax > 2
+                or not torch.is_grad_enabled() or not x.requires_grad or x.shape[0]*self.channels > 32768):
+            return False
+        contractions=self.symmetric_contractions.contractions
+        return (len(contractions)==1 and contractions[0].correlation in (1,2,3)
+                and (contractions[0].correlation<3 or getattr(contractions[0], '_use_scalar_corr3_fast', False))
+                and any(p.requires_grad for p in contractions.parameters()))
 

@@ -90,6 +90,8 @@ channels as a fully connected tensor product would.
 Within each degree/path, `ir_mul` stores `[angular component,channel]` and
 `mul_ir` stores `[channel,angular component]`. Packing changes the storage layout and retains
 the native ICTC angular basis.
+The default is `layout="ir_mul", execution="direct"`, using the contiguous
+channel layout of the K100 kernel. Explicit layouts keep their documented ABI.
 
 ## Node graph messages
 
@@ -111,6 +113,49 @@ the operator performs gather, TP, gating and scatter reduction. The edge TP's
 `pack_input` also accepts node blocks with matching channel and degree settings.
 For the dictionary interface, use
 `GraphMessage(tp, input_lmax=..., edge_lmax=...)`.
+
+## Standalone symmetric contraction
+
+```python
+sc = create_symmetric_contraction(
+    num_elements=3, channels=64, lmax=2, correlation=3, device="cuda",
+)
+# x: [N, 64*9], ICTC mul_ir degree blocks
+# attrs: [N,3] one-hot; species: [N] int64 on the same GPU
+y = sc(x, attrs, node_type_idx=species)
+```
+
+The SC factory and in-place configuration default to
+`species_schedule="auto", inference_basis_fusion="auto"`. On K100, auto
+selects indexed circuits for degrees up to three. Fixed input/output basis
+maps are fused with the contraction when its coefficient bank has no live
+gradients. Trainable parameters retain their gradients and use the differentiable
+route. Selection follows the current gradient state when weights are frozen or
+unfrozen; configuration does not freeze them.
+Small scalar-output training calls use the original matrix recursion when
+its lower launch overhead is preferable. This dispatch uses the row/channel
+workload and keeps the same live weights and derivatives.
+
+For frozen inference, use `sc.eval().requires_grad_(False)`. Inputs can still
+require gradients for force evaluation. Only projections of frozen weights are
+cached, with invalidation on parameter updates; node features and species are
+evaluated on every call. Calls supplying only `attrs` preserve continuous
+attribute differentiation.
+
+To select the previous grouped schedule explicitly:
+
+```python
+info = configure_symmetric_contraction(sc, species_schedule="grouped")
+# Explicit indexed without basis fusion:
+info = configure_symmetric_contraction(sc, species_schedule="indexed")
+# Keep auto scheduling and disable basis fusion:
+info = configure_symmetric_contraction(sc, inference_basis_fusion=False)
+```
+
+`info["indexed_species_active"]` and `info["basis_fusion_active"]` report the
+enabled plans. Fusion executes only when its gradient requirements are met.
+Higher degrees retain their existing partitioned or sparse plans. These are
+standalone SC defaults; model-wide runtime settings have their own defaults.
 
 ## Coverage and gradients
 

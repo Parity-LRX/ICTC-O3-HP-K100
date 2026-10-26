@@ -493,7 +493,7 @@ def direction_harmonics(directions, lmax, *, policy="auto"):
 def create_symmetric_contraction(*, num_elements, lmax, target_lmax=None, channels=64,
                                 correlation=3, use_reduced_cg=False, device="cuda", policy="generated",
                                 high_l_policy="auto", training=False, reference_buffer_policy="auto",
-                                species_schedule="grouped"):
+                                species_schedule="auto", inference_basis_fusion="auto"):
     """Create a parameterized trainable bridge-U SC and select its plan.
 
     This creates initialized weights. To preserve existing trained coefficients,
@@ -521,17 +521,22 @@ def create_symmetric_contraction(*, num_elements, lmax, target_lmax=None, channe
     ).to(device=device, dtype=torch.float32)
     configure_symmetric_contraction(module, policy=policy, high_l_policy=high_l_policy,
                                    training=training,reference_buffer_policy=reference_buffer_policy,
-                                   species_schedule=species_schedule)
+                                   species_schedule=species_schedule,
+                                   inference_basis_fusion=inference_basis_fusion)
     return module
 
 
 def configure_symmetric_contraction(module, *, policy="auto", high_l_policy="auto", training=False,
-                                    reference_buffer_policy="auto",species_schedule="grouped"):
+                                    reference_buffer_policy="auto", species_schedule="auto",
+                                    inference_basis_fusion="auto"):
     """Select factorized SC in place, preserving live weights and checkpoint keys.
 
     Coverage: CUDA FP32, positive channels, correlation 1/2/3, native full CG. Supply
     discrete node_type_idx in ordinary forward calls to use factorization;
     calls with only node_attrs retain the established route.
+    Auto scheduling selects indexed low-degree circuits on K100 and fuses fixed
+    basis maps when the coefficient bank has no live gradients. Explicit grouped
+    or indexed schedules retain their unfused behavior unless fusion is requested.
     High-L cubic auto residency keeps immutable dense U on CPU after planning;
     reference_buffer_policy=device keeps them on the parameter device.
     """
@@ -544,8 +549,10 @@ def configure_symmetric_contraction(module, *, policy="auto", high_l_policy="aut
         raise ValueError("SC policy must be auto, generated or reference")
     if high_l_policy not in ("auto","off"):
         raise ValueError("high_l_policy must be auto or off")
-    if species_schedule not in ('grouped','indexed'):
-        raise ValueError('species_schedule must be grouped or indexed')
+    if species_schedule not in ('auto','grouped','indexed'):
+        raise ValueError('species_schedule must be auto, grouped or indexed')
+    if not (isinstance(inference_basis_fusion, bool) or inference_basis_fusion == 'auto'):
+        raise ValueError('inference_basis_fusion must be auto or a boolean')
     if not isinstance(training,bool):raise TypeError("training must be a boolean")
     if reference_buffer_policy not in ('auto','device'):
         raise ValueError('reference_buffer_policy must be auto or device')
@@ -555,6 +562,8 @@ def configure_symmetric_contraction(module, *, policy="auto", high_l_policy="aut
     supported = (parameter.is_cuda and parameter.dtype == torch.float32 and module.channels > 0 and not module.use_reduced_cg
                  and module.lmax >= 0 and module.target_lmax >= 0
                  and all(c.correlation in (1,2,3) for c in module.symmetric_contractions.contractions))
+    k100 = bool(supported and torch.version.hip and
+                getattr(torch.cuda.get_device_properties(parameter.device), 'gcnArchName', '').split(':')[0] == 'gfx926')
     if policy == "generated" and not supported:
         raise ValueError("Generated SC requires CUDA FP32 and a positive-order bridge-U contraction")
     if policy == "reference" or supported or policy=='auto':
@@ -563,7 +572,8 @@ def configure_symmetric_contraction(module, *, policy="auto", high_l_policy="aut
         module._compact_contraction = enabled
         module._factorized_contraction = enabled
         module._factorized_circuit = enabled
-        module._species_circuit=(enabled and species_schedule=='indexed' and max(module.lmax,module.target_lmax)<=3)
+        module._species_circuit=(enabled and (species_schedule=='indexed' or (species_schedule=='auto' and k100))
+                                 and max(module.lmax,module.target_lmax)<=3)
         module._partitioned_circuit=False
         module._compact_circuit_adjoints=False
         module._staged_circuit=False
@@ -579,9 +589,16 @@ def configure_symmetric_contraction(module, *, policy="auto", high_l_policy="aut
             module._adaptive_sparse_tiling=True
         if high and orders=={2} and module.target_lmax>0 and (training or (module.lmax==5 and module.channels%32)):
             module._partitioned_circuit=True
+        module._hip_fused_basis = bool(k100 and module._species_circuit and module._factorized_circuit
+                                      and not module._partitioned_circuit
+                                      and (inference_basis_fusion is True or
+                                           (inference_basis_fusion == 'auto' and species_schedule == 'auto')))
+        module._standalone_sc_auto = enabled and k100 and species_schedule == 'auto'
+        module._frozen_projected_bank = None
     return {"selected": "generated" if supported and policy != "reference" else "reference",
             "high_l_policy":high_l_policy,
             "species_schedule":species_schedule,"indexed_species_active":module._species_circuit,
+            "inference_basis_fusion":inference_basis_fusion,"basis_fusion_active":module._hip_fused_basis,
             "reference_buffer_policy":reference_buffer_policy,
             "sc_schedule":"sparse" if supported and policy!="reference" and not module._factorized_circuit else
                 "partitioned" if supported and policy!="reference" and module._partitioned_circuit else

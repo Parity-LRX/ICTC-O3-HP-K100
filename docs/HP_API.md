@@ -257,6 +257,14 @@ activated_scalar = normalized_silu(scalar_features, scale=model_activation_scale
 ```
 
 SC preserves the original weights, parameter identities and checkpoint keys.
+Standalone SC defaults to `species_schedule="auto"` and
+`inference_basis_fusion="auto"`: K100 low-degree calls select indexed circuits,
+and coefficient banks without live gradients use fused fixed basis maps.
+Trainable weight gradients remain available. Explicit `grouped` and `indexed`
+schedules retain their unfused behavior unless `inference_basis_fusion=True`
+is requested. Use `sc.eval().requires_grad_(False)` for frozen inference;
+`.eval()` alone does not freeze weights. See the
+[standalone SC guide](O3_API.md#standalone-symmetric-contraction).
 Factorization requires discrete `node_type_idx`. Calls with only `node_attrs`
 retain the original module behavior and do not replace differentiable species
 inputs with `argmax`. Kernel planning still checks reconstruction of the saved U.
@@ -974,7 +982,7 @@ edge IDs are not treated as ordered. CG, coordinates, paths and differentiation
 formulas are unchanged. The option defaults off and needs performance validation
 for the actual shapes.
 
-## Optional SC species weights indexed by node
+## SC species weights indexed by node
 
 `configure_model(..., species_schedule="indexed")` and
 `configure_symmetric_contraction(..., species_schedule="indexed")` select a
@@ -984,7 +992,12 @@ It retains the CG polynomial and trainable weight bank while eliminating per-spe
 groups and learned parameters are not cached. First, parameter and mixed second
 gradients remain available.
 
-The default `species_schedule="grouped"` retains the original route.
+The model-wide `configure_model` default remains `species_schedule="grouped"`.
+Standalone `configure_symmetric_contraction` defaults to `species_schedule="auto"`,
+selecting indexed low-degree circuits on K100, with automatic basis fusion when
+the coefficient bank has no live gradients. Explicit standalone `grouped` and
+`indexed` schedules preserve their previous unfused behavior; fusion can be
+requested with `inference_basis_fusion=True` or disabled with `False`.
 High-L and existing partitioned/sparse SC retain their plans. Returned
 `indexed_species_circuits` counts, or standalone SC `indexed_species_active`,
 report actual coverage. `policy="reference"` clears indexed execution.

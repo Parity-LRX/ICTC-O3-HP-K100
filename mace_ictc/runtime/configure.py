@@ -224,6 +224,7 @@ def _apply_legacy_options(model: torch.nn.Module, *, training=False, policy="aut
             if species_linear_schedule!='auto':
                 module._shared_species_gemm=False
         if isinstance(module,ICTDBridgeUSymmetricContractionSO3):
+            module._standalone_sc_auto=False
             module._species_circuit=(selected and species_schedule=='indexed'
                 and max(module.lmax,module.target_lmax)<=3 and module._factorized_circuit
                 and not module._partitioned_circuit)
