@@ -805,9 +805,9 @@ def main() -> int:
         # energy model lives at obj.wrapper.model (a PureCartesianICTDFix, ZBL-wrapped only if the
         # checkpoint configured ZBL -- same 7-arg forward either way). The checkpoint's dtype/species
         # OVERRIDE the CLI so the .pt2 matches what LAMMPS will run.
-        from mace_ictc.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
+        from mace_ictc.checkpoints import load_checkpoint
         element_types = [s.strip() for s in args.elements.split(",") if s.strip()]
-        obj = LAMMPS_MLIAP_MFF.from_checkpoint(
+        obj = load_checkpoint(
             checkpoint_path=args.checkpoint, element_types=element_types, device=args.device,
             avg_num_neighbors=args.avg_num_neighbors,
             operator_plan="checkpoint",  # Configure once, after export transforms/freezing.

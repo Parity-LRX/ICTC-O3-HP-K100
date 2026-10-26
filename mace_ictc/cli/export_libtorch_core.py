@@ -494,7 +494,7 @@ def _trace_model_for_export(
     trace_num_edges: int,
     jit_mode: str = "trace",
 ) -> torch.jit.ScriptModule:
-    from mace_ictc.interfaces.lammps_mliap import (
+    from mace_ictc.checkpoints.adapters import (
         _TorchScriptEdgeVecCore,
         _TorchScriptEdgeVecCoreWithFidelity,
         _resolve_model_external_tensor_total_numel,
@@ -652,8 +652,8 @@ def _export_single_core(
     jit_mode: str = "trace",
     avg_num_neighbors: Optional[float] = None,
 ) -> dict:
-    from mace_ictc.interfaces.lammps_mliap import (
-        LAMMPS_MLIAP_MFF,
+    from mace_ictc.checkpoints import load_checkpoint
+    from mace_ictc.checkpoints.adapters import (
         _resolve_model_external_tensor_rank,
         _resolve_model_external_tensor_specs,
         _resolve_model_external_tensor_total_numel,
@@ -728,7 +728,7 @@ def _export_single_core(
         build_device = device
         trace_device = device
 
-    obj = LAMMPS_MLIAP_MFF.from_checkpoint(
+    obj = load_checkpoint(
         checkpoint_path=checkpoint,
         element_types=elements,
         max_radius=effective_radius,

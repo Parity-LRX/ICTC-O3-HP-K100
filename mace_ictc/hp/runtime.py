@@ -53,7 +53,7 @@ def create_model(*, channels=64, lmax=3, edge_lmax=None, num_interactions=2,
             options['smearing_sigma'] = (1.0 if options['reciprocal_backend'] == 'mesh_fft'
                                         and options['mesh_fft_full_ewald'] else None)
         long_range_options = {'long_range_' + key: value for key, value in options.items()}
-    from mace_ictc.cli.train import build_baseline_model
+    from mace_ictc.models.factory import build_baseline_model
     from mace_ictc.utils.config import ModelConfig
     import e3nn
     previous_dtype = torch.get_default_dtype()

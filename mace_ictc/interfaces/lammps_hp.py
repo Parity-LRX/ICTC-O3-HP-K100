@@ -136,8 +136,8 @@ def _load(checkpoint, metadata, device):
         return model, None, plan
     if not isinstance(saved, dict) or saved.get("tensor_product_mode") != "pure-cartesian-ictd-fix":
         raise ValueError("Native MFF expects a pure-cartesian-ictd-fix checkpoint or converted FoundationHP model")
-    from mace_ictc.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
-    potential = LAMMPS_MLIAP_MFF.from_checkpoint(str(checkpoint), metadata["elements"],
+    from mace_ictc.checkpoints import load_checkpoint
+    potential = load_checkpoint(str(checkpoint), metadata["elements"],
         device=str(device), operator_plan="checkpoint", torchscript=False,
         atomic_energy_keys=e0_keys, atomic_energy_values=e0_values,
         avg_num_neighbors=metadata.get("avg_num_neighbors"))
