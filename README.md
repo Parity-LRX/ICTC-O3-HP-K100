@@ -1,133 +1,222 @@
 # ICTC-O3-HP-K100
 
-High-performance **ICTC-O3 operators optimized for Hygon K100 GPUs**, together
-with the **MACE-ICTC framework** for atomistic modeling, training and inference.
+High-performance ICTC-O3 operators optimized for Hygon K100 GPUs, together with
+the MACE-ICTC framework for atomistic modeling, energy-and-force training and
+molecular dynamics.
 
-Version **0.1.0**. Distribution: `ictc-o3-hp-k100`.
-Python packages: `ictc_o3` for standalone operators and `mace_ictc` for the
-MACE-ICTC framework.
+Version 0.1.0 · [MIT License](LICENSE) · Distribution: `ictc-o3-hp-k100`
 
-Start with the [user guide](docs/USAGE.md) for complete training recipes with
-or without long-range electrostatics, MACE checkpoint conversion, Python
-prediction, and LAMMPS compilation and execution. Copyable recipes are in
-[`examples/`](examples/).
+Use `ictc_o3` to build your own equivariant networks, or `mace_ictc` to train,
+convert and deploy MACE potentials. The two packages live side by side and ship
+in one distribution. Standalone O3 operators run independently of MACE-ICTC.
 
-## Python API
+[Results](#multi-gpu-results) · [Installation](#installation) ·
+[O(3) API](docs/O3_API.md) ·
+[Training and conversion](docs/USAGE.md) ·
+[Electrostatics](docs/ELECTROSTATICS.md) ·
+[LAMMPS](lammps_user_mfftorch/README.md) ·
+[Architecture](docs/ARCHITECTURE.md)
 
-The two packages live side by side and are installed together:
+## Highlights
 
-```text
-ictc_o3/          # Public Cartesian tensor operators
-mace_ictc/        # MACE-compatible models, training and interfaces
-```
+- Native HIP tensor products, graph messages and symmetric contractions,
+  with first derivatives and mixed second derivatives for force-loss training.
+- Eight-GPU MD strong scaling: 7.07× speedup for C64/lmax 2 and 7.90× for
+  MACE-MH-1, with 88.4% and 98.8% efficiency, respectively. C64 weak scaling
+  reaches 878k atom-steps/s at 1,048,576 atoms.
+- Large-system MD on eight GPUs: 3,241,792 atoms for C64/lmax 2 with two
+  interactions and correlation 3 in capacity mode; 1,146,880 atoms for
+  MACE-MH-1 in performance mode.
+- MACE conversion, including all six MACE-MH-1 readout heads and its nonlinear
+  interactions.
+- Learned monopole, dipole and quadrupole reciprocal electrostatics for
+  MACE-ICTC training and multi-GPU MD.
 
-```python
-from ictc_o3 import (
-    EdgeTensorProduct, GraphMessage, PackedGraphMessage,
-    direction_harmonics, create_symmetric_contraction,
-    configure_symmetric_contraction, channel_linear, normalized_silu,
-    MeshElectrostatics, mesh_shape_for_cell,
-)
-from mace_ictc.hp import create_model, configure_model, energy_and_forces
-from mace_ictc.training import ForceTrainer
-```
-
-See the [operator API](docs/O3_API.md) for shapes, gradients and standalone usage,
-and the [model API](docs/HP_API.md) for training, inference and conversion.
-Existing operator imports from `mace_ictc.hp` remain compatible.
-See [architecture and module ownership](docs/ARCHITECTURE.md) for the implementation layout.
+The [results below](#multi-gpu-results) give the model configurations,
+throughput, memory and measurement protocols. MD throughput counts physical
+atoms and includes the complete step: neighbors, energy, forces and communication.
 
 ## Installation
 
-Use an isolated environment with a compatible K100 vendor PyTorch, HIP/DTK
-and Triton stack, then install:
+Use a Linux environment with Python 3.10 or later and a matching K100
+(`gfx926`) vendor PyTorch, HIP/DTK and Triton stack. Install the platform's
+PyTorch and Triton first, then add the operator package:
 
 ```bash
 git clone https://github.com/Parity-LRX/ICTC-O3-HP-K100.git
 cd ICTC-O3-HP-K100
-python -m pip install -e '.[hp,train,conversion,lammps]'
+python -m pip install -e '.[hp]'
 ```
 
-The `hp` extra supplies Ninja and preserves the installed vendor Triton.
-GPU execution and just-in-time (JIT) compilation need the matching HIP compiler and runtime.
-On Slurm clusters, run computation through `sbatch` on an allocated GPU.
+The `hp` extra adds Ninja and preserves the installed vendor Triton. Native
+HIP kernels compile just in time on first use and require the matching HIP
+compiler and runtime. PyTorch spells the K100 HIP device `cuda`.
 
-## K100 execution and deployment
-
-The performance path is eager FP32 with native HIP operators for training
-and inference. Whole-model `torch.compile`, AOTInductor `.pt2` deployment
-and graph replay are outside the supported current K100 workflow.
-Native HIP kernel JIT compilation is a separate requirement.
-
-For LAMMPS deployment, `mff-export-core` defaults to native HP performance
-inference, and `mff-lammps` enables Kokkos/HIP graph preparation. Multi-GPU
-execution exchanges intermediate features and reverse gradients through FP32
-RCCL, using a fresh LAMMPS ghost owner map on every force evaluation.
+For dataset preparation, training, conversion and LAMMPS, add:
 
 ```bash
-mff-export-core --checkpoint converted.pth --elements H C O --out core.pt
-mpirun --bind-to none -np 8 mff-lammps -in in.mfftorch
+python -m pip install -e '.[hp,train,conversion,lammps]'
+python -m pip install tables
 ```
 
-Run these commands inside a K100 allocation. `--inference-mode capacity`
-selects smaller forward chunks; `--backend reference` selects portable
-whole-network TorchScript. Build instructions, model packaging and input
-examples are in the [K100 MFF-Torch guide](lammps_user_mfftorch/README.md).
+`tables` supplies the preprocessing HDF5 backend; `conversion` adds upstream
+MACE, and `lammps` adds `mpi4py`. Build the LAMMPS shared library and Python
+bindings separately using the [LAMMPS guide](docs/USAGE.md#9-compile-the-lammps-interface).
 
-## Features
+Run installation, compilation and computation inside a compute allocation.
+On Slurm, submit through `sbatch`; adapt the partition, GPU resource and DTK
+module in [`examples/k100_job.sbatch`](examples/k100_job.sbatch) to your site.
+The [Slurm setup](docs/USAGE.md#running-on-slurm) covers environment variables
+and persistent compilation caches.
 
-- Tensor products, graph aggregation, direction harmonics and symmetric contractions.
-- HIP kernels for first-order backward and mixed second derivatives in energy/force training.
-- Streamed inference gates, chunked backward kernels and grouped element-conditioned linear maps.
-- Nonlinear MACE-MH-1 conversion with all original readout heads retained.
-- Standard MACE conversion preserves radial MLP hidden widths and depth.
-- Native K100 monopole, dipole and quadrupole reciprocal electrostatics.
-- LAMMPS interfaces and model export utilities.
+## Standalone O3 operators
+
+This complete tensor-product example computes feature, direction and gate
+gradients. Run it in the K100 environment on an allocated GPU:
+
+```python
+import torch
+from ictc_o3 import EdgeTensorProduct, direction_harmonics
+
+channels, lmax, edges = 32, 2, 257
+tp = EdgeTensorProduct.create(
+    channels=channels, input_lmax=lmax, edge_lmax=lmax,
+    output_lmax=lmax, layout="ir_mul", device="cuda",
+)
+blocks = {
+    l: torch.randn(edges, channels, 2*l+1, device="cuda",
+                   dtype=torch.float32, requires_grad=True)
+    for l in range(lmax+1)
+}
+vectors = torch.randn(edges, 3, device="cuda", dtype=torch.float32,
+                      requires_grad=True)
+harmonics = torch.cat(direction_harmonics(
+    torch.nn.functional.normalize(vectors, dim=-1), lmax, policy="generated",
+), dim=-1)
+gates = torch.randn(edges, tp.gate_width, device="cuda",
+                    dtype=torch.float32, requires_grad=True)
+output = tp(tp.pack_input(blocks), harmonics, gates)
+output_blocks = tp.unpack_output(output)
+output.square().mean().backward()
+```
+
+Channels, angular degrees and edge counts are configurable. The public
+[operator API](docs/O3_API.md) also covers graph aggregation, symmetric
+contractions, channel linear maps and mesh electrostatics, including tensor
+layouts and gradient support. Importing `ictc_o3` alone does not initialize a
+GPU or compile extensions. Existing operator imports from `mace_ictc.hp`
+remain compatible.
+
+## MACE training, conversion and prediction
+
+Create a model and select native HP training operators:
 
 ```python
 from mace_ictc.hp import create_model, configure_model
 
-model = create_model(channels=64, lmax=2, num_interactions=2, correlation=3)
+model = create_model(
+    channels=64, lmax=2, num_interactions=2, correlation=3, cutoff=4.5,
+)
 configure_model(
     model, training=True, policy="generated", layout="fused_pack",
 )
 ```
 
-Generated eager training uses `training_message_linear_layout="node_component"`
-by default in both the HP API and `ForceTrainer`/CLI. Set it to `"einsum"` (CLI:
-`--training-message-linear-layout einsum`) to select the previous layout.
+This creates initialized weights. Generated training defaults to
+`training_message_linear_layout="node_component"` in the HP API,
+`ForceTrainer` and CLI. The [model API](docs/HP_API.md) documents checkpoint
+loading, caller-supplied neighbor graphs and `energy_and_forces(..., training=True)`
+for force-loss backpropagation.
 
-See the [API guide](docs/HP_API.md) for training, inference and conversion.
-The current MH-1 foundation adapter supports frozen-weight force inference;
-full MH-1 fine-tuning requires a training adapter.
+For a complete training workflow, first [prepare the dataset](docs/USAGE.md#2-prepare-training-data),
+including `fitted_E0.csv`, then submit the supplied recipe:
+
+```bash
+export ICTC_REPO=/path/to/ICTC-O3-HP-K100
+export ICTC_ENV=/path/to/k100-python-environment
+
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/k100_job.sbatch" \
+  bash "$ICTC_REPO/examples/train_hco.sh" short data/hco models/hco-short.pth
+```
+
+`short` disables long-range electrostatics. Replace it with `q`, `qmu` or
+`qmuq` to train learned charge, charge/dipole or charge/dipole/quadrupole
+sources. The recipe uses C64/lmax 2, two interactions, correlation 3 and a
+4.5 Å cutoff; append CLI options to select another configuration.
+See the [long-range recipe](docs/USAGE.md#4-train-with-long-range-electrostatics)
+for mesh and boundary settings.
+
+Convert an existing torch-saved MACE model using the appropriate route:
+
+```bash
+# Ordinary ScaleShiftMACE model.
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/k100_job.sbatch" \
+  mff-convert-mace --mace-model models/source.model \
+    --out models/mace-ictc.pth --product-backend ictd-bridge-u \
+    --dtype float32 --device cpu
+
+# Nonlinear MACE-MH-1 model; retain all heads and select the default head.
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/k100_job.sbatch" \
+  mff-convert-foundation --mace-model models/mace-mh-1.model \
+    --head omat_pbe --out models/mace-mh-1-ictc-hp.pt
+```
+
+The [conversion guide](docs/USAGE.md#6-convert-an-existing-mace-model) describes
+supported architectures and further training of ordinary converted models.
+The current MACE-MH-1 adapter supports frozen-weight energy-and-force inference.
+Evaluate an ordinary trained or converted checkpoint with the supplied example:
+
+```bash
+sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/k100_job.sbatch" \
+  python "$ICTC_REPO/examples/predict.py" --checkpoint models/mace-ictc.pth \
+    --structure data/reference.extxyz --out prediction.json
+```
+
+For MACE-MH-1, add `--foundation --head omat_pbe` and use its converted
+checkpoint. The [prediction guide](docs/USAGE.md#8-predict-energy-and-forces-with-python)
+covers units, neighbors, E0 offsets and supported elements.
+
+## Inference modes and LAMMPS
+
+K100 training and inference use eager FP32 with TF32 disabled and native HIP
+operators. Whole-model `torch.compile`, AOTInductor `.pt2` deployment and graph
+replay are outside the current supported K100 workflow.
+
+The native LAMMPS exporter defaults to `--inference-mode performance`, using
+streamed radial gates and grouped element-conditioned linear maps. Select
+`--inference-mode capacity` to bound temporary storage with smaller chunks
+and radial rematerialization. Both modes retain the model weights, neighbors
+and FP32 arithmetic; their throughput and memory use are reported below.
+
+After [building the interface](docs/USAGE.md#9-compile-the-lammps-interface),
+export the deployment bundle inside an allocation:
+
+```bash
+mff-export-core --checkpoint models/hco-short.pth --elements H C O --out models/core.pt
+```
+
+Keep the four output files together. Start from [`examples/in.hco`](examples/in.hco)
+and follow the [one- and eight-GPU launch recipes](docs/USAGE.md#one-gpu-and-eight-gpus).
+The `mff-lammps` launcher enables Kokkos/HIP graph preparation for `mff/torch/kk`.
+Multi-GPU execution exchanges intermediate features and reverse gradients
+through FP32 RCCL, rebuilding the LAMMPS ghost owner map at every force evaluation.
+See the [MFF-Torch guide](lammps_user_mfftorch/README.md) for packaging and
+interface options, including the plain `mff/torch` path.
 
 ## Native long-range electrostatics
 
-Standalone electrostatics operators are exposed through `ictc_o3`, and learned
-source heads integrate with MACE-ICTC energy-and-force training and native
-`mff/torch/kk` inference. The implementation supports monopoles `q`, dipoles
-`μ` and quadrupoles `Q`, arbitrary source-channel counts, cell gradients and
-mixed second derivatives. Its physical scope is a Gaussian-screened reciprocal
-correction with periodic or padded-slab boundaries. Full real-space Ewald is
-outside this implementation.
-
-```python
-from ictc_o3 import MeshElectrostatics, mesh_shape_for_cell
-
-mesh = mesh_shape_for_cell(cell, spacing=0.5)  # Choose once during setup.
-solver = MeshElectrostatics(
-    mesh_size=mesh, smearing_sigma=1.0, backend="hip",
-).to(device=positions.device, dtype=positions.dtype)
-atom_energy = solver(positions, batch, cell, q, mu, Q)
-```
+`ictc_o3.MeshElectrostatics` exposes standalone monopole (`q`), dipole (`μ`)
+and quadrupole (`Q`) operators with configurable source-channel counts,
+position and cell gradients, and mixed second derivatives. Learned source
+heads integrate the same Gaussian-screened reciprocal correction into
+MACE-ICTC training and native `mff/torch/kk` inference, with periodic or
+padded-slab boundaries.
 
 Native multi-GPU deployment partitions physical source atoms and FFT slabs
 across ranks. Differentiable RCCL exchanges retain both direct electrostatic
 forces and the response of learned moments. The optimized message schedule,
 real-component multipole contractions and automatic distributed-FFT selection
-are enabled by default. `mff-export-core` continues to default to native
-performance inference; capacity mode additionally bounds large temporary
-allocations through chunking and radial rematerialization.
+are enabled by default.
 
 See the [electrostatics API and physical conventions](docs/ELECTROSTATICS.md)
 for model configuration, tensor shapes, derivatives and validation.
