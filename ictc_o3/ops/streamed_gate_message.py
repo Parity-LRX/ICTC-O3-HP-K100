@@ -289,6 +289,7 @@ def streamed_gate_message(tp,x1,edge_attrs,edge_feats,fc,src,dst,mask,*,output_n
     plan['generated_second']=getattr(tp,'_generated_second',False)
     plan['generated_second_roles']=getattr(tp,'_generated_second_roles',False)
     plan['generated_second_channel_tile']=getattr(tp,'_generated_second_channel_tile',None)
+    plan['training_gate_gemm_rows']=getattr(tp,'_training_gate_gemm_rows',0)
     if train_gate:
         if not (plan['generated_forward'] and plan['generated_adjoint']):return None
         plan['gate_cache_bytes']=(1<<62) if tp._training_gate_schedule=='cached' else 0

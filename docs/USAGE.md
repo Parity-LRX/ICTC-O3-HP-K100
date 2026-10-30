@@ -403,8 +403,36 @@ Cartesian training architecture: the optimized foundation SC also consumes
 the checkpoint's existing e3nn-basis features directly.
 
 The current `FoundationHP` adapter supports **frozen-weight energy/force
-inference**. It is not an MH-1 fine-tuning trainer. Use the ordinary conversion
-workflow only for architectures supported by that converter.
+inference**. For fine-tuning, use `FoundationTrainHP` with the original native
+checkpoint rather than this frozen converter. It retains canonical MACE
+parameters and all readout heads, with live energy/force parameter gradients.
+
+### Fine-tune MACE-MH-1 through ICTC
+
+```python
+from mace_ictc.hp import FoundationTrainHP, FoundationTrainingConfig, check_model, configure_model
+from mace_ictc.interfaces.foundation_hp import load_foundation_checkpoint
+
+native = load_foundation_checkpoint("models/mace-mh-1.model")
+config = FoundationTrainingConfig.k100_mh1(mode="speed")
+model = FoundationTrainHP(native, head="omat_pbe", config=config).float().cuda()
+assert check_model(model, training=True)["supported"]
+configure_model(model, training=True, policy="generated", foundation_config=config)
+```
+
+Use `mode="memory"` to recompute gates. Select the adapter device/dtype before
+constructing an optimizer over `model.native.parameters()`. Generic backbone
+`RuntimePlan` settings do not configure this nonlinear foundation adapter;
+use `FoundationTrainingConfig` for its schedules.
+
+The [complete fine-tuning recipe](MH1_FINE_TUNING.md) shows ASE/MACE graph
+construction with `head_name`, energy/force losses, optional force masks,
+validation, checkpoint restoration and native MACE export. It uses FP32
+features, parameters and forces with FP64 atomic energy terms and reductions.
+Train `interaction_energy` against `E_DFT - sum(E0)` and add the same external
+FP64 E0 sum when evaluating total energies. Atoms are included in the force
+loss unless explicitly masked. Run all compilation and numerical work through
+`sbatch` on the configured K100 resources.
 
 ## 8. Predict energy and forces with Python
 

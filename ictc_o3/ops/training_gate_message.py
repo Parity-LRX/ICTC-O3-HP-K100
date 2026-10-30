@@ -23,6 +23,20 @@ def _expression(x,sh,w,h,a,b,src,dst,mask,p,projection):
     return _native(x,sh,w,_gate(h,a,b,p),src,dst,mask,p,projection)
 
 
+def _contract_gate(flat, h, a, dh, da, db, rows):
+    """Bound live gate adjoint GEMMs without changing reduction targets."""
+    rows = rows or max(flat.shape[0], 1)
+    for start in range(0, flat.shape[0], rows):
+        end = min(start + rows, flat.shape[0])
+        block = flat[start:end]
+        if dh is not None:
+            torch.mm(block, a, out=dh[start:end])
+        if da is not None:
+            da.addmm_(block.t(), h[start:end])
+        if db is not None:
+            db.add_(block.sum(0))
+
+
 def _first(x,sh,w,h,a,b,src,dst,mask,v,p,projection,needed,cache):
     from ictc_o3.ops.fused_message import _channel_inputs
     from ictc_o3.ops.fused_message import _normal_feature_gradient
@@ -43,9 +57,8 @@ def _first(x,sh,w,h,a,b,src,dst,mask,v,p,projection,needed,cache):
             harmonic_output=ds[start:end] if ns else None)
         if dg is not None:
             flat=dg.reshape(end-start,-1)
-            if nh:torch.mm(flat,a,out=dh[start:end])
-            if na:da.addmm_(flat.t(),h[start:end])
-            if nb:db.add_(flat.sum(0))
+            _contract_gate(flat,h[start:end],a,dh[start:end] if nh else None,da,db,
+                           p.get('training_gate_gemm_rows',0))
             del flat
         del g,dg
     if nx and not canonical:dx=_normal_feature_gradient(dx,p)
@@ -98,9 +111,8 @@ def _second(x,sh,w,h,a,b,src,dst,mask,v,p,projection,incoming,needed,need_v,cach
             dg.zero_()
         if dg is not None:
             flat=dg.reshape(end-start,-1)
-            if nh:torch.mm(flat,a,out=dh[start:end])
-            if na:da.addmm_(flat.t(),hs)
-            if nb:db.add_(flat.sum(0))
+            _contract_gate(flat,hs,a,dh[start:end] if nh else None,da,db,
+                           p.get('training_gate_gemm_rows',0))
             del flat
         del tg,dg
         # Derivatives of the gate tangent th @ A.T + h @ ta.T + tb.

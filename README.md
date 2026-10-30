@@ -163,7 +163,10 @@ sbatch --account=YOUR_ACCOUNT "$ICTC_REPO/examples/k100_job.sbatch" \
 
 The [conversion guide](docs/USAGE.md#6-convert-an-existing-mace-model) describes
 supported architectures and further training of ordinary converted models.
-The current MACE-MH-1 adapter supports frozen-weight energy-and-force inference.
+Use `FoundationHP` for frozen-weight MACE-MH-1 inference, or
+[`FoundationTrainHP`](docs/USAGE.md#fine-tune-mace-mh-1-through-ictc) to fine-tune
+its original nonlinear architecture with canonical live parameters and FP64
+energy reductions.
 Evaluate an ordinary trained or converted checkpoint with the supplied example:
 
 ```bash

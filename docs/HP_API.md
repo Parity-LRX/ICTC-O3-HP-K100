@@ -1412,3 +1412,31 @@ This interface covers eager force inference with frozen weights. Additional
 charge/spin embeddings are outside current coverage. Validate energy and
 forces against the actual checkpoint after conversion. Capacity depends on
 the model, material density and neighbor count.
+
+### MACE-MH-1 fine-tuning
+
+`mace_ictc.hp.FoundationTrainHP` wraps a native nonlinear foundation checkpoint
+for eager energy-and-force training. `FoundationTrainingConfig.k100_mh1`
+selects materialized gates (`mode="speed"`) or recomputed gates
+(`mode="memory"`). This separate trainable adapter preserves the original
+MACE parameter objects within `model.native`; no learned inference projection
+cache substitutes for live weights.
+
+Call `check_model(model, training=True)` and
+`configure_model(model, training=True, policy="generated", foundation_config=config)`
+after explicitly selecting GPU FP32, then create the optimizer over
+`model.native.parameters()`. Generic `RuntimePlan` and backbone schedules are
+not applied to this architecture. Reconfiguration preserves parameter
+identity. `policy="reference"` selects the matching native MACE forward with
+FP64 energy reductions for a controlled comparison.
+
+Features, readout GEMMs, parameters and forces remain FP32; individual energy
+terms are cast before summing layers and atoms, and before scale/shift.
+`interaction_energy` excludes E0. Force-loss training requires
+`training=True` in the forward call, preserving the mixed geometry/parameter
+derivative graph. Current coverage is eager GPU FP32 with hidden/edge L <= 3;
+stress, distributed graph decomposition and external position Hessians are
+not covered by this training adapter.
+
+See the [fine-tuning recipe](MH1_FINE_TUNING.md) for graph construction,
+reference conventions, losses, force masks and native-model export.

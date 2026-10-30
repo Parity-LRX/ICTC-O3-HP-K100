@@ -9,6 +9,7 @@ from .operators import (
     configure_symmetric_contraction, create_symmetric_contraction, direction_harmonics, normalized_silu,
 )
 from .runtime import check_model, configure_model, create_model, energy_and_forces, prepare_for_export
+from mace_ictc.interfaces.foundation_training import FoundationTrainHP, FoundationTrainingConfig
 from ictc_o3.electrostatics.api import MeshElectrostatics
 from ictc_o3.electrostatics.api import configure_electrostatics
 from ictc_o3.electrostatics.api import mesh_spread
@@ -19,6 +20,7 @@ __all__ = [
     "EdgeTensorProduct", "GraphMessage", "PackedGraphMessage", "direction_harmonics",
     "create_symmetric_contraction", "configure_symmetric_contraction", "channel_linear", "normalized_silu",
     "create_model", "check_model", "configure_model", "energy_and_forces", "prepare_for_export",
+    "FoundationTrainHP", "FoundationTrainingConfig",
     "MeshElectrostatics", "configure_electrostatics", "mesh_spread", "mesh_gather", "mesh_shape_for_cell",
 ]
 

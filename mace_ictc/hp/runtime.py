@@ -118,7 +118,17 @@ def _layout(value, *, optional=False):
 
 def check_model(model: torch.nn.Module, *, training=False, capture=False) -> dict:
     """Read-only coverage check; no freezing, casting, planning or compilation."""
-    from mace_ictc.runtime.planning import generated_plan_unavailable
+    from mace_ictc.interfaces.foundation_training import FoundationTrainHP
+    from mace_ictc.runtime.planning import generated_plan_unavailable, mace_backbone_core
+    core = mace_backbone_core(model)
+    if isinstance(core, FoundationTrainHP):
+        result = core.check_training()
+        if not training:
+            result["reasons"].append("FoundationTrainHP coverage requires training=True")
+        if capture:
+            result["reasons"].append("Foundation training requires eager execution")
+        result["supported"] = not result["reasons"]
+        return result
     reasons = generated_plan_unavailable(model, training=training, capture=capture)
     return {"supported": not reasons, "reasons": reasons}
 
@@ -138,7 +148,7 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
                     inference_adjoint_channel_tile="auto",inference_gate_adjoint_rows=0,
                     inference_gemm_policy="torch",inference_message_adjoint_edges=0,
                     inference_basis_fusion=False,species_linear_schedule="auto",
-                    electrostatics_backend="auto", plan=None) -> dict:
+                    electrostatics_backend="auto", plan=None, foundation_config=None) -> dict:
     """Configure every interaction for eager training or full-force inference.
 
     auto selects qualified independent HP operators or reports why the existing
@@ -208,6 +218,9 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
 
     Pass plan=RuntimePlan(...) for grouped configuration. Use either a plan
     or nondefault legacy keywords in a call; both share the same validation.
+    FoundationTrainHP uses foundation_config=FoundationTrainingConfig(...)
+    instead of generic backbone schedules or RuntimePlan. With no config,
+    its current explicit foundation schedules are retained.
     """
 
     from mace_ictc.runtime.config import RuntimePlan
@@ -246,6 +259,35 @@ def configure_model(model: torch.nn.Module, *, training=False, policy="auto",
         electrostatics_backend=electrostatics_backend,
     )
     requested = RuntimePlan.from_legacy(**options)
+    from mace_ictc.interfaces.foundation_training import FoundationTrainHP
+    from mace_ictc.runtime.planning import mace_backbone_core
+    core = mace_backbone_core(model)
+    if isinstance(core, FoundationTrainHP):
+        if plan is not None:
+            raise ValueError("Use FoundationTrainingConfig for MH-1, not RuntimePlan")
+        generic = RuntimePlan.from_legacy(**{**options, "training": False, "policy": "auto", "capture": False})
+        if generic != RuntimePlan():
+            raise ValueError("Use foundation_config instead of generic backbone or inference schedules for MH-1")
+        if policy not in ("auto", "generated", "reference"):
+            raise ValueError("operator plan must be auto, reference or generated")
+        if capture:
+            raise ValueError("Foundation training requires eager execution")
+        if policy == "reference":
+            if foundation_config is not None:
+                raise ValueError("A generated foundation config cannot accompany the native reference policy")
+            core._reference_policy = True
+            return dict(selected="reference", architecture="nonlinear MACE foundation", reasons=[])
+        if not training:
+            raise ValueError("FoundationTrainHP configuration requires training=True")
+        coverage = core.check_training()
+        if not coverage["supported"]:
+            if policy == "generated":
+                raise ValueError("; ".join(coverage["reasons"]))
+            core._reference_policy = True
+            return dict(selected="reference", **coverage)
+        return core.configure_training(foundation_config or core.training_config)
+    if foundation_config is not None:
+        raise ValueError("foundation_config requires a FoundationTrainHP model")
     if plan is not None:
         if not isinstance(plan, RuntimePlan):
             raise TypeError("plan must be a RuntimePlan")
