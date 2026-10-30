@@ -1,7 +1,0 @@
-# Experiment scripts, numerical results and plots remain local.
-/benchmarks/
-/docs/assets/mh1-training-atom-scan.svg
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.DS_Store
